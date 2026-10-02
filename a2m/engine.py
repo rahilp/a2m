@@ -53,6 +53,7 @@ from a2m.errors import (
     UsageError,
 )
 from a2m.layout import collision_key, unsafe_name_reason
+from a2m.parser import read_bundle
 from a2m.runlog import get_logger, run_log
 
 # Names shown when --only does not match; longer lists are cut short.
@@ -119,9 +120,23 @@ class ProxyContext:
 
 Stage = Callable[[ProxyContext], None]
 
-# The per-proxy pipeline. Later checkpoints add parsing, generation and
-# verification stages here; tests replace it through ``stages=``.
-DEFAULT_STAGES: tuple[Stage, ...] = ()
+
+def parse(context: ProxyContext) -> None:
+    """Read the proxy's bundle into the IR; a bundle that cannot be read raises BundleError, so it is refused."""
+    bundle = read_bundle(context.bundle_dir, label=context.name)
+    get_logger().info(
+        "%s: read %d proxy endpoints, %d target endpoints, %d policies, %d resources",
+        context.name,
+        len(bundle.proxy_endpoints),
+        len(bundle.target_endpoints),
+        len(bundle.policies),
+        len(bundle.resources),
+    )
+
+
+# The per-proxy pipeline. Later checkpoints add generation and verification
+# stages here; tests replace it through ``stages=``.
+DEFAULT_STAGES: tuple[Stage, ...] = (parse,)
 
 
 class RunInterrupted(KeyboardInterrupt):

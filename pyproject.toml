@@ -7,11 +7,12 @@ name = "a2m"
 version = "0.1.0"
 description = "Migrate Apigee proxy bundles to Mule 4 projects"
 requires-python = ">=3.11"
-dependencies = []
+# defusedxml parses untrusted bundle XML without resolving entities (standards rule 4).
+dependencies = ["defusedxml>=0.7.1"]
 
 [project.optional-dependencies]
 # ruff and mypy are the project's static checks; CP1-T55/T61 run them.
-dev = ["pytest>=8", "ruff>=0.16", "mypy>=2.4"]
+dev = ["pytest>=8", "ruff>=0.16", "mypy>=2.4", "types-defusedxml>=0.7"]
 
 [project.scripts]
 a2m = "a2m.cli:main"

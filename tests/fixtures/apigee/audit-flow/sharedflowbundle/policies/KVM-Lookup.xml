@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<KeyValueMapOperations async="false" continueOnError="false" enabled="true" name="KVM-Lookup" mapIdentifier="audit-settings">
+    <DisplayName>Audit Settings Lookup</DisplayName>
+    <Scope>environment</Scope>
+    <Get assignTo="audit.level">
+        <Key>
+            <Parameter>level</Parameter>
+        </Key>
+    </Get>
+</KeyValueMapOperations>

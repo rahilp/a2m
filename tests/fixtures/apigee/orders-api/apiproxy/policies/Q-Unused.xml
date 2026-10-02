@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Quota async="false" continueOnError="false" enabled="true" name="Q-Unused" type="calendar">
+    <DisplayName>Unused Quota</DisplayName>
+    <Allow count="100"/>
+    <Interval>1</Interval>
+    <TimeUnit>hour</TimeUnit>
+    <StartTime>2026-01-01 00:00:00</StartTime>
+    <Distributed>true</Distributed>
+</Quota>

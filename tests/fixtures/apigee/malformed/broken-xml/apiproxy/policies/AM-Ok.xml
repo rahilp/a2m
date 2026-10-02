@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<AssignMessage async="false" continueOnError="false" enabled="true" name="AM-Ok">
+    <Set>
+        <Headers>
+            <Header name="X-Ok">yes</Header>
+        </Headers>
+    </Set>
+</AssignMessage>

@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ProxyEndpoint name="default">
+    <Description>Orders proxy endpoint</Description>
+    <FaultRules>
+        <FaultRule name="InvalidKey">
+            <Step>
+                <Name>RF-Unauthorized</Name>
+            </Step>
+            <Condition>fault.name = "InvalidApiKey"</Condition>
+        </FaultRule>
+    </FaultRules>
+    <DefaultFaultRule name="all">
+        <Step>
+            <Name>AM-ErrorBody</Name>
+        </Step>
+        <AlwaysEnforce>true</AlwaysEnforce>
+    </DefaultFaultRule>
+    <PreFlow name="PreFlow">
+        <Request>
+            <Step>
+                <Name>VA-Key</Name>
+            </Step>
+            <Step>
+                <Name>SA-Limit</Name>
+            </Step>
+        </Request>
+        <Response/>
+    </PreFlow>
+    <Flows>
+        <Flow name="GetOrder">
+            <Description>Read one order</Description>
+            <Request>
+                <Step>
+                    <Name>EV-OrderId</Name>
+                </Step>
+            </Request>
+            <Response>
+                <Step>
+                    <Name>AM-AddHeader</Name>
+                </Step>
+            </Response>
+            <Condition>(proxy.pathsuffix MatchesPath "/{id}") and (request.verb = "GET")</Condition>
+        </Flow>
+        <Flow name="CreateOrder">
+            <Description>Create an order</Description>
+            <Request>
+                <Step>
+                    <Condition>request.header.Content-Type != "application/json"</Condition>
+                    <Name>RF-BadType</Name>
+                </Step>
+                <Step>
+                    <Name>JS-Validate</Name>
+                </Step>
+                <Step>
+                    <Name>PY-Enrich</Name>
+                </Step>
+            </Request>
+            <Response/>
+            <Condition>request.verb = "POST" &amp;&amp; request.header.x-tenant != null</Condition>
+        </Flow>
+    </Flows>
+    <PostFlow name="PostFlow">
+        <Request/>
+        <Response>
+            <Step>
+                <Name>AM-AddHeader</Name>
+            </Step>
+        </Response>
+    </PostFlow>
+    <HTTPProxyConnection>
+        <BasePath>/orders/v1</BasePath>
+        <Properties/>
+        <VirtualHost>secure</VirtualHost>
+    </HTTPProxyConnection>
+    <RouteRule name="mock">
+        <Condition>request.header.x-mock = "true"</Condition>
+    </RouteRule>
+    <RouteRule name="legacy">
+        <Condition>request.header.x-legacy = "1"</Condition>
+        <TargetEndpoint>legacy</TargetEndpoint>
+    </RouteRule>
+    <RouteRule name="default">
+        <TargetEndpoint>backend</TargetEndpoint>
+    </RouteRule>
+</ProxyEndpoint>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<JavaCallout async="false" continueOnError="false" enabled="true" name="JC-Sign">
+    <DisplayName>Sign Response</DisplayName>
+    <ClassName>com.example.Sign</ClassName>
+    <ResourceURL>java://sign.jar</ResourceURL>
+</JavaCallout>

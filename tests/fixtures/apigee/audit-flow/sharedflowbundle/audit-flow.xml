@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<SharedFlowBundle revision="1" name="audit-flow">
+    <ConfigurationVersion majorVersion="4" minorVersion="0"/>
+    <Description>Audit shared flow, hand-authored a2m test fixture</Description>
+    <DisplayName>audit-flow</DisplayName>
+    <Policies>
+        <Policy>AM-AuditHeader</Policy>
+        <Policy>KVM-Lookup</Policy>
+    </Policies>
+    <Resources/>
+    <SharedFlows>
+        <SharedFlow>default</SharedFlow>
+    </SharedFlows>
+    <subType>SharedFlow</subType>
+</SharedFlowBundle>

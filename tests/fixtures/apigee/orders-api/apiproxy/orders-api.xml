@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="3" name="orders-api">
+    <Basepaths>/orders</Basepaths>
+    <ConfigurationVersion majorVersion="4" minorVersion="0"/>
+    <Description>Orders API, hand-authored a2m test fixture</Description>
+    <DisplayName>orders-api</DisplayName>
+    <Policies>
+        <Policy>VA-Key</Policy>
+        <Policy>SA-Limit</Policy>
+        <Policy>EV-OrderId</Policy>
+        <Policy>AM-AddHeader</Policy>
+        <Policy>RF-BadType</Policy>
+        <Policy>JS-Validate</Policy>
+        <Policy>PY-Enrich</Policy>
+        <Policy>RF-Unauthorized</Policy>
+        <Policy>AM-ErrorBody</Policy>
+        <Policy>FC-Audit</Policy>
+        <Policy>OA-Token</Policy>
+        <Policy>JC-Sign</Policy>
+        <Policy>Q-Unused</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <Resources>
+        <Resource>java://sign.jar</Resource>
+        <Resource>java://Sign.java</Resource>
+        <Resource>jsc://validate.js</Resource>
+        <Resource>py://enrich.py</Resource>
+    </Resources>
+    <TargetEndpoints>
+        <TargetEndpoint>backend</TargetEndpoint>
+        <TargetEndpoint>legacy</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>

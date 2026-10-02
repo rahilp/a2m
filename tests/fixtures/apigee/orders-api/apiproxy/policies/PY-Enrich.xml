@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Script async="false" continueOnError="false" enabled="false" name="PY-Enrich">
+    <DisplayName>Enrich Order</DisplayName>
+    <ResourceURL>py://enrich.py</ResourceURL>
+</Script>

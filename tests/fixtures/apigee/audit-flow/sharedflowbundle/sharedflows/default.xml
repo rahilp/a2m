@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<SharedFlow name="default">
+    <Step>
+        <Name>AM-AuditHeader</Name>
+        <Condition>request.verb != "OPTIONS"</Condition>
+    </Step>
+    <Step>
+        <Name>KVM-Lookup</Name>
+    </Step>
+</SharedFlow>

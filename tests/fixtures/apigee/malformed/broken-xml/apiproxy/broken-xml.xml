@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="1" name="broken-xml">
+    <Basepaths>/broken-xml</Basepaths>
+    <Description>Malformed a2m test fixture</Description>
+    <DisplayName>broken-xml</DisplayName>
+    <Policies>
+        <Policy>AM-Ok</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>default</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>
