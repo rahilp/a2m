@@ -1,0 +1,40 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Secrets (real LLM provider key lives in an env var, never in the repo)
+.env
+.env.*
+!.env.example
+
+# Scratch a2m run output (anchored to the root so committed golden trees under
+# tests/ are NOT ignored)
+/results/
+/out/
+/scratch/
+/tmp/
+*.log
+!tests/**/*.log
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# .ratchet/ is intentionally NOT ignored here; .ratchet/.gitignore decides what
+# inside it is tracked (config.json, standards.md, learnings.md).
+
+# Maven build output (generated Mule projects and the mule-smoke reference), anywhere
+target/

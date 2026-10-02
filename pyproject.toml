@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a2m"
+version = "0.1.0"
+description = "Migrate Apigee proxy bundles to Mule 4 projects"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+# ruff and mypy are the project's static checks; CP1-T55/T61 run them.
+dev = ["pytest>=8", "ruff>=0.16", "mypy>=2.4"]
+
+[project.scripts]
+a2m = "a2m.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["a2m*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "runtime: needs Java, Maven and the Mule runtime installed",
+]
+
+[tool.ruff]
+# The code base wraps at about 120 characters; ruff's default of 88 would make
+# isort rewrap one-line imports (I001) that fit the project's own style.
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# The round-01 and round-02 test blocks import mid-file so no locked test line
+# changes; E402 makes their `# noqa: E402` markers meaningful (not RUF100).
+extend-select = ["E402"]
+
+[tool.ruff.lint.per-file-ignores]
+# These rules fire only on locked lines of this test file (CP1-T01 subprocess
+# calls without check=, CP1-T17 string join), which may not be edited.
+# Narrowly scoped to this one file; new code elsewhere is still checked.
+"tests/test_cp1_cli.py" = ["PLW1510", "FLY002"]

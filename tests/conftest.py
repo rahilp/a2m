@@ -1,0 +1,267 @@
+"""Shared pytest fixtures for a2m.
+
+Fixture bundles are built under ``tmp_path`` as minimal but valid Apigee
+proxies, so they stay valid once later checkpoints add a real parse stage.
+
+Stage contract used by the CP1 tests (the one injection seam):
+
+    a2m.cli.main(argv: list[str] | None = None, *, stages=None) -> int
+
+``stages`` is an optional list of per-proxy callables that replaces the
+default pipeline. Each stage is called once per proxy as ``stage(proxy)``,
+where ``proxy`` exposes at least ``proxy.name`` (str, the proxy name; for a
+zip it is the file stem) and ``proxy.out_dir`` (pathlib.Path, a folder under
+``--out`` where this proxy's output goes). A stage that raises marks that
+proxy as crashed; the batch carries on with the next proxy.
+"""
+
+from __future__ import annotations
+
+import os
+import zipfile
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+FIXED_ZIP_TIME = (2026, 1, 1, 0, 0, 0)
+
+
+@pytest.fixture(autouse=True)
+def _no_api_key_and_isolated_cwd(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """No test ever sees a real API key, and stray relative writes land in tmp_path."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+
+def bundle_files(name: str, base_path: str | None = None, target_url: str | None = None) -> dict[str, str]:
+    """Return {relative path: text} for a minimal valid Apigee proxy bundle."""
+    base_path = base_path if base_path is not None else f"/{name}"
+    target_url = target_url if target_url is not None else f"http://127.0.0.1:9/{name}"
+    return {
+        f"apiproxy/{name}.xml": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            f'<APIProxy revision="1" name="{name}">\n'
+            f"    <DisplayName>{name}</DisplayName>\n"
+            "    <Description>a2m test fixture</Description>\n"
+            "    <ProxyEndpoints>\n"
+            "        <ProxyEndpoint>default</ProxyEndpoint>\n"
+            "    </ProxyEndpoints>\n"
+            "    <TargetEndpoints>\n"
+            "        <TargetEndpoint>default</TargetEndpoint>\n"
+            "    </TargetEndpoints>\n"
+            "    <Policies/>\n"
+            "</APIProxy>\n"
+        ),
+        "apiproxy/proxies/default.xml": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            '<ProxyEndpoint name="default">\n'
+            "    <PreFlow name=\"PreFlow\">\n"
+            "        <Request/>\n"
+            "        <Response/>\n"
+            "    </PreFlow>\n"
+            "    <Flows/>\n"
+            "    <PostFlow name=\"PostFlow\">\n"
+            "        <Request/>\n"
+            "        <Response/>\n"
+            "    </PostFlow>\n"
+            "    <HTTPProxyConnection>\n"
+            f"        <BasePath>{base_path}</BasePath>\n"
+            "        <VirtualHost>default</VirtualHost>\n"
+            "    </HTTPProxyConnection>\n"
+            '    <RouteRule name="default">\n'
+            "        <TargetEndpoint>default</TargetEndpoint>\n"
+            "    </RouteRule>\n"
+            "</ProxyEndpoint>\n"
+        ),
+        "apiproxy/targets/default.xml": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            '<TargetEndpoint name="default">\n'
+            "    <PreFlow name=\"PreFlow\">\n"
+            "        <Request/>\n"
+            "        <Response/>\n"
+            "    </PreFlow>\n"
+            "    <Flows/>\n"
+            "    <PostFlow name=\"PostFlow\">\n"
+            "        <Request/>\n"
+            "        <Response/>\n"
+            "    </PostFlow>\n"
+            "    <HTTPTargetConnection>\n"
+            f"        <URL>{target_url}</URL>\n"
+            "    </HTTPTargetConnection>\n"
+            "</TargetEndpoint>\n"
+        ),
+    }
+
+
+def write_bundle_dir(
+    parent: Path, name: str, base_path: str | None = None, target_url: str | None = None
+) -> Path:
+    """Write an unzipped bundle at parent/<name>/apiproxy/... and return parent/<name>."""
+    root = parent / name
+    for rel, text in bundle_files(name, base_path, target_url).items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return root
+
+
+def write_bundle_zip(
+    parent: Path,
+    name: str,
+    extra_members: Iterable[tuple[str, str]] = (),
+    base_path: str | None = None,
+    target_url: str | None = None,
+) -> Path:
+    """Write parent/<name>.zip with apiproxy/ at the zip root (Apigee export layout).
+
+    ``extra_members`` are (member name, text) pairs written verbatim, which is
+    how the zip-slip fixtures add unsafe entries.
+    """
+    parent.mkdir(parents=True, exist_ok=True)
+    path = parent / f"{name}.zip"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for rel, text in bundle_files(name, base_path, target_url).items():
+            zf.writestr(zipfile.ZipInfo(rel, FIXED_ZIP_TIME), text)
+        for member, text in extra_members:
+            zf.writestr(zipfile.ZipInfo(member, FIXED_ZIP_TIME), text)
+    return path
+
+
+@pytest.fixture
+def make_bundle() -> Callable[..., Path]:
+    """make_bundle(parent, name, base_path=None, target_url=None) -> bundle folder."""
+    return write_bundle_dir
+
+
+@pytest.fixture
+def make_zip() -> Callable[..., Path]:
+    """make_zip(parent, name, extra_members=(), ...) -> zip path."""
+    return write_bundle_zip
+
+
+@pytest.fixture
+def results_dir(tmp_path: Path) -> Path:
+    """tmp_path/results. Not created in advance."""
+    return tmp_path / "results"
+
+
+@pytest.fixture
+def mixed_exports(tmp_path: Path) -> Path:
+    """Exports folder 'mixed': alpha/ (unzipped), beta.zip (zipped), gamma/ (unzipped)."""
+    exports = tmp_path / "mixed"
+    exports.mkdir()
+    write_bundle_dir(exports, "alpha")
+    write_bundle_zip(exports, "beta")
+    write_bundle_dir(exports, "gamma")
+    return exports
+
+
+@pytest.fixture
+def evil_dotdot_zip_member() -> tuple[str, str]:
+    return ("apiproxy/../../escaped.txt", "pwned")
+
+
+@pytest.fixture
+def evil_abs_zip_member(tmp_path: Path) -> tuple[str, str]:
+    return (str(tmp_path / "abs-escaped.txt"), "pwned")
+
+
+@pytest.fixture
+def broken_zip_bytes() -> bytes:
+    """200 bytes of deterministic non-zip garbage."""
+    data = (b"this is not a zip file, just garbage. " * 6)[:200]
+    assert len(data) == 200
+    return data
+
+
+@dataclass
+class Recorder:
+    """A per-proxy stage that records which proxies ran and writes one small file."""
+
+    calls: list[str] = field(default_factory=list)
+
+    def __call__(self, proxy: Any) -> None:
+        self.calls.append(proxy.name)
+        out_dir = Path(proxy.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "recorded.txt").write_text(f"recorded {proxy.name}\n", encoding="utf-8")
+
+
+@pytest.fixture
+def recorder() -> Recorder:
+    return Recorder()
+
+
+@pytest.fixture
+def crashing_stage() -> Callable[[Any], None]:
+    """Raises RuntimeError('boom in beta') only for the proxy named beta."""
+
+    def stage(proxy: Any) -> None:
+        if proxy.name == "beta":
+            raise RuntimeError("boom in beta")
+
+    return stage
+
+
+@dataclass
+class CliResult:
+    code: int
+    out: str
+    err: str
+
+
+@pytest.fixture
+def run_cli(capsys: pytest.CaptureFixture[str]) -> Callable[..., CliResult]:
+    """Run a2m.cli.main(argv, stages=...) in-process and capture its output.
+
+    A SystemExit (for example from argparse) is converted to its exit code so
+    usage errors can be asserted the same way as returned codes.
+    """
+
+    def _run(argv: list[str], stages: list[Callable[[Any], None]] | None = None) -> CliResult:
+        from a2m.cli import main
+
+        capsys.readouterr()
+        try:
+            if stages is None:
+                code = main(argv)
+            else:
+                code = main(argv, stages=stages)
+        except SystemExit as exc:  # argparse usage errors and --help
+            code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 2)
+        captured = capsys.readouterr()
+        return CliResult(code=code, out=captured.out, err=captured.err)
+
+    return _run
+
+
+@pytest.fixture
+def subprocess_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)
+    return env
+
+
+# ---------------------------------------------------------------- CP1 adversarial round 04 additions
+# New imports for the fixture below live here so no existing line changes.
+
+from collections.abc import Iterator  # noqa: E402
+
+STATIC_CHECK_CACHE_VARS = ("MYPY_CACHE_DIR", "RUFF_CACHE_DIR")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _static_check_caches_under_tmp(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """[CP1-T63] ruff and mypy run by tests keep their caches under pytest's tmp folder, never in the repo.
+
+    Session-scoped, so it is set before any function-scoped fixture (such as
+    ``subprocess_env``) copies the environment.
+    """
+    caches = tmp_path_factory.mktemp("static-check-caches")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("MYPY_CACHE_DIR", str(caches / "mypy"))
+        patch.setenv("RUFF_CACHE_DIR", str(caches / "ruff"))
+        yield caches
