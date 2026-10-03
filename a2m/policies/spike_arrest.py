@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import re
 
+from a2m.conditions import NO_CHANGES, RequestChanges
 from a2m.ir import Policy
 from a2m.policies.common import (
     NOW_MILLIS,
@@ -43,7 +44,6 @@ from a2m.policies.common import (
     os_remove,
     os_retrieve,
     os_store,
-    read_variable,
     set_variable,
     text,
     try_scope,
@@ -62,8 +62,8 @@ EMPTY, BLOCKED = -1, 0
 HANDLED = {"Rate", "Identifier", "MessageWeight", "UseEffectiveCount"}
 
 
-def translate(policy: Policy, *, direction: str) -> TemplateOutput:
-    draft = Draft(policy, direction, handled=HANDLED)
+def translate(policy: Policy, *, direction: str, changes: RequestChanges = NO_CHANGES) -> TemplateOutput:
+    draft = Draft(policy, direction, handled=HANDLED, changes=changes)
     settings = draft.settings
     rate_element = child(settings, "Rate")
     rate = text(rate_element)
@@ -94,13 +94,14 @@ def translate(policy: Policy, *, direction: str) -> TemplateOutput:
     identifier = child(settings, "Identifier")
     if identifier is not None:
         ref = identifier.attributes.get("ref", "").strip()
-        reader = read_variable(ref, direction) if ref else None
-        if reader is None:
+        read = draft.read(ref) if ref else None
+        if read is None or read.dw is None:
+            why = f" ({read.reason})" if read is not None and read.reason else ""
             return draft.skip(
                 f"SpikeArrest {policy.name} counts per identifier '{ref or identifier.text or ''}', "
-                "which a2m cannot read here; a shared limit would reject other callers"
+                f"which a2m cannot read here{why}; a shared limit would reject other callers"
             )
-        identity = f"'client:' ++ (({reader} default '') as String)"
+        identity = f"'client:' ++ (({read.dw} default '') as String)"
 
     store = f"a2m-spike-arrest-{key_part(policy.name)}"
     # An entry is read until one interval after the end of its bucket at the latest.

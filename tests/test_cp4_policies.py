@@ -551,7 +551,32 @@ def test_CP4_T03_a_steps_condition_is_kept_and_marked_pending_not_dropped(tmp_pa
     nearby = project.nearby_text(spike)
     assert any(SPIKE_CONDITION in text for text in nearby), f"condition not kept next to the step: {nearby}"
     pending = [(str(p.name), str(p.condition)) for p in result.pending]
-    assert ("Spike-Arrest", SPIKE_CONDITION) in pending, pending
+    # Either untranslated (#[false] guard, listed pending with the original condition) or translated
+    # (a non-constant DataWeave guard, not pending). Never both, never neither.
+    flow = project.listener_flow()
+    parents = {child: parent for doc in project.docs.values() for parent in doc.iter() for child in parent}
+    guards: list[str] = []
+    node = spike
+    while node is not flow and node in parents:
+        node = parents[node]
+        if is_element(node) and node.tag == tag(CORE, "when"):
+            guards.append(str(node.get("expression") or ""))
+    assert guards, "the conditional step is not guarded by a <when>"
+    guard = re.sub(r"\s+", "", guards[0])
+    spike_pending = [entry for entry in pending if entry[0] == "Spike-Arrest"]
+    records = [c for c in result.conditions if str(c.name) == "Spike-Arrest"]
+    assert len(records) == 1, (
+        f"expected one condition record for Spike-Arrest: {[str(c.name) for c in result.conditions]}"
+    )
+    if guard == "#[false]":
+        assert records[0].ok is False, "Spike-Arrest has a #[false] guard but its condition is marked translated"
+        assert str(records[0].original) == SPIKE_CONDITION, records[0].original
+        assert str(records[0].reason or "").strip(), "the untranslated Spike-Arrest condition has no reason"
+    else:
+        inner = guard[2:-1] if guard.startswith("#[") and guard.endswith("]") else ""
+        assert inner not in ("", "true", "false"), f"guard is not a non-constant DataWeave expression: {guards[0]}"
+        assert records[0].ok is True, "Spike-Arrest has a real guard but its condition is marked untranslated"
+        assert not spike_pending, f"a translated condition is still listed as pending: {pending}"
 
 
 def test_CP4_T04_oauthv2_is_listed_as_unsupported_with_its_name_and_type(tmp_path: Path) -> None:
@@ -570,12 +595,21 @@ def test_CP4_T04_oauthv2_is_listed_as_unsupported_with_its_name_and_type(tmp_pat
     sequence = project.sequence(STEP_NAMES | {"Verify-Token"})
     labels = [label for label, _ in sequence]
     assert "Verify-Token" not in labels, "an unsupported OAuthV2 step was generated as a Mule step"
-    key, spike = labels.index("Verify-Key"), labels.index("Spike-Arrest")
-    between = [node.text or "" for label, node in sequence[key + 1 : spike] if label == COMMENT]
+    # OAuthV2 (never generated) is the writer of client_id, so the SpikeArrest and Quota keyed on client_id
+    # must be refused with a reason naming the OAuthV2 step or the identifier, not emitted keyed on a null identity.
+    for keyed in ("Spike-Arrest", "Hourly-Quota"):
+        keyed_entry = record(result, keyed)
+        assert str(keyed_entry.method) == "skipped", summary(result)
+        assert any(word in str(keyed_entry.reason or "") for word in ("Verify-Token", "client_id")), (
+            f"the refused {keyed} reason names neither Verify-Token nor client_id: {keyed_entry.reason!r}"
+        )
+        assert keyed not in labels, f"{keyed}, keyed on the dropped client_id, was generated as a Mule step"
+    key, check = labels.index("Verify-Key"), labels.index("Check-IP")
+    between = [node.text or "" for label, node in sequence[key + 1 : check] if label == COMMENT]
     assert any("Verify-Token" in text and "OAuthV2" in text for text in between), (
-        f"no comment naming Verify-Token and OAuthV2 between Verify-Key and Spike-Arrest: {between}"
+        f"no comment naming Verify-Token and OAuthV2 between Verify-Key and Check-IP: {between}"
     )
-    assert project.order() == list(ORDER), project.order()
+    assert project.order() == [name for name in ORDER if name not in ("Spike-Arrest", "Hourly-Quota")], project.order()
 
 
 def test_CP4_T05_any_unknown_policy_type_is_listed_and_no_policy_goes_missing(tmp_path: Path) -> None:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ipaddress
 
+from a2m.conditions import NO_CHANGES, RequestChanges
 from a2m.ir import Policy
 from a2m.policies.common import (
     REQUEST,
@@ -36,8 +37,8 @@ CLIENT_NUMBER = (
 )
 
 
-def translate(policy: Policy, *, direction: str) -> TemplateOutput:
-    draft = Draft(policy, direction, handled=HANDLED)
+def translate(policy: Policy, *, direction: str, changes: RequestChanges = NO_CHANGES) -> TemplateOutput:
+    draft = Draft(policy, direction, handled=HANDLED, changes=changes)
     if direction != REQUEST:
         return draft.skip(
             f"AccessControl {policy.name} is in a response flow, where the generated app no longer has the "

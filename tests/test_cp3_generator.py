@@ -1071,8 +1071,26 @@ def test_CP3_T23_conditional_routes_become_a_choice_with_conditions_kept(tmp_pat
         for when in branches[:2]:
             assert condition not in (when.get("expression") or ""), "Apigee condition used as a Mule expression"
 
-    pending = {(str(item.name), str(item.condition)) for item in result.pending}
-    assert pending == {("beta", conditions["beta"]), ("canary", conditions["canary"])}
+    pending = [(str(item.name), str(item.condition)) for item in result.pending]
+    # Superseded by CP5: each conditional route is either untranslated (#[false] guard, listed pending
+    # with the original condition) or translated (a non-constant DataWeave guard, not pending).
+    # Never both, never neither.
+    for name, when in zip(("beta", "canary"), branches[:2], strict=True):
+        guard = re.sub(r"\s+", "", str(when.get("expression") or ""))
+        route_pending = [entry for entry in pending if entry[0] == name]
+        records = [c for c in result.conditions if str(c.name) == name]
+        assert len(records) == 1, (
+            f"expected one condition record for {name}: {[str(c.name) for c in result.conditions]}"
+        )
+        if guard == "#[false]":
+            assert records[0].ok is False, f"route {name} has a #[false] guard but its condition is marked translated"
+            assert str(records[0].original) == str(conditions[name]), records[0].original
+            assert str(records[0].reason or "").strip(), f"untranslated route {name} has no reason"
+        else:
+            inner = guard[2:-1] if guard.startswith("#[") and guard.endswith("]") else ""
+            assert inner not in ("", "true", "false"), f"guard is not a non-constant DataWeave expression: {guard}"
+            assert records[0].ok is True, f"route {name} has a real guard but its condition is marked untranslated"
+            assert not route_pending, f"a translated route condition is still listed as pending: {pending}"
 
 
 def test_CP3_T24_target_timeout_carries_over_and_other_settings_are_flagged(tmp_path: Path) -> None:

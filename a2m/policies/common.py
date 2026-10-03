@@ -1,8 +1,12 @@
 """What every policy template shares: the result types, reading the policy XML and building Mule XML.
 
-A template is a function ``translate(policy, *, direction) -> TemplateOutput``.
+A template is a function ``translate(policy, *, direction, changes) -> TemplateOutput``.
 ``direction`` is "request" or "response": the side of the flow its step sits
-in. The output holds the Mule processors placed at the step's position (all
+in. ``changes`` are the request headers, query parameters and verb earlier
+steps on the same path may have changed: a message template or a variable
+reference (``ref``, ``Ref``, ``Source``; see :func:`read_variable`) reading one
+of them can't be translated (see :mod:`a2m.conditions.variables`). The output
+holds the Mule processors placed at the step's position (all
 tags in ElementTree's ``{namespace-uri}local`` form), the top-level elements
 they need, the entries they add to the app's properties file, and the result
 record that later becomes the step's report row.
@@ -33,6 +37,17 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from a2m.conditions import NO_CHANGES, RequestChanges, Translation, translate_template
+from a2m.conditions.lexer import ConditionError
+from a2m.conditions.template import has_reference
+from a2m.conditions.variables import (  # noqa: F401 (re-exported)
+    RESPONSE_HEADERS_BASE,
+    RESPONSE_HEADERS_VAR,
+    SNAPSHOT_READ,
+    accessor,
+    is_custom_variable,
+    stale_part,
+)
 from a2m.ir import Policy, XmlElement
 
 CORE = "http://www.mulesoft.org/schema/mule/core"
@@ -53,72 +68,26 @@ NEED_FAULT = "fault"
 NEED_REASON_PHRASE = "reason-phrase"
 NEED_REQUEST_HEADERS = "request-headers"
 NEED_REQUEST_QUERY = "request-query"
+# A value reads the request on the response side: the generator saves the request snapshot before the target call.
+NEED_REQUEST_SNAPSHOT = "request-snapshot"
 
 REQUEST_HEADERS_VAR = "a2mRequestHeaders"
 REQUEST_QUERY_VAR = "a2mRequestQuery"
-RESPONSE_HEADERS_VAR = "responseHeaders"
 STATUS_VAR = "httpStatus"
 REASON_PHRASE_VAR = "a2mReasonPhrase"
 
 # The headers and query parameters of the request as it will be sent: changed by earlier steps, else the caller's.
 REQUEST_HEADERS_BASE = f"(vars.{REQUEST_HEADERS_VAR} default attributes.headers)"
 REQUEST_QUERY_BASE = f"(vars.{REQUEST_QUERY_VAR} default attributes.queryParams)"
-RESPONSE_HEADERS_BASE = f"(vars.{RESPONSE_HEADERS_VAR} default {{}})"
 NOW_MILLIS = "(now() as Number {unit: 'milliseconds'})"
 
 # Root attributes every policy may carry; continueOnError and enabled are handled separately.
 COMMON_ATTRIBUTES = frozenset({"name", "async", "continueOnError", "enabled"})
+UNRESOLVED_VARIABLES = "IgnoreUnresolvedVariables"
 COMMON_CHILDREN = frozenset({"DisplayName", "Description", "FaultRules", "Properties"})
 # HTTP header names and Apigee keywords are ASCII and compared without regard to case.
 ASCII_FOLD = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 UNSAFE_KEY_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
-# An Apigee message template reference such as {request.header.id} inside a literal value.
-TEMPLATE_REF = re.compile(r"\{[A-Za-z_][\w.\-]*\}")
-# Apigee variables a2m can read, by prefix; anything else with a built-in prefix is not readable.
-BUILTIN_PREFIXES = (
-    "request.",
-    "response.",
-    "message.",
-    "client.",
-    "proxy.",
-    "system.",
-    "environment.",
-    "organization.",
-    "apiproxy.",
-    "application.",
-    "error.",
-    "fault.",
-    "flow.",
-    "current.",
-    "router.",
-    "messageid",
-    "is.error",
-    "ratelimit.",
-    "verifyapikey.",
-    "oauthv2",
-    "apigee.",
-    "developer.",
-    "servicecallout.",
-)
-
-# Apigee's target.* variables; other names under target. (target.env, say) are the proxy's own.
-BUILTIN_TARGET_VARIABLES = (
-    "target.url",
-    "target.host",
-    "target.ip",
-    "target.name",
-    "target.port",
-    "target.scheme",
-    "target.basepath",
-    "target.copy",
-    "target.cn",
-    "target.expectedcn",
-    "target.received",
-    "target.sent",
-    "target.ssl",
-)
-
-
 class Method(StrEnum):
     TEMPLATE = "template"
     SKIPPED = "skipped"
@@ -130,6 +99,9 @@ class UnsupportedOption:
 
     name: str
     reason: str
+    # The setting's text as written in the bundle when it is kept because it can't be translated
+    # (a {variable} template a2m cannot read); the generator writes it beside the step.
+    original: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,16 +132,22 @@ class TemplateOutput:
     needs: frozenset[str] = frozenset()
     # A comment written above a property in the properties file, by key.
     property_notes: dict[str, str] = field(default_factory=dict)
+    # The proxy's own flow variables the processors write exactly as Apigee does (names in lower case); every
+    # other variable the policy may write in Apigee is one the generated app does not (see registry.variable_writes).
+    written: frozenset[str] = frozenset()
 
 
 class Draft:
     """Collects one template's output; :meth:`skip` and :meth:`done` turn it into a :class:`TemplateOutput`."""
 
-    def __init__(self, policy: Policy, direction: str, *, handled: Iterable[str] = ()) -> None:
+    def __init__(
+        self, policy: Policy, direction: str, *, handled: Iterable[str] = (), changes: RequestChanges = NO_CHANGES
+    ) -> None:
         if direction not in DIRECTIONS:
             raise ValueError(f"direction must be one of {DIRECTIONS}, not {direction!r}")
         self.policy = policy
         self.direction = direction
+        self.changes = changes
         self.options: list[UnsupportedOption] = []
         self.tags: list[str] = []
         self.processors: list[ET.Element] = []
@@ -177,6 +155,10 @@ class Draft:
         self.properties: dict[str, str] = {}
         self.property_notes: dict[str, str] = {}
         self.needs: set[str] = set()
+        # The last write of each flow variable or message part (lower case) the policy makes, in order: None when the
+        # processors make it exactly as Apigee does, else what made it in a way the template does not carry over.
+        # The last write decides: a later dropped write makes an earlier exact one stale, a later exact one replaces it.
+        self.writes: dict[str, str | None] = {}
         self._check_common(set(handled))
 
     @property
@@ -201,11 +183,88 @@ class Draft:
             elif child.tag == "FaultRules" and child.children:
                 self.option("FaultRules", "fault rules inside a policy are not carried over")
 
-    def option(self, name: str, reason: str) -> None:
-        self.options.append(UnsupportedOption(name, reason))
+    def option(self, name: str, reason: str, *, original: str | None = None) -> None:
+        self.options.append(UnsupportedOption(name, reason, original))
+
+    def template(
+        self,
+        setting: str,
+        value: str,
+        *,
+        prefix: str = "{",
+        suffix: str = "}",
+        changes: RequestChanges | None = None,
+    ) -> Translation | None:
+        """``value`` as an Apigee message template read on this step's side of the flow.
+
+        None when it can't be translated (including a reference to a request
+        header, query parameter or verb an earlier step may have changed): the
+        setting is then listed as an unsupported option holding its original
+        text, and must not be emitted. ``changes`` replaces the step's
+        :attr:`changes` (a policy that changes the request itself passes what
+        its earlier operations changed as well).
+        """
+        seen = self.changes if changes is None else changes
+        result = translate_template(value, prefix, suffix, direction=self.direction, changes=seen)
+        if not result.ok:
+            self.option(setting, f"can't translate the value of {setting}: {result.reason}", original=value)
+            return None
+        if result.reads_request_snapshot:
+            self.need(NEED_REQUEST_SNAPSHOT)
+        unresolved = UNRESOLVED_VARIABLES
+        if result.dw is not None and not flag(child(self.settings, unresolved)) and not self._noted(unresolved):
+            self.option(
+                unresolved,
+                f"{unresolved} is not true, so Apigee fails the call when a {{variable}} in a value is missing; "
+                "the generated app uses an empty string instead",
+            )
+        return result
+
+    def _noted(self, name: str) -> bool:
+        return any(option.name == name for option in self.options)
+
+    def value(self, setting: str, value: str, *, changes: RequestChanges | None = None) -> str | None:
+        """DataWeave for a setting's value: a quoted literal without variables, the translated template with
+        them, or None when it can't be translated (listed, see :meth:`template`)."""
+        result = self.template(setting, value, changes=changes)
+        if result is None:
+            return None
+        if result.dw is None:
+            return dw_string(value)
+        return f"({result.dw})" if " ++ " in result.dw else result.dw
+
+    def read(self, ref: str, *, changes: RequestChanges | None = None) -> VariableRead:
+        """The Apigee variable ``ref`` read on this step's side (see :func:`read_variable`), checked against the
+        step's :attr:`changes` (or ``changes``). The caller reports a refusal (``dw`` None) with its ``reason``;
+        a read of the request snapshot is wired up here."""
+        result = read_variable(ref, self.direction, self.changes if changes is None else changes)
+        if result.snapshot:
+            self.need(NEED_REQUEST_SNAPSHOT)
+        return result
 
     def need(self, *needs: str) -> None:
         self.needs.update(needs)
+
+    def wrote(self, *names: str) -> None:
+        """The processors write the flow variables ``names`` exactly as Apigee does (see :attr:`TemplateOutput.written`)."""
+        for name in names:
+            self.writes[fold(name.strip())] = None
+
+    def dropped(self, *names: str, by: str | None = None) -> None:
+        """The policy writes ``names`` in Apigee where the processors do not write them exactly; ``by`` names what made
+        that write (the policy by default), for a later read of the same policy to report."""
+        for name in names:
+            self.writes[fold(name.strip())] = by or self.policy.name
+
+    @property
+    def written(self) -> frozenset[str]:
+        """The names whose last write is exact (see :attr:`TemplateOutput.written`)."""
+        return frozenset(name for name, by in self.writes.items() if by is None)
+
+    @property
+    def stale(self) -> dict[str, str]:
+        """The names whose last write is not carried over exactly, by what made it."""
+        return {name: by for name, by in self.writes.items() if by is not None}
 
     def add(self, *processors: ET.Element) -> None:
         self.processors.extend(processors)
@@ -239,6 +298,7 @@ class Draft:
             self._result(Method.TEMPLATE, ""),
             frozenset(self.needs),
             dict(self.property_notes),
+            self.written,
         )
 
 
@@ -287,59 +347,45 @@ def key_part(name: str) -> str:
 
 
 def has_template(value: str) -> bool:
-    """True when ``value`` holds an Apigee {variable} reference that a literal copy would not resolve."""
-    return TEMPLATE_REF.search(value) is not None
+    """True when ``value`` holds an Apigee {variable} reference (or a {...} part a2m does not understand) that a
+    literal copy would not resolve; read with the one template reader (:mod:`a2m.conditions.template`)."""
+    return has_reference(value)
 
 
 # ---------------------------------------------------------------- Apigee variables as DataWeave
 
 
-def is_custom_variable(name: str) -> bool:
-    """True for a flow variable the proxy sets itself (not one of Apigee's built-in variables)."""
-    lowered = fold(name.strip())
-    if not lowered:
-        return False
-    if any(lowered == p.rstrip(".") or lowered.startswith(p) for p in BUILTIN_PREFIXES):
-        return False
-    return lowered != "target" and not any(
-        lowered == t or lowered.startswith(t + ".") for t in BUILTIN_TARGET_VARIABLES
-    )
+@dataclass(frozen=True, slots=True)
+class VariableRead:
+    """The DataWeave reading one Apigee variable named in a policy setting, or why a2m can't read it there.
+
+    ``dw`` is None when it can't be read and ``reason`` says why;
+    ``snapshot`` is True when ``dw`` reads the request snapshot (a request
+    variable read on the response side).
+    """
+
+    dw: str | None
+    reason: str = ""
+    snapshot: bool = False
 
 
-def var_ref(name: str) -> str:
-    """DataWeave reading flow variable ``name`` (an Apigee custom variable keeps its name in Mule)."""
-    return f"vars[{dw_string(name)}]"
+def read_variable(ref: str, direction: str, changes: RequestChanges = NO_CHANGES) -> VariableRead:
+    """The Apigee variable ``ref`` (a policy's ref attribute, Ref or Source) read on the ``direction`` side.
 
-
-def request_header(name: str) -> str:
-    """DataWeave reading request header ``name`` as it will be sent (changed by earlier steps or the caller's)."""
-    key = dw_string(fold(name))
-    return f"(if (vars.{REQUEST_HEADERS_VAR} == null) attributes.headers[{key}] else vars.{REQUEST_HEADERS_VAR}[{key}])"
-
-
-def request_query(name: str) -> str:
-    """DataWeave reading query parameter ``name`` as it will be sent."""
-    key = dw_string(name)
-    return f"(if (vars.{REQUEST_QUERY_VAR} == null) attributes.queryParams[{key}] else vars.{REQUEST_QUERY_VAR}[{key}])"
-
-
-def read_variable(ref: str, direction: str) -> str | None:
-    """DataWeave reading the Apigee variable ``ref`` on the ``direction`` side, or None when a2m cannot read it.
-
-    Readable: request headers and query parameters before the target call,
-    response headers after it, and custom flow variables anywhere.
+    Every request variable (``request.header.NAME``, ``request.queryparam.NAME``,
+    ``request.verb``, ``proxy.pathsuffix``), every response header
+    (``response.header.NAME``, on the response side) and every flow variable goes
+    through the one accessor conditions and message templates use
+    (:func:`a2m.conditions.variables.accessor`): the same meaning (a header is its
+    first comma-separated value, trimmed) and the same refusal of a part that
+    ``changes`` says an earlier step may have changed.
     """
     name = ref.strip()
-    lowered = fold(name)
-    if lowered.startswith("request.header.") and direction == REQUEST:
-        return request_header(name[len("request.header.") :])
-    if lowered.startswith("request.queryparam.") and direction == REQUEST:
-        return request_query(name[len("request.queryparam.") :])
-    if lowered.startswith("response.header.") and direction == RESPONSE:
-        return f"{RESPONSE_HEADERS_BASE}[{dw_string(fold(name[len('response.header.') :]))}]"
-    if is_custom_variable(name):
-        return var_ref(name)
-    return None
+    try:
+        read = accessor(name, direction, changes)
+    except ConditionError as exc:
+        return VariableRead(None, str(exc))
+    return VariableRead(read.dw, snapshot=SNAPSHOT_READ in read.dw)
 
 
 # ---------------------------------------------------------------- building Mule XML
@@ -383,7 +429,12 @@ def literal_value(value: str) -> str:
 
 def dw_object(pairs: Sequence[tuple[str, str]]) -> str:
     """A DataWeave object literal of string keys and string values, in order."""
-    return "{" + ", ".join(f"{dw_string(k)}: {dw_string(v)}" for k, v in pairs) + "}"
+    return dw_object_of([(k, dw_string(v)) for k, v in pairs])
+
+
+def dw_object_of(pairs: Sequence[tuple[str, str]]) -> str:
+    """A DataWeave object literal of string keys and DataWeave value expressions, in order."""
+    return "{" + ", ".join(f"{dw_string(k)}: {v}" for k, v in pairs) + "}"
 
 
 def dw_keys(keys: Iterable[str]) -> str:
@@ -405,8 +456,9 @@ def set_variable(name: str, value: str) -> ET.Element:
     return element(CORE, "set-variable", {"variableName": name, "value": value})
 
 
-def set_payload(value: str, mime_type: str | None = None) -> ET.Element:
-    attrib = {"value": literal_value(value)}
+def set_payload(value: str, mime_type: str | None = None, *, expression: str | None = None) -> ET.Element:
+    """Set the payload to ``value`` taken literally, or to the DataWeave ``expression`` when one is given."""
+    attrib = {"value": f"#[{expression}]" if expression is not None else literal_value(value)}
     if mime_type:
         attrib["mimeType"] = mime_type
     return element(CORE, "set-payload", attrib)

@@ -3,11 +3,13 @@
 The step sets the status (default 500 "Server Error", as Apigee), reason
 phrase, headers and payload of the answer and raises the policy-fault error;
 the listening flow's handler sends that answer, so no later step and no target
-call runs.
+call runs. Header, payload and reason phrase values are Apigee message templates,
+translated as in AssignMessage (see :mod:`a2m.conditions`).
 """
 
 from __future__ import annotations
 
+from a2m.conditions import NO_CHANGES, RequestChanges
 from a2m.ir import Policy, XmlElement
 from a2m.policies.common import (
     CORE,
@@ -21,11 +23,9 @@ from a2m.policies.common import (
     TemplateOutput,
     child,
     children,
-    dw_object,
-    dw_string,
+    dw_object_of,
     element,
     fold,
-    has_template,
     set_payload,
     set_variable,
     text,
@@ -37,8 +37,8 @@ DEFAULT_STATUS = 500
 DEFAULT_REASON = "Server Error"
 
 
-def translate(policy: Policy, *, direction: str) -> TemplateOutput:
-    draft = Draft(policy, direction, handled=HANDLED)
+def translate(policy: Policy, *, direction: str, changes: RequestChanges = NO_CHANGES) -> TemplateOutput:
+    draft = Draft(policy, direction, handled=HANDLED, changes=changes)
     response = child(draft.settings, "FaultResponse")
     set_block = child(response, "Set") if response is not None else None
     if response is not None:
@@ -60,22 +60,28 @@ def translate(policy: Policy, *, direction: str) -> TemplateOutput:
     status = int(status_text) if status_text is not None else DEFAULT_STATUS
     if reason is None and status_text is None:
         reason = DEFAULT_REASON
-    if reason is not None and has_template(reason):
-        draft.option("ReasonPhrase", "the reason phrase holds a {variable} reference, which is not translated yet")
-        reason = None
+    phrase = draft.value("ReasonPhrase", reason) if reason is not None else None
 
     draft.add(set_variable(STATUS_VAR, f"#[{status}]"))
-    if reason is not None:
+    if phrase is not None:
         draft.need(NEED_REASON_PHRASE)
-        draft.add(set_variable(REASON_PHRASE_VAR, f"#[{dw_string(reason)}]"))
+        draft.add(set_variable(REASON_PHRASE_VAR, f"#[{phrase}]"))
     headers = _headers(draft, set_block)
-    draft.add(set_variable(RESPONSE_HEADERS_VAR, f"#[{dw_object(headers)}]"))
+    draft.add(set_variable(RESPONSE_HEADERS_VAR, f"#[{dw_object_of(headers)}]"))
     payload = child(set_block, "Payload") if set_block is not None else None
     body = payload.text or "" if payload is not None else ""
-    if has_template(body):
-        draft.option("Set Payload", "the fault payload holds {variable} references, which are not translated yet")
-        body = ""
-    draft.add(set_payload(body, payload.attributes.get("contentType") if payload is not None else None))
+    expression: str | None = None
+    if payload is not None:
+        prefix = payload.attributes.get("variablePrefix") or "{"
+        suffix = payload.attributes.get("variableSuffix") or "}"
+        translated = draft.template("Set Payload", body, prefix=prefix, suffix=suffix)
+        if translated is None:
+            # The fault answer is still sent, with an empty body; the payload is listed as can't translate.
+            body = ""
+        else:
+            expression = translated.dw
+    content_type = payload.attributes.get("contentType") if payload is not None else None
+    draft.add(set_payload(body, content_type, expression=expression))
     draft.need(NEED_FAULT)
     draft.add(
         element(CORE, "raise-error", {"type": FAULT_ERROR_TYPE, "description": f"RaiseFault {policy.name} ({status})"})
@@ -88,9 +94,10 @@ def _headers(draft: Draft, set_block: XmlElement | None) -> list[tuple[str, str]
     found: list[tuple[str, str]] = []
     for header in children(group, "Header") if group is not None else []:
         name = header.attributes.get("name", "").strip()
-        value = header.text or ""
-        if not name or has_template(value):
-            draft.option(f"Header {name}".strip(), f"the fault header {name} holds a {{variable}} reference or no name")
+        if not name:
+            draft.option("Header", "a fault header without a name is not carried over")
             continue
-        found.append((fold(name), value))
+        value = draft.value(f"Header {name}", header.text or "")
+        if value is not None:
+            found.append((fold(name), value))
     return found

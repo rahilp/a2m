@@ -54,6 +54,6 @@
       ]
     ]
   },
-  "max_adversarial_rounds": 10,
-  "max_adversarial_rounds_run": 60
+  "max_adversarial_rounds": 12,
+  "max_adversarial_rounds_run": 100
 }

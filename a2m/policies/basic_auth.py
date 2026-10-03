@@ -9,6 +9,13 @@ Password variables to the parts before and after the first ':'.
 
 from __future__ import annotations
 
+from a2m.conditions import (
+    NO_CHANGES,
+    REQUEST_CONTENT_TYPE,
+    RESPONSE_CONTENT_TYPE,
+    RESPONSE_HEADER_PREFIX,
+    RequestChanges,
+)
 from a2m.ir import Policy
 from a2m.policies.common import (
     NEED_REQUEST_HEADERS,
@@ -27,7 +34,6 @@ from a2m.policies.common import (
     fold,
     is_custom_variable,
     is_true,
-    read_variable,
     set_variable,
     text,
     without_keys,
@@ -40,8 +46,8 @@ INVALID_SOURCE = "steps.basicauthentication.InvalidBasicAuthenticationSource"
 BASIC_VALUE = r"/(?i)^Basic\s+[A-Za-z0-9+\/]+=*\s*$/"
 
 
-def translate(policy: Policy, *, direction: str) -> TemplateOutput:
-    draft = Draft(policy, direction, handled=HANDLED)
+def translate(policy: Policy, *, direction: str, changes: RequestChanges = NO_CHANGES) -> TemplateOutput:
+    draft = Draft(policy, direction, handled=HANDLED, changes=changes)
     operation = text(child(draft.settings, "Operation")) or ""
     if fold(operation) == "encode":
         return _encode(draft)
@@ -50,6 +56,39 @@ def translate(policy: Policy, *, direction: str) -> TemplateOutput:
     return draft.skip(
         f"BasicAuthentication {policy.name} has the operation '{operation}'; only Encode and Decode are translated"
     )
+
+
+def request_changes(policy: Policy) -> RequestChanges:
+    """The request header an Encode writes in Apigee (AssignTo request.header.NAME), whether or not a2m carries it."""
+    operation = fold(text(child(policy.settings, "Operation")) or "")
+    target = text(child(policy.settings, "AssignTo")) or ""
+    prefix = "request.header."
+    if operation != "encode" or not fold(target).startswith(prefix):
+        return RequestChanges()
+    return RequestChanges(headers=frozenset({(fold(target[len(prefix) :]), policy.name)}))
+
+
+def variable_writes(policy: Policy) -> frozenset[str]:
+    """The proxy's own flow variables this policy writes in Apigee, in lower case: Decode's User and Password
+    refs, Encode's AssignTo (a flow variable or a response header, ``response.header.NAME``); an AssignTo of
+    the request or response Content-Type also changes it without the payload's media type, which a JSON read
+    needs to agree (:data:`REQUEST_CONTENT_TYPE`, :data:`RESPONSE_CONTENT_TYPE`), and is never written exactly."""
+    operation = fold(text(child(policy.settings, "Operation")) or "")
+    if operation == "decode":
+        names = [
+            (element.attributes.get("ref", "") if element is not None else "")
+            for element in (child(policy.settings, "User"), child(policy.settings, "Password"))
+        ]
+    elif operation == "encode":
+        names = [text(child(policy.settings, "AssignTo")) or ""]
+    else:
+        names = []
+    media = {"request.header.content-type": REQUEST_CONTENT_TYPE, "response.header.content-type": RESPONSE_CONTENT_TYPE}
+    return frozenset(
+        fold(name.strip())
+        for name in names
+        if name.strip() and (is_custom_variable(name) or fold(name.strip()).startswith(RESPONSE_HEADER_PREFIX))
+    ) | frozenset(media[fold(name.strip())] for name in names if fold(name.strip()) in media)
 
 
 def _ref(draft: Draft, tag: str) -> str | None:
@@ -62,10 +101,13 @@ def _encode(draft: Draft) -> TemplateOutput:
     user_ref, password_ref = _ref(draft, "User"), _ref(draft, "Password")
     if user_ref is None or password_ref is None:
         return draft.skip(f"BasicAuthentication {name} (Encode) needs <User ref> and <Password ref>")
-    user, password = read_variable(user_ref, draft.direction), read_variable(password_ref, draft.direction)
+    user_read, password_read = draft.read(user_ref), draft.read(password_ref)
+    user, password = user_read.dw, password_read.dw
     if user is None or password is None:
-        unreadable = user_ref if user is None else password_ref
-        return draft.skip(f"BasicAuthentication {name} reads {unreadable}, which a2m cannot read here")
+        unreadable, refused = (user_ref, user_read) if user is None else (password_ref, password_read)
+        return draft.skip(
+            f"BasicAuthentication {name} reads {unreadable}, which a2m cannot read here ({refused.reason})"
+        )
     assign_to = child(draft.settings, "AssignTo")
     target = text(assign_to) or ""
     if not target:
@@ -100,8 +142,10 @@ def _encode(draft: Draft) -> TemplateOutput:
         header = fold(target[len("response.header.") :])
         kept = without_keys(RESPONSE_HEADERS_BASE, [header])
         draft.add(set_variable(RESPONSE_HEADERS_VAR, f"#[{kept} ++ {{{dw_string(header)}: {value}}}]"))
+        draft.wrote(target)
     elif is_custom_variable(target):
         draft.add(set_variable(target, f"#[{value}]"))
+        draft.wrote(target)
     else:
         return draft.skip(
             f"BasicAuthentication {name} assigns to {target} in a {draft.direction} flow, which a2m cannot write"
@@ -112,9 +156,11 @@ def _encode(draft: Draft) -> TemplateOutput:
 def _decode(draft: Draft) -> TemplateOutput:
     name = draft.policy.name
     source = text(child(draft.settings, "Source")) or ""
-    reader = read_variable(source, draft.direction) if source else None
+    read = draft.read(source) if source else None
+    reader = read.dw if read is not None else None
     if reader is None:
-        return draft.skip(f"BasicAuthentication {name} (Decode) reads '{source}', which a2m cannot read here")
+        why = f" ({read.reason})" if read is not None and read.reason else ""
+        return draft.skip(f"BasicAuthentication {name} (Decode) reads '{source}', which a2m cannot read here{why}")
     user_ref, password_ref = _ref(draft, "User"), _ref(draft, "Password")
     if (
         user_ref is None
@@ -143,4 +189,5 @@ def _decode(draft: Draft) -> TemplateOutput:
         set_variable(user_ref, f"#[dw::core::Strings::substringBefore(vars.{DECODED_VAR}, ':')]"),
         set_variable(password_ref, f"#[dw::core::Strings::substringAfter(vars.{DECODED_VAR}, ':')]"),
     )
+    draft.wrote(user_ref, password_ref)
     return draft.done()

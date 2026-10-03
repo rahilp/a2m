@@ -18,6 +18,7 @@ object store entry per allowed call until its window ends.
 
 from __future__ import annotations
 
+from a2m.conditions import NO_CHANGES, RequestChanges
 from a2m.ir import Policy
 from a2m.policies.common import (
     NOW_MILLIS,
@@ -35,7 +36,6 @@ from a2m.policies.common import (
     os_retrieve,
     os_store,
     raise_error,
-    read_variable,
     set_variable,
     text,
     try_scope,
@@ -60,8 +60,8 @@ HANDLED = {
 }
 
 
-def translate(policy: Policy, *, direction: str) -> TemplateOutput:
-    draft = Draft(policy, direction, handled=HANDLED)
+def translate(policy: Policy, *, direction: str, changes: RequestChanges = NO_CHANGES) -> TemplateOutput:
+    draft = Draft(policy, direction, handled=HANDLED, changes=changes)
     draft.tags.append(TIME_WINDOW_TAG)
     settings = draft.settings
     allow = child(settings, "Allow")
@@ -91,13 +91,14 @@ def translate(policy: Policy, *, direction: str) -> TemplateOutput:
     identifier = child(settings, "Identifier")
     if identifier is not None:
         ref = identifier.attributes.get("ref", "").strip()
-        reader = read_variable(ref, direction) if ref else None
-        if reader is None:
+        read = draft.read(ref) if ref else None
+        if read is None or read.dw is None:
+            why = f" ({read.reason})" if read is not None and read.reason else ""
             return draft.skip(
                 f"Quota {policy.name} counts per identifier '{ref or identifier.text or ''}', "
-                "which a2m cannot read here; a shared counter would reject other callers"
+                f"which a2m cannot read here{why}; a shared counter would reject other callers"
             )
-        identity = f"(({reader} default '') as String)"
+        identity = f"(({read.dw} default '') as String)"
 
     allowed = int(count_text)
     store = f"a2m-quota-{key_part(policy.name)}"

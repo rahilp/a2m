@@ -148,15 +148,18 @@ def generate(context: ProxyContext) -> None:
     log.info("%s: wrote Mule project %s/ (%d files)", context.name, layout.MULE_APP_DIR_NAME, len(result.files))
     for item in result.unsupported:
         log.warning("%s: not generated: %s: %s", context.name, item.name, item.reason)
-    for pending in result.pending:
-        log.info(
-            "%s: %s %s (%s) keeps its condition for translation: %s",
-            context.name,
-            pending.kind,
-            pending.name,
-            pending.endpoint,
-            pending.condition,
-        )
+    for record in result.conditions:
+        if record.ok:
+            log.info("%s: %s %s condition translated: %s", context.name, record.kind, record.name, record.original)
+        else:
+            log.warning(
+                "%s: %s %s condition can't be translated (%s), so it never runs: %s",
+                context.name,
+                record.kind,
+                record.name,
+                record.reason,
+                record.original,
+            )
 
 
 # The per-proxy pipeline. Later checkpoints add verification stages here;

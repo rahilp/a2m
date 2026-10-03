@@ -25,7 +25,7 @@
             </http:response-validator>
         </http:request>
         <set-variable variableName="httpStatus" value="#[attributes.statusCode]" />
-        <set-variable variableName="responseHeaders" value="#[attributes.headers -- ['content-length', 'transfer-encoding', 'connection', 'content-type']]" />
+        <set-variable variableName="responseHeaders" value="#[attributes.headers -- ['content-length', 'transfer-encoding', 'connection']]" />
     </flow>
     <sub-flow name="shared-flow-GetSharedFlow">
         <!-- Step Get-Shared-Flow (KeyValueMapOperations) is not generated: KeyValueMapOperations policy Get-Shared-Flow is not translated in this version of a2m. -->

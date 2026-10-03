@@ -19,7 +19,7 @@
             </http:error-response>
         </http:listener>
         <try doc:name="Verify-Key">
-            <set-variable variableName="a2mApiKey" value="#[output application/java --- (if (vars.a2mRequestQuery == null) attributes.queryParams['apikey'] else vars.a2mRequestQuery['apikey'])]" />
+            <set-variable variableName="a2mApiKey" value="#[output application/java --- attributes.queryParams['apikey']]" />
             <choice>
                 <when expression="#[isEmpty(vars.a2mApiKey)]">
                     <set-variable variableName="httpStatus" value="#[output application/java --- 401]" />
@@ -34,6 +34,7 @@
                     <raise-error type="A2M:POLICY_FAULT" description="VerifyAPIKey Verify-Key rejected the call (401)" />
                 </when>
             </choice>
+            <set-variable variableName="client_id" value="#[output application/java --- vars.a2mApiKey]" />
             <error-handler>
                 <on-error-propagate type="A2M:POLICY_FAULT" logException="false" />
             </error-handler>
@@ -159,7 +160,7 @@
                 <on-error-propagate type="A2M:POLICY_FAULT" logException="false" />
             </error-handler>
         </try>
-        <set-variable variableName="ext.orderId" value="#[output application/java --- if ((payload is Object) or (payload is Array)) payload['order']['id'] else null]" doc:name="Extract-Order-Id" />
+        <set-variable variableName="ext.orderId" value="#[output application/java --- (do { var found = (['order', 'id']) reduce ((step, node = (if (((lower(trim(((((if ((vars.a2mRequestHeaders default attributes.headers)['content-type'] == null) null else trim(((vars.a2mRequestHeaders default attributes.headers)['content-type'] splitBy &quot;,&quot;)[0] default &quot;&quot;))) default '') splitBy ';')[0] default '')) == 'application/json')) and ((payload is Object) or (payload is Array))) payload else null)) -&gt; if (node == null) null else if (step is Number) (if (node is Array) node[step] else null) else (if (node is Object) node[step] else null)) --- if (found == null) null else if (found is String) found else if ((found is Object) or (found is Array)) write(found, 'application/json', {indent: false}) else (found as String) }) default vars['ext.orderId']]" doc:name="Extract-Order-Id" />
         <try doc:name="Encode-Basic-Auth">
             <choice>
                 <when expression="#[(vars['creds.user']) == null or (vars['creds.pass']) == null]">
@@ -191,7 +192,7 @@
             </http:response-validator>
         </http:request>
         <set-variable variableName="httpStatus" value="#[attributes.statusCode]" />
-        <set-variable variableName="responseHeaders" value="#[attributes.headers -- ['content-length', 'transfer-encoding', 'connection', 'content-type']]" />
+        <set-variable variableName="responseHeaders" value="#[attributes.headers -- ['content-length', 'transfer-encoding', 'connection']]" />
         <set-variable variableName="responseHeaders" value="#[output application/java --- ((vars.responseHeaders default {}) filterObject ((value, key) -&gt; not (['x-internal'] contains lower(key as String))))]" doc:name="Strip-Internal" />
         <set-variable variableName="responseHeaders" value="#[output application/java --- (((vars.responseHeaders default {}) filterObject ((value, key) -&gt; not (['x-served-by'] contains lower(key as String)))) ++ {'x-served-by': 'a2m'})]" doc:name="Set-Response-Header" />
         <error-handler>

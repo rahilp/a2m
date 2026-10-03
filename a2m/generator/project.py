@@ -18,14 +18,31 @@ in Apigee's execution order, and :attr:`GenerateResult.policies` holds one
 result record per step (``template`` or ``skipped``). A skipped step leaves an
 XML comment naming the step and its type where it would have been.
 
+Conditions go through :mod:`a2m.conditions`. A conditional step sits alone
+in a ``choice``/``when`` at its place; the conditional Flows of an endpoint
+become one ``choice`` that runs the first matching flow, in Apigee's order
+(a flow without a condition is the ``otherwise``); conditional RouteRules
+become the ``when`` branches of the routing choice. A condition, message
+template or target URL that reads a request header, query parameter or the
+verb an earlier step on the same path may change (AssignMessage,
+BasicAuthentication Encode, also inside a shared flow) can't be translated:
+the generated app's attributes keep the caller's values. Each conditional
+Flow's own condition is checked against the changes made before the flows
+only, since a sibling Flow that was tried first never ran. Request variables
+read on the response side read a snapshot of the request as sent, saved in
+the flow variable ``a2mSentRequest`` right before the target call (or where the
+route ends without one); it is only written when something reads it. A
+condition that can't be
+translated keeps its ``when`` at ``#[false]`` (the step, flow or route never
+runs, it never runs unguarded), with "can't translate", the original text and
+the reason beside it in the flow XML. :attr:`GenerateResult.conditions` holds
+one record per non-empty condition in the bundle, translated or not, including
+those of fault rules and other parts that are not generated.
+
 Nothing is dropped silently. Whatever this step does not generate (policies
-without a template, settings a template cannot carry over, conditional flows,
-fault rules, target settings, targets without a fixed URL, ...) is listed in
-:attr:`GenerateResult.unsupported` with a reason, and every conditional
-RouteRule or step is kept in :attr:`GenerateResult.pending` with its original
-condition for the condition translator. Until it is translated, a conditional
-route's branch or step never runs (its ``when`` is ``#[false]``) and the
-original condition is kept beside it in the flow XML.
+without a template, settings a template cannot carry over, fault rules,
+target settings, targets without a fixed URL, ...) is listed in
+:attr:`GenerateResult.unsupported` with a reason.
 
 All XML is built with :mod:`xml.etree.ElementTree`, so every value from the
 bundle is escaped. The output is deterministic: no timestamps, no absolute
@@ -47,6 +64,19 @@ from typing import cast
 from urllib.parse import urlsplit
 
 from a2m import safefs
+from a2m.conditions import (
+    ANY,
+    FAULT,
+    NO_CHANGES,
+    SNAPSHOT_VAR,
+    RequestChanges,
+    Translation,
+    dw_string,
+    template_parts,
+    translate_condition,
+    translate_template,
+)
+from a2m.conditions.variables import EXACT_PATH_SUFFIX_DW, RESPONSE_FRAMING_HEADERS, fold
 from a2m.ir import (
     Bundle,
     BundleKind,
@@ -67,6 +97,7 @@ from a2m.policies.common import (
     NEED_REASON_PHRASE,
     NEED_REQUEST_HEADERS,
     NEED_REQUEST_QUERY,
+    NEED_REQUEST_SNAPSHOT,
     REASON_PHRASE_VAR,
     REQUEST,
     REQUEST_HEADERS_VAR,
@@ -117,19 +148,20 @@ TIMEOUT_PROPERTY = "io.timeout.millis"
 DEFAULT_PORTS = {"http": 80, "https": 443}
 PROTOCOLS = {"http": "HTTP", "https": "HTTPS"}
 FLOW_CALLOUT = "FlowCallout"
+# The flow variables holding the name of the conditional Flow that matched the request, so the same
+# flow's response steps run after the target call (Apigee picks the flow once, on the request).
+PROXY_FLOW_VAR = "a2mFlow"
+TARGET_FLOW_VAR = "a2mTargetFlow"
+CANT_TRANSLATE_TAG = "condition-cant-translate"
 SHARED_FLOW_ENTRY = "default"
 XML_HEAD = '<?xml version="1.0" encoding="UTF-8"?>\n'
 
-# The request path below the matched base path (Apigee's proxy.pathsuffix). Every listener path
-# ends in '/*', and Mule's maskedRequestPath is the part of the raw request path that trailing
-# '*' matched, so a wildcard segment of any length in the base path ('/v1/*/search') is never
-# forwarded: '/v1/acme/search/items' gives '/items'. Mule gives '/' both for the base path itself
-# and for the base path with a trailing slash; Apigee's suffix is '' for the first (so the
-# target gets exactly its own base path) and '/' for the second.
-REQUEST_PATH = (
-    "#[if (attributes.maskedRequestPath == '/' and not (attributes.rawRequestPath endsWith '/')) '' "
-    "else attributes.maskedRequestPath]"
-)
+# The request path below the matched base path: Apigee's proxy.pathsuffix, so the target gets exactly its own base
+# path for a call to the bare base path (see EXACT_PATH_SUFFIX_DW).
+REQUEST_PATH_DW = EXACT_PATH_SUFFIX_DW
+REQUEST_PATH = f"#[{REQUEST_PATH_DW}]"
+# A target URL's {variable} reference (as message templates write it).
+URL_SCHEME = re.compile(r"(?i)http(s?)://")
 # Hop-by-hop and length headers the HTTP connector sets itself; everything else is passed on.
 HOP_HEADERS = "['host', 'content-length', 'transfer-encoding', 'connection']"
 REQUEST_HEADERS = f"#[attributes.headers -- {HOP_HEADERS}]"
@@ -137,8 +169,16 @@ REQUEST_QUERY = "#[attributes.queryParams]"
 # The same, once a policy step may have changed the headers or query parameters the target gets.
 CHANGED_REQUEST_HEADERS = f"#[(vars.{REQUEST_HEADERS_VAR} default attributes.headers) -- {HOP_HEADERS}]"
 CHANGED_REQUEST_QUERY = f"#[vars.{REQUEST_QUERY_VAR} default attributes.queryParams]"
-# Content-Type travels as the payload's media type, so it is not copied twice.
-RESPONSE_HEADERS = "#[attributes.headers -- ['content-length', 'transfer-encoding', 'connection', 'content-type']]"
+# The request as sent (or as it stands where a route ends without a target call), for response-side reads of
+# request variables (see a2m.conditions.variables): the keys are the ones the accessor reads.
+REQUEST_SNAPSHOT = (
+    "#[output application/java --- {method: attributes.method, pathSuffix: attributes.maskedRequestPath, "
+    f"headers: (vars.{REQUEST_HEADERS_VAR} default attributes.headers), "
+    f"queryParams: (vars.{REQUEST_QUERY_VAR} default attributes.queryParams)}}]"
+)
+# The target's headers as the response being built: Content-Type included (the listener sends that header rather than
+# the payload's media type, and response.header.Content-Type reads it), the framing headers Mule writes itself not.
+RESPONSE_HEADERS = "#[attributes.headers -- [" + ", ".join(f"'{h}'" for h in RESPONSE_FRAMING_HEADERS) + "]]"
 NO_ROUTE_FAULT = '{"fault": "No route of the migrated proxy matched this request."}'
 NO_TARGET_FAULT = '{"fault": "The target of this route was not migrated; see the migration report."}'
 # What a caller gets when the flow fails (target down, timeout, any Mule error). Mule's error
@@ -172,9 +212,11 @@ class UnsupportedItem:
 
 @dataclass(frozen=True, slots=True)
 class PendingCondition:
-    """A conditional RouteRule or step kept for the condition translator: ``condition`` is the original text.
+    """A condition left for a later translation step: ``condition`` is the original text.
 
-    ``endpoint`` is the ProxyEndpoint of a RouteRule, or where a step sits.
+    Every condition is translated or marked can't translate (see
+    :class:`ConditionRecord`), so :attr:`GenerateResult.pending` stays empty;
+    the type is kept for callers that read it.
     """
 
     name: str
@@ -184,12 +226,33 @@ class PendingCondition:
 
 
 @dataclass(frozen=True, slots=True)
+class ConditionRecord:
+    """One non-empty condition of the bundle: translated (``ok``, ``dw``) or can't translate (``reason``).
+
+    ``name`` is the step, flow, fault rule or route rule; ``kind`` says which
+    (Step, Flow, FaultRule, DefaultFaultRule, RouteRule); ``location`` is where
+    it sits; ``original`` is the condition text as read from the bundle; ``dw``
+    is the DataWeave expression without the ``#[ ]`` wrapper.
+    """
+
+    name: str
+    kind: str
+    location: str
+    original: str
+    ok: bool
+    dw: str | None
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class GenerateResult:
     files: tuple[str, ...]
     unsupported: tuple[UnsupportedItem, ...]
     pending: tuple[PendingCondition, ...]
     # One result record per policy step, in flow order (a policy used by two steps has two records).
     policies: tuple[PolicyResult, ...] = ()
+    # One record per non-empty condition, in the order the generator met them (a step generated twice has two).
+    conditions: tuple[ConditionRecord, ...] = ()
 
 
 class GeneratorError(ValueError):
@@ -218,8 +281,9 @@ def generate_project(
     return GenerateResult(
         files=tuple(sorted(files)),
         unsupported=tuple(builder.unsupported),
-        pending=tuple(builder.pending),
+        pending=(),
         policies=tuple(builder.records),
+        conditions=tuple(builder.conditions),
     )
 
 
@@ -232,6 +296,14 @@ class _Address:
     host: str
     port: str
     base_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class _TemplateAddress:
+    """A target URL with {variable} references: its fixed protocol and the URL as written."""
+
+    protocol: str
+    url: str
 
 
 def shown_url(url: str) -> str:
@@ -262,7 +334,7 @@ def _parse_url(url: str) -> _Address | str:
     """The target address in ``url``, or the reason it cannot be used as a fixed address."""
     shown = shown_url(url)
     if "{" in url or "}" in url:
-        return f"its URL {shown} contains a flow variable; variables in target URLs are translated in a later step"
+        return f"its URL {shown} contains a {{variable}} reference; a2m does not translate variables in target URLs"
     split = urlsplit(url.strip())
     scheme = split.scheme  # urlsplit gives it in lower case
     if scheme not in DEFAULT_PORTS:
@@ -280,6 +352,37 @@ def _parse_url(url: str) -> _Address | str:
     written = split.netloc.rpartition("@")[2]
     host = split.hostname if written.startswith("[") else written.partition(":")[0]
     return _Address(PROTOCOLS[scheme], host, str(port or DEFAULT_PORTS[scheme]), path)
+
+
+def _template_url(url: str) -> _TemplateAddress | str:
+    """The target address of a URL with {variable} references, or the reason it can't be generated.
+
+    The scheme must be written literally (the request config is HTTP or HTTPS),
+    every brace must belong to a {variable} reference a2m can read, and the URL
+    may hold no query string or credentials (as for a fixed URL). With a
+    placeholder for each reference, the rest must still be an http or https
+    address with a host. The final check of the references (on the route's
+    path) is in :meth:`_ProjectBuilder._target_processors`.
+    """
+    shown = shown_url(url)
+    text = url.strip()
+    parts = template_parts(text)
+    if any(p.variable is None and ("{" in p.text or "}" in p.text) for p in parts):
+        return f"its URL {shown} holds a brace that is not a {{variable}} reference"
+    scheme = URL_SCHEME.match(text)
+    if scheme is None:
+        return f"its URL {shown} does not start with a fixed http:// or https://"
+    translation = translate_template(text, direction=REQUEST)
+    if not translation.ok:
+        return f"its URL {shown} can't be translated: {translation.reason}"
+    split = urlsplit("".join("0" if p.variable is not None else p.text for p in parts))
+    if split.query or split.fragment:
+        return f"its URL {shown} has a query string or fragment, which a2m does not carry over with {{variable}} references"
+    if split.username is not None or split.password is not None:
+        return f"its URL {shown} holds credentials, which a2m does not copy into the project"
+    if not split.hostname:
+        return f"its URL {shown} has no host"
+    return _TemplateAddress("HTTPS" if scheme.group(1) else "HTTP", text)
 
 
 def listener_path(base_path: str | None) -> str:
@@ -350,11 +453,16 @@ class _Names:
 
 @dataclass
 class _TargetPlan:
-    """How one TargetEndpoint is generated: its request config, or None when it cannot be (already reported)."""
+    """How one TargetEndpoint is generated: its request config, or None when it cannot be (already reported).
+
+    ``url`` is the target URL as written when it has {variable} references; the
+    request then sends to that URL, translated on each route's path.
+    """
 
     config: str | None
     key: str | None
     timeout: bool
+    url: str | None = None
 
 
 class _ProjectBuilder:
@@ -369,7 +477,6 @@ class _ProjectBuilder:
         self.props: dict[str, str] = {LISTENER_HOST_KEY: LISTENER_HOST, LISTENER_PORT_KEY: LISTENER_PORT}
         self.unsupported: list[UnsupportedItem] = []
         self._seen_items: set[tuple[str, str]] = set()
-        self.pending: list[PendingCondition] = []
         self.globals: list[ET.Element] = []
         self.flows: list[ET.Element] = []
         self.sub_flows: list[ET.Element] = []
@@ -382,6 +489,7 @@ class _ProjectBuilder:
         self.dropped_route_targets: set[str] = set()
         self.names.take(LISTENER_CONFIG)
         self.records: list[PolicyResult] = []
+        self.conditions: list[ConditionRecord] = []
         # What the generated policy steps need from the flows (see a2m.policies.common), and their globals.
         self.needs: set[str] = set()
         self.policy_globals: list[ET.Element] = []
@@ -389,6 +497,18 @@ class _ProjectBuilder:
         self.property_notes: dict[str, str] = {}
         self.requests: list[ET.Element] = []
         self.listener_responses: list[ET.Element] = []
+        # The request headers and query parameters the steps generated so far on the current path may change
+        # (see RequestChanges): a request-side condition reading one of them can't be translated.
+        self.changes: RequestChanges = NO_CHANGES
+        self.shared_changes: dict[tuple[str, str], RequestChanges] = {}
+        self.sub_flow_bases: dict[str, RequestChanges] = {}
+        # While generating a branch that never runs in the generated app (a Flow or RouteRule whose condition can't
+        # be translated is a #[false] branch), that Flow or RouteRule: every write of its steps counts as dropped.
+        self.dead: str | None = None
+        # The conditional flows generated as a #[false] branch (by id): their response steps never run either.
+        self.dead_flows: set[int] = set()
+        # Every request snapshot written (one per place a route ends); removed again when nothing reads them.
+        self.snapshots: list[ET.Element] = []
 
     # ------------------------------------------------------------ results
 
@@ -396,6 +516,16 @@ class _ProjectBuilder:
         if (name, reason) not in self._seen_items:
             self._seen_items.add((name, reason))
             self.unsupported.append(UnsupportedItem(name, reason))
+
+    def _condition(self, name: str, kind: str, where: str, text: str | None, direction: str) -> Translation | None:
+        """Translate and record a condition; None when there is none (absent or empty: Apigee runs always)."""
+        if text is None or not text.strip():
+            return None
+        translation = translate_condition(text, direction=direction, changes=self.changes)
+        self.conditions.append(
+            ConditionRecord(name, kind, where, text, translation.ok, translation.dw, translation.reason)
+        )
+        return translation
 
     def build(self) -> dict[str, str]:
         listener = _element(CORE, "configuration-properties", {"file": PROPERTIES_FILE})
@@ -417,6 +547,7 @@ class _ProjectBuilder:
 
         files: dict[str, str] = {}
         main = [listener, listener_config, *self.globals, *self.policy_globals, *self.flows, *self.sub_flows]
+        _drop_undeclared_error_handlers(main)
         files["/".join((*MULE_DIR, PROXY_FILE))] = _mule_document(main)
         configs = sorted(path.rsplit("/", 1)[-1] for path in files)
         files["/".join((*RESOURCES_DIR, PROPERTIES_FILE))] = _properties_text(self.props, self.property_notes)
@@ -425,7 +556,14 @@ class _ProjectBuilder:
         return files
 
     def _wire_policy_needs(self) -> None:
-        """Connect the generated policy steps to the flows: changed request parts, fault answers, reason phrases."""
+        """Connect the generated policy steps to the flows: changed request parts, fault answers, reason phrases,
+        the request snapshot."""
+        if NEED_REQUEST_SNAPSHOT not in self.needs:
+            snapshots = {id(snapshot) for snapshot in self.snapshots}
+            for root in [*self.flows, *self.sub_flows]:
+                for parent in root.iter():
+                    for node in [c for c in parent if id(c) in snapshots]:
+                        parent.remove(node)
         for request in self.requests:
             headers = request.find(f"{{{HTTP}}}headers")
             query = request.find(f"{{{HTTP}}}query-params")
@@ -466,16 +604,22 @@ class _ProjectBuilder:
         _child(error, HTTP, "body").text = _error_body()
         self._check_endpoint_settings(endpoint, where)
 
+        self.changes = NO_CHANGES
         flow.extend(self._steps(endpoint.pre_flow.request, f"{where} PreFlow request", REQUEST))
-        self._skip_flows(endpoint.flows, where)
+        flow_choice, matched = self._conditional_flows(endpoint.flows, where, PROXY_FLOW_VAR)
+        flow.extend(flow_choice)
         flow.extend(self._steps(endpoint.post_flow.request, f"{where} PostFlow request", REQUEST))
         flow.extend(self._routing(endpoint, where))
         # Apigee's response order: the target's response steps (inside the routing above), then this
-        # endpoint's PreFlow, conditional Flows (reported by _skip_flows) and PostFlow response steps.
+        # endpoint's PreFlow, matched conditional Flow and PostFlow response steps.
         flow.extend(self._steps(endpoint.pre_flow.response, f"{where} PreFlow response", RESPONSE))
+        flow.extend(self._flow_responses(matched, where, PROXY_FLOW_VAR))
         flow.extend(self._steps(endpoint.post_flow.response, f"{where} PostFlow response", RESPONSE))
         if endpoint.post_client_flow is not None:
+            # It runs after the response is sent: its writes reach nothing generated.
+            path = self.changes
             self._skip_flow_steps(endpoint.post_client_flow, f"{where} PostClientFlow")
+            self.changes = path
         self._skip_fault_rules(endpoint, where)
         return flow
 
@@ -483,6 +627,7 @@ class _ProjectBuilder:
         """Report a ProxyEndpoint whose base path has no Mule listener path, and everything in it."""
         where = f"ProxyEndpoint {endpoint.name}"
         base = endpoint.base_path or ""
+        self.changes = NO_CHANGES
         self.skip(
             f"BasePath {base}",
             f"{where}: base path {base} cannot be a Mule listener path ({reason}), "
@@ -496,6 +641,7 @@ class _ProjectBuilder:
         self._skip_fault_rules(endpoint, where)
         for rule in endpoint.route_rules:
             self.skip(rule.name, f"{where}: RouteRule {rule.name} is not generated, since its ProxyEndpoint is not")
+            self._condition(rule.name, "RouteRule", where, rule.condition, REQUEST)
             if rule.target is not None:
                 self.dropped_route_targets.add(rule.target)
 
@@ -521,80 +667,185 @@ class _ProjectBuilder:
                 self.skip(element.tag, f"{where}: <{element.tag}> is not carried over")
 
     def _skip_flows(self, flows: Sequence[Flow], where: str) -> None:
+        """Report the conditional flows of an endpoint that is not generated, and everything in them."""
         for flow in flows:
             condition = f" (condition {flow.condition})" if flow.condition else " (no condition)"
             self.skip(
                 flow.name,
-                f"{where}: flow {flow.name}{condition} is not generated yet; its steps are listed separately",
+                f"{where}: flow {flow.name}{condition} is not generated, since {where} is not; "
+                "its steps are listed separately",
             )
+            self._condition(flow.name, "Flow", where, flow.condition, REQUEST)
             self._skip_flow_steps(FlowSteps(flow.request, flow.response), f"{where} flow {flow.name}")
 
     def _skip_flow_steps(self, steps: FlowSteps, where: str) -> None:
-        for direction, items in (("request", steps.request), ("response", steps.response)):
-            self._skip_steps(items, f"{where} {direction}")
+        for direction, items in ((REQUEST, steps.request), (RESPONSE, steps.response)):
+            self._skip_steps(items, f"{where} {direction}", direction=direction)
 
-    def _skip_steps(self, steps: Sequence[Step], where: str, policies: dict[str, Policy] | None = None) -> None:
+    def _skip_steps(
+        self, steps: Sequence[Step], where: str, policies: dict[str, Policy] | None = None, *, direction: str
+    ) -> None:
+        """Report steps that are not generated. Apigee still runs them, so everything each may write counts as
+        dropped for what is read after it (a caller whose skipped part is off the generated path restores
+        :attr:`changes` afterwards)."""
         policies = self.policies if policies is None else policies
         for step in steps:
             reason = f"{where}: step {step.name} is in a part of the flow that is not generated yet"
             self.skip(step.name, reason)
-            self._record_skipped(step, policies, where, reason)
+            self._record_skipped(step, policies, where, reason, direction)
+            dropped = self._dropped_writes(step, policies, direction, self.changes, set(self.in_progress), runs=False)
+            self.changes = self.changes | self._step_changes(step, policies, set(), direction) | dropped
 
-    def _record_skipped(self, step: Step, policies: dict[str, Policy], where: str, reason: str) -> None:
+    def _record_skipped(
+        self, step: Step, policies: dict[str, Policy], where: str, reason: str, direction: str
+    ) -> None:
         policy = policies.get(step.policy)
         kind = policy.type if policy is not None else "unknown"
+        self._condition(step.name, "Step", where, step.condition, direction)
         self.records.append(
             PolicyResult(step.name, kind, Method.SKIPPED, reason, location=where, condition=step.condition)
         )
 
     def _skip_fault_rules(self, endpoint: ProxyEndpoint | TargetEndpoint, where: str) -> None:
+        # A fault rule may run before or after the target call, so whether the request snapshot exists is not
+        # known: its conditions are read with the FAULT direction, which refuses request variables. A fault rule's
+        # steps count as writers for the fault rules after it, never for the generated path.
+        path = self.changes
+        self._fault_rules(endpoint, where)
+        self.changes = path
+
+    def _fault_rules(self, endpoint: ProxyEndpoint | TargetEndpoint, where: str) -> None:
         for rule in endpoint.fault_rules:
             self.skip(rule.name, f"{where}: fault rule {rule.name} is not generated yet")
-            self._skip_steps(rule.steps, f"{where} fault rule {rule.name}")
+            self._condition(rule.name, "FaultRule", where, rule.condition, FAULT)
+            self._skip_steps(rule.steps, f"{where} fault rule {rule.name}", direction=FAULT)
         default = endpoint.default_fault_rule
         if default is not None:
             self.skip(default.name, f"{where}: default fault rule {default.name} is not generated yet")
-            self._skip_steps(default.steps, f"{where} default fault rule {default.name}")
+            self._condition(default.name, "DefaultFaultRule", where, default.condition, FAULT)
+            self._skip_steps(default.steps, f"{where} default fault rule {default.name}", direction=FAULT)
+
+    # ------------------------------------------------------------ conditional flows
+
+    def _conditional_flows(
+        self, flows: Sequence[Flow], where: str, var: str
+    ) -> tuple[list[ET.Element], list[Flow]]:
+        """The processors that run the first conditional flow whose condition matches, and the flows they can run.
+
+        Apigee tries the flows in order on the request and runs the first that
+        matches; a flow without a condition always matches, so the flows after it
+        never run (reported). Each branch records the flow's name in ``var`` for
+        :meth:`_flow_responses`. A flow whose condition can't be translated is a
+        ``#[false]`` branch: it never runs.
+        """
+        if not flows:
+            return [], []
+        choice = _element(CORE, "choice")
+        matched: list[Flow] = []
+        fallback: Flow | None = None
+        # Each flow's condition and steps start from the changes made before the choice (a flow tried earlier did
+        # not match, so its steps never ran); after the choice, any branch may have run.
+        before = after = self.changes
+        outer = self.dead
+        for flow in flows:
+            self.changes = before
+            if fallback is not None:
+                self.skip(
+                    flow.name,
+                    f"{where}: flow {flow.name} comes after flow {fallback.name}, which has no condition, "
+                    "so Apigee never runs it",
+                )
+                self._condition(flow.name, "Flow", where, flow.condition, REQUEST)
+                self._skip_flow_steps(FlowSteps(flow.request, flow.response), f"{where} flow {flow.name}")
+                continue
+            translation = self._condition(flow.name, "Flow", where, flow.condition, REQUEST)
+            if translation is None:
+                fallback = flow
+                branch = _element(CORE, "otherwise")
+            else:
+                branch = _element(
+                    CORE, "when", _guard(f"Flow {flow.name}", str(flow.condition), translation, "this flow never runs")
+                )
+            matched.append(flow)
+            if translation is not None and not translation.ok:
+                # A #[false] branch: in Apigee the flow may run, so every write of its steps is dropped.
+                self.dead_flows.add(id(flow))
+            else:
+                # A target's flows are generated once per route, each time after that route's changes.
+                self.dead_flows.discard(id(flow))
+            self.dead = outer or (f"Flow {flow.name}" if id(flow) in self.dead_flows else None)
+            branch.append(_element(CORE, "set-variable", {"variableName": var, "value": f"#[{dw_string(flow.name)}]"}))
+            branch.extend(self._steps(flow.request, f"{where} flow {flow.name} request", REQUEST))
+            self.dead = outer
+            after = after | self.changes
+            choice.append(branch)
+        self.changes = after
+        if choice[0].tag == "otherwise":
+            # The first flow has no condition: it always runs, so no choice is needed.
+            return list(choice[0]), matched
+        return [choice], matched
+
+    def _flow_responses(self, matched: Sequence[Flow], where: str, var: str) -> list[ET.Element]:
+        """The response steps of the conditional flow :meth:`_conditional_flows` ran, picked by its name."""
+        flows = [flow for flow in matched if flow.response]
+        if not flows:
+            return []
+        choice = _element(CORE, "choice")
+        # Only the matched flow's response steps run: each branch starts from the same changes.
+        before = after = self.changes
+        for flow in flows:
+            when = _child(
+                choice,
+                CORE,
+                "when",
+                {"expression": f"#[vars.{var} == {dw_string(flow.name)}]", DOC_DESCRIPTION: _attribute_text(f"Flow {flow.name}")},
+            )
+            self.changes = before
+            outer = self.dead
+            self.dead = outer or (f"Flow {flow.name}" if id(flow) in self.dead_flows else None)
+            when.extend(self._steps(flow.response, f"{where} flow {flow.name} response", RESPONSE))
+            self.dead = outer
+            after = after | self.changes
+            _ensure_processor(when, f"flow {flow.name} response")
+        self.changes = after
+        return [choice]
 
     # ------------------------------------------------------------ routing
 
     def _routing(self, endpoint: ProxyEndpoint, where: str) -> list[ET.Element]:
         """The processors that pick a route: inline for one unconditional route, else a choice router."""
-        conditional: list[RouteRule] = []
+        conditional: list[tuple[RouteRule, str, Translation]] = []
         fallback: RouteRule | None = None
         for rule in endpoint.route_rules:
+            translation = self._condition(rule.name, "RouteRule", where, rule.condition, REQUEST)
             if fallback is not None:
                 self.skip(
                     rule.name,
                     f"{where}: RouteRule {rule.name} comes after the unconditional RouteRule {fallback.name}, "
                     "so Apigee never reaches it",
                 )
-            elif rule.condition is None:
+            elif translation is None:
                 fallback = rule
             else:
-                conditional.append(rule)
+                conditional.append((rule, rule.condition or "", translation))
         if not endpoint.route_rules:
             return self._null_route()
         if not conditional and fallback is not None:
             return self._route(fallback, where)
         choice = _element(CORE, "choice")
-        for rule in conditional:
-            condition = rule.condition or ""
-            self.pending.append(PendingCondition(rule.name, condition, endpoint.name))
-            when = _child(
-                choice,
-                CORE,
-                "when",
-                {
-                    "expression": "#[false]",
-                    f"{{{DOC}}}description": (
-                        f"RouteRule {rule.name}: Apigee condition {condition} (not translated yet, "
-                        "so this branch is never taken)"
-                    ),
-                },
-            )
-            when.extend(self._route(rule, where))
+        # Each route starts from the changes made before routing; after it, any route may have run.
+        before = after = self.changes
+        outer = self.dead
+        for rule, condition, translation in conditional:
+            guard = _guard(f"RouteRule {rule.name}", condition, translation, "this branch is never taken")
+            self.changes = before
+            # A #[false] branch: in Apigee the route may be taken, so every write of its target's steps is dropped.
+            self.dead = outer or (None if translation.ok else f"RouteRule {rule.name}")
+            _child(choice, CORE, "when", guard).extend(self._route(rule, where))
+            self.dead = outer
+            after = after | self.changes
         otherwise = _child(choice, CORE, "otherwise")
+        self.changes = before
         if fallback is not None:
             otherwise.extend(self._route(fallback, where))
         else:
@@ -603,12 +854,23 @@ class _ProjectBuilder:
                 f"{where}: every RouteRule has a condition; when none matches the app answers 500 "
                 "with a fault body (Apigee would send no target request)",
             )
-            otherwise.extend(_fault(NO_ROUTE_FAULT))
+            otherwise.extend(self._no_call(_fault(NO_ROUTE_FAULT)))
+        self.changes = after | self.changes
         return [choice]
 
     def _null_route(self) -> list[ET.Element]:
         """No target: answer with an empty body instead of echoing the request back."""
-        return [_element(CORE, "set-payload", {"value": ""})]
+        return self._no_call([_element(CORE, "set-payload", {"value": ""})])
+
+    def _snapshot(self) -> ET.Element:
+        """Save the request as it stands (as sent, right before a target call) for response-side reads."""
+        snapshot = _element(CORE, "set-variable", {"variableName": SNAPSHOT_VAR, "value": REQUEST_SNAPSHOT})
+        self.snapshots.append(snapshot)
+        return snapshot
+
+    def _no_call(self, processors: list[ET.Element]) -> list[ET.Element]:
+        """``processors`` that end a route without a target call, after the request snapshot."""
+        return [self._snapshot(), *processors]
 
     def _route(self, rule: RouteRule, where: str) -> list[ET.Element]:
         if rule.url is not None and rule.target is None:
@@ -616,7 +878,7 @@ class _ProjectBuilder:
                 rule.name,
                 f"{where}: RouteRule {rule.name} routes straight to the URL {shown_url(rule.url)}; not generated yet",
             )
-            return _fault(NO_TARGET_FAULT)
+            return self._no_call(_fault(NO_TARGET_FAULT))
         if rule.target is None:
             return self._null_route()
         target = self.targets[rule.target]
@@ -636,6 +898,14 @@ class _ProjectBuilder:
             self.skip(target.name, f"{where} is not generated: {address}")
             self._skip_target_extras(target, where)
             plan = _TargetPlan(None, None, timeout=False)
+        elif isinstance(address, _TemplateAddress):
+            key = self.keys.take(target.name.replace(".", "_"))
+            prefix = f"target.{key}"
+            config = _element(HTTP, "request-config", {"name": self.names.take(f"target-{target.name}-config")})
+            _child(config, HTTP, "request-connection", {"protocol": address.protocol})
+            self.globals.append(config)
+            timeout = self._target_settings(target, where, prefix)
+            plan = _TargetPlan(config.get("name"), prefix, timeout, url=address.url)
         else:
             key = self.keys.take(target.name.replace(".", "_"))  # a dot would split the key
             prefix = f"target.{key}"
@@ -660,7 +930,7 @@ class _ProjectBuilder:
         self.target_plans[target.name] = plan
         return plan
 
-    def _target_address(self, target: TargetEndpoint) -> _Address | str:
+    def _target_address(self, target: TargetEndpoint) -> _Address | _TemplateAddress | str:
         connection = target.connection
         if connection is None:
             return "it has no HTTPTargetConnection"
@@ -682,6 +952,8 @@ class _ProjectBuilder:
                     "whose address is an Apigee environment setting a2m cannot see"
                 )
             return "it has no URL"
+        if "{" in target.url or "}" in target.url:
+            return _template_url(target.url)
         return _parse_url(target.url)
 
     def _target_settings(self, target: TargetEndpoint, where: str, prefix: str) -> bool:
@@ -711,7 +983,9 @@ class _ProjectBuilder:
         self._skip_other_elements(target.other_elements, where)
         self._skip_fault_rules(target, where)
         if target.event_flow is not None:
+            path = self.changes
             self._skip_flow_steps(target.event_flow, f"{where} EventFlow")
+            self.changes = path
 
     def _target_processors(self, target: TargetEndpoint) -> list[ET.Element]:
         where = f"TargetEndpoint {target.name}"
@@ -720,9 +994,10 @@ class _ProjectBuilder:
             self._skip_flow_steps(target.pre_flow, f"{where} PreFlow")
             self._skip_flows(target.flows, where)
             self._skip_flow_steps(target.post_flow, f"{where} PostFlow")
-            return _fault(NO_TARGET_FAULT)
+            return self._no_call(_fault(NO_TARGET_FAULT))
         processors = self._steps(target.pre_flow.request, f"{where} PreFlow request", REQUEST)
-        self._skip_flows(target.flows, where)
+        flow_choice, matched = self._conditional_flows(target.flows, where, TARGET_FLOW_VAR)
+        processors += flow_choice
         processors += self._steps(target.post_flow.request, f"{where} PostFlow request", REQUEST)
         attrib = {
             "config-ref": plan.config,
@@ -731,6 +1006,18 @@ class _ProjectBuilder:
             # Apigee hands a target's 3xx and its Location back to the caller; it never follows it.
             "followRedirects": "false",
         }
+        if plan.url is not None:
+            url = self._target_url(target, plan.url, where)
+            if url is None:
+                for direction, steps in (
+                    ("PreFlow response", target.pre_flow.response),
+                    *((f"flow {f.name} response", f.response) for f in matched),
+                    ("PostFlow response", target.post_flow.response),
+                ):
+                    self._skip_steps(steps, f"{where} {direction}", direction=RESPONSE)
+                return processors + self._no_call(_fault(NO_TARGET_FAULT))
+            del attrib["path"]
+            attrib = {**attrib, "url": url}
         if plan.timeout:
             attrib["responseTimeout"] = f"${{{plan.key}.responseTimeout}}"
         request = _element(HTTP, "request", attrib)
@@ -740,6 +1027,7 @@ class _ProjectBuilder:
         validator = _child(request, HTTP, "response-validator")
         # Apigee passes the target's 4xx and 5xx answers to the caller unchanged.
         _child(validator, HTTP, "success-status-code-validator", {"values": "0..599"})
+        processors.append(self._snapshot())
         processors.append(request)
         processors.append(
             _element(CORE, "set-variable", {"variableName": "httpStatus", "value": "#[attributes.statusCode]"})
@@ -748,8 +1036,30 @@ class _ProjectBuilder:
             _element(CORE, "set-variable", {"variableName": "responseHeaders", "value": RESPONSE_HEADERS})
         )
         processors += self._steps(target.pre_flow.response, f"{where} PreFlow response", RESPONSE)
+        processors += self._flow_responses(matched, where, TARGET_FLOW_VAR)
         processors += self._steps(target.post_flow.response, f"{where} PostFlow response", RESPONSE)
         return processors
+
+    def _target_url(self, target: TargetEndpoint, url: str, where: str) -> str | None:
+        """The http:request url for a target URL with {variable} references, on the current path; None (reported)
+        when a reference reads a request header or query parameter an earlier step may have changed.
+
+        As for a fixed URL, the request's path below the base path is appended
+        (one slash where the URL ends in '/' and the path starts with one), and
+        the query parameters are sent with http:query-params.
+        """
+        translation = translate_template(url, direction=REQUEST, changes=self.changes)
+        if not translation.ok or translation.dw is None:
+            self.skip(
+                f"{target.name} URL",
+                f"{where}: its URL {shown_url(url)} can't be translated on this route ({translation.reason}); "
+                "the route answers 500 with a fault body instead of calling it",
+            )
+            return None
+        return (
+            f"#[do {{ var base = {translation.dw} var suffix = {REQUEST_PATH_DW} --- "
+            "if ((base endsWith '/') and (suffix startsWith '/')) base[0 to -2] ++ suffix else base ++ suffix }]"
+        )
 
     # ------------------------------------------------------------ steps and shared flows
 
@@ -760,32 +1070,264 @@ class _ProjectBuilder:
         policies = self.policies if policies is None else policies
         found: list[ET.Element] = []
         for step in steps:
+            before = self.changes
             policy = policies.get(step.policy)
             if policy is None:
-                found.append(self._skipped_step(step, "unknown", f"policy {step.policy} is not in the bundle", where))
+                reason = f"policy {step.policy} is not in the bundle"
+                found.append(self._skipped_step(step, "unknown", reason, where, direction))
             elif not policy.enabled:
                 reason = f"policy {policy.name} is disabled (enabled=false), so nothing is generated"
-                found.append(self._skipped_step(step, policy.type, reason, where))
+                found.append(self._skipped_step(step, policy.type, reason, where, direction))
             elif policy.type == FLOW_CALLOUT:
                 found.append(self._flow_callout(step, policy, where, direction))
             else:
-                found.append(self._policy_step(step, registry.translate(policy, direction=direction), where))
+                output = registry.translate(policy, direction=direction, changes=self.changes)
+                found.extend(_untranslated_settings(step.name, output.result.unsupported_options))
+                found.append(self._policy_step(step, output, where, direction))
+            # Counted whether or not the step is generated, and even under a condition: in Apigee it may have
+            # changed the request (a response-side step too, with AssignTo type="request"), so a later read must
+            # not see the caller's original value. The same for a flow variable it may write where the generated
+            # step does not (recomputed from the same inputs the step was generated from).
+            dropped = self._dropped_writes(
+                step, policies, direction, before, set(self.in_progress), runs=self.dead is None
+            )
+            if self.dead is not None:
+                dropped = _in_dead_branch(dropped, self.dead)
+            self.changes = self.changes | self._step_changes(step, policies, set(), direction) | dropped
         return found
 
-    def _skipped_step(self, step: Step, kind: str, reason: str, where: str) -> ET.Element:
-        """Report a step that is not generated; the comment left at its place names the step and its type."""
+    def _dropped_writes(
+        self,
+        step: Step,
+        policies: dict[str, Policy],
+        direction: str,
+        changes: RequestChanges,
+        visiting: set[str],
+        *,
+        runs: bool = True,
+        base: RequestChanges | None = None,
+    ) -> RequestChanges:
+        """The proxy's own flow variables ``step`` may write in Apigee where its generated step does not write them
+        exactly, as :attr:`RequestChanges.variables`, for the step generated after ``changes``.
+
+        A write counts unless the step is generated (not skipped), its condition
+        translates (a step whose condition can't be translated never runs), and
+        its template writes that variable exactly (:attr:`TemplateOutput.written`).
+        ``runs`` False (the step is not generated, or sits in a branch that
+        never runs) counts every write. A policy a2m has no write model for
+        (:func:`registry.has_write_model`) may write anything. ``visiting`` are the shared flows being
+        generated (a call into one of them is refused); ``base`` is what a shared
+        flow's sub-flow is generated after (see :meth:`_sub_flow_base`).
+        """
+        policy = policies.get(step.policy)
+        if policy is None or not policy.enabled:
+            return NO_CHANGES
+        if runs and step.condition is not None and step.condition.strip():
+            runs = translate_condition(step.condition, direction=direction, changes=changes).ok
+        if policy.type == FLOW_CALLOUT:
+            return self._callout_dropped(step, policy, direction, visiting, runs, base)
+        writes = registry.variable_writes(policy, direction=direction)
+        if not writes:
+            return NO_CHANGES
+        written: frozenset[str] = frozenset()
+        if runs:
+            output = registry.translate(policy, direction=direction, changes=changes)
+            if output.result.method is Method.TEMPLATE and output.processors:
+                written = output.written
+        return RequestChanges(variables=frozenset((name, step.name) for name in writes - written))
+
+    def _callout_dropped(
+        self,
+        step: Step,
+        policy: Policy,
+        direction: str,
+        visiting: set[str],
+        runs: bool,
+        base: RequestChanges | None,
+    ) -> RequestChanges:
+        """The flow variable writes a FlowCallout step (its Parameters, which are not passed, and the steps of the
+        shared flow it calls) may make in Apigee that the generated app does not make (see :meth:`_dropped_writes`)."""
+        parameters = {
+            fold(item.attributes.get("name", "").strip())
+            for group in policy.settings.children
+            if group.tag == "Parameters"
+            for item in group.children
+            if item.tag == "Parameter" and item.attributes.get("name", "").strip()
+        }
+        dropped = RequestChanges(variables=frozenset((name, step.name) for name in parameters))
+        name = step.shared_flow
+        bundles = self.shared.get(name, []) if name is not None else []
+        if name is None or len(bundles) != 1:
+            # Not generated, and what the shared flow would write is not known.
+            return dropped | RequestChanges(variables=frozenset({(ANY, step.name)}))
+        shared = bundles[0]
+        if shared.name in visiting:
+            # A call from inside itself is refused; its steps are counted where the shared flow runs.
+            return dropped
+        if base is not None:
+            context = base
+        else:
+            # With runs False nothing is translated, so the sub-flow base is not needed.
+            context = self._sub_flow_base(direction) if runs else NO_CHANGES
+        return dropped | self._shared_flow_dropped(shared, direction, visiting | {shared.name}, runs, context)
+
+    def _shared_flow_dropped(
+        self, shared: Bundle, direction: str, visiting: set[str], runs: bool, base: RequestChanges
+    ) -> RequestChanges:
+        """The flow variable writes the entry flow of ``shared`` may make in Apigee that its sub-flow, generated
+        after ``base``, does not make; with ``runs`` False, every write."""
+        flows = list(shared.shared_flows)
+        entry = next((f for f in flows if f.name == SHARED_FLOW_ENTRY), flows[0] if flows else None)
+        policies = {policy.name: policy for policy in shared.policies}
+        context, found = base, NO_CHANGES
+        for step in entry.steps if entry is not None else ():
+            dropped = self._dropped_writes(step, policies, direction, context, visiting, runs=runs, base=base)
+            found = found | dropped
+            context = context | self._step_changes(step, policies, set(), direction) | dropped
+        return found
+
+    def _sub_flow_base(self, direction: str) -> RequestChanges:
+        """What a shared flow's sub-flow on the ``direction`` side is generated after: every request change any step
+        of the proxy may make (:meth:`_proxy_request_changes`) and every flow variable write any step (shared flows
+        included) may make in Apigee that the generated app does not, found by repeating until nothing is added
+        (a dropped write can make a later step's condition or value untranslatable, which drops its writes too)."""
+        known = self.sub_flow_bases.get(direction)
+        if known is not None:
+            return known
+        context = self._proxy_request_changes(direction)
+        while True:
+            found = context
+            for side, step, runs in self._proxy_steps(direction, context):
+                found = found | self._dropped_writes(step, self.policies, side, context, set(), runs=runs, base=context)
+            if found == context:
+                break
+            context = found
+        self.sub_flow_bases[direction] = context
+        return context
+
+    def _step_changes(
+        self, step: Step, policies: dict[str, Policy], visiting: set[str], direction: str = REQUEST
+    ) -> RequestChanges:
+        """The request headers, query parameters and verb ``step`` (on the ``direction`` side) may change in Apigee."""
+        policy = policies.get(step.policy)
+        if policy is None or not policy.enabled:
+            return NO_CHANGES
+        if policy.type != FLOW_CALLOUT:
+            return registry.request_changes(policy, direction=direction)
+        name = step.shared_flow
+        bundles = self.shared.get(name, []) if name is not None else []
+        if name is None or len(bundles) != 1:
+            # Not generated, and what the shared flow would change is not known: anything.
+            every = RequestChanges.everything(step.name)
+            return RequestChanges(every.headers, every.queries, every.verb)
+        return self._shared_flow_changes(bundles[0], visiting, direction)
+
+    def _shared_flow_changes(self, shared: Bundle, visiting: set[str], direction: str = REQUEST) -> RequestChanges:
+        """What the entry flow of ``shared`` (and the shared flows it calls) may change in the request when it is
+        called on the ``direction`` side."""
+        known = self.shared_changes.get((shared.name, direction))
+        if known is not None:
+            return known
+        if shared.name in visiting:
+            return NO_CHANGES  # a call cycle: the generator refuses it, and its steps are counted once already
+        top = not visiting
+        visiting.add(shared.name)
+        flows = list(shared.shared_flows)
+        entry = next((f for f in flows if f.name == SHARED_FLOW_ENTRY), flows[0] if flows else None)
+        policies = {policy.name: policy for policy in shared.policies}
+        changes = NO_CHANGES
+        for step in entry.steps if entry is not None else ():
+            changes = changes | self._step_changes(step, policies, visiting, direction)
+        visiting.discard(shared.name)
+        if top:
+            # A result found inside a cycle can miss the steps of the flow that was cut off; only a complete one is kept.
+            self.shared_changes[(shared.name, direction)] = changes
+        return changes
+
+    def _proxy_request_changes(self, direction: str = REQUEST) -> RequestChanges:
+        """Every request change any step of the proxy may make before a step on the ``direction`` side runs, in
+        any order: the request-side steps, and for the response side the response-side steps as well."""
+        changes = NO_CHANGES
+        for side, step, _ in self._proxy_steps(direction):
+            changes = changes | self._step_changes(step, self.policies, set(), side)
+        return changes
+
+    def _proxy_steps(
+        self, direction: str = REQUEST, context: RequestChanges | None = None
+    ) -> Iterator[tuple[str, Step, bool]]:
+        """(side, step, runs) for every step of the proxy that may run before a step on the ``direction`` side: the
+        request-side steps, and for the response side the response-side steps as well.
+
+        ``runs`` is False for a step the generated app may never run where
+        Apigee does: in a ProxyEndpoint or TargetEndpoint that is not generated,
+        or, with ``context`` (the changes the conditions are read after), in a
+        Flow or behind a RouteRule whose condition can't be translated.
+        """
+
+        def can_run(condition: str | None) -> bool:
+            if context is None or condition is None or not condition.strip():
+                return True
+            return translate_condition(condition, direction=REQUEST, changes=context).ok
+
+        live: dict[int, bool] = {}
+        for proxy in self.bundle.proxy_endpoints:
+            generated = unsupported_base_path(proxy.base_path) is None
+            live[id(proxy)] = generated
+            for rule in proxy.route_rules:
+                target = self.targets.get(rule.target) if rule.target is not None else None
+                if target is not None and not (generated and can_run(rule.condition)):
+                    live[id(target)] = False
+        for target in self.bundle.target_endpoints:
+            if isinstance(self._target_address(target), str):
+                live[id(target)] = False
+        endpoints: list[ProxyEndpoint | TargetEndpoint] = [*self.bundle.proxy_endpoints, *self.bundle.target_endpoints]
+        for endpoint in endpoints:
+            runs = live.get(id(endpoint), True)
+            groups = [(REQUEST, runs, endpoint.pre_flow.request), (REQUEST, runs, endpoint.post_flow.request)]
+            flows = [(f, runs and can_run(f.condition)) for f in endpoint.flows]
+            groups += [(REQUEST, flow_runs, f.request) for f, flow_runs in flows]
+            if direction == RESPONSE:
+                groups += [(RESPONSE, runs, endpoint.pre_flow.response), (RESPONSE, runs, endpoint.post_flow.response)]
+                groups += [(RESPONSE, flow_runs, f.response) for f, flow_runs in flows]
+            for side, group_runs, steps in groups:
+                for step in steps:
+                    yield side, step, group_runs
+
+    def _skipped_step(
+        self,
+        step: Step,
+        kind: str,
+        reason: str,
+        where: str,
+        direction: str,
+        options: tuple[UnsupportedOption, ...] = (),
+    ) -> ET.Element:
+        """Report a step that is not generated; the comment left at its place names the step and its type.
+
+        ``options`` are the settings the template listed on its way to skipping the step (kept in its record).
+        """
         self.skip(step.name, f"{where}: {reason}")
+        self._condition(step.name, "Step", where, step.condition, direction)
         condition = f" It has the condition {step.condition}." if step.condition is not None else ""
         self.records.append(
-            PolicyResult(step.name, kind, Method.SKIPPED, reason, location=where, condition=step.condition)
+            PolicyResult(
+                step.name,
+                kind,
+                Method.SKIPPED,
+                reason,
+                unsupported_options=options,
+                location=where,
+                condition=step.condition,
+            )
         )
         comment = ET.Comment(_comment_text(f"Step {step.name} ({kind}) is not generated: {reason}.{condition}"))
         return cast(ET.Element, comment)
 
-    def _policy_step(self, step: Step, output: TemplateOutput, where: str) -> ET.Element:
+    def _policy_step(self, step: Step, output: TemplateOutput, where: str, direction: str) -> ET.Element:
         result = output.result
         if result.method is not Method.TEMPLATE or not output.processors:
-            return self._skipped_step(step, result.type, result.reason or "nothing could be generated", where)
+            reason = result.reason or "nothing could be generated"
+            return self._skipped_step(step, result.type, reason, where, direction, result.unsupported_options)
         for option in result.unsupported_options:
             self.skip(f"{step.name} {option.name}", f"{where}: {result.type} step {step.name}: {option.reason}")
         names = self._take_globals(step.policy, output)
@@ -795,7 +1337,8 @@ class _ProjectBuilder:
         for key, note in output.property_notes.items():
             self.property_notes.setdefault(key, note)
         self.needs.update(output.needs)
-        return self._place(step, _labelled(step.name, processors), dataclasses.replace(result, name=step.name), where)
+        labelled = _labelled(step.name, processors)
+        return self._place(step, labelled, dataclasses.replace(result, name=step.name), where, direction)
 
     def _take_globals(self, policy_name: str, output: TemplateOutput) -> dict[str, str]:
         """Add the template's global elements once per policy; returns old name -> unique Mule name."""
@@ -810,30 +1353,22 @@ class _ProjectBuilder:
             names[wanted] = self.global_names[key]
         return names
 
-    def _place(self, step: Step, processor: ET.Element, result: PolicyResult, where: str) -> ET.Element:
-        """Record the generated step; a step with a condition is kept but never runs until it is translated."""
-        if step.condition is None:
+    def _place(
+        self, step: Step, processor: ET.Element, result: PolicyResult, where: str, direction: str
+    ) -> ET.Element:
+        """Record the generated step; a step with a condition runs inside a when guarded by its translation, or
+        never (``#[false]``, marked can't translate) when the condition can't be translated."""
+        translation = self._condition(step.name, "Step", where, step.condition, direction)
+        if translation is None:
             self.records.append(dataclasses.replace(result, location=where))
             return processor
-        self.pending.append(PendingCondition(step.name, step.condition, where, kind="Step"))
-        self.records.append(
-            dataclasses.replace(
-                result, location=where, condition=step.condition, tags=(*result.tags, "condition-pending")
-            )
-        )
+        if translation.ok and translation.reads_request_snapshot:
+            self.needs.add(NEED_REQUEST_SNAPSHOT)
+        tags = result.tags if translation.ok else (*result.tags, CANT_TRANSLATE_TAG)
+        self.records.append(dataclasses.replace(result, location=where, condition=step.condition, tags=tags))
         choice = _element(CORE, "choice")
-        when = _child(
-            choice,
-            CORE,
-            "when",
-            {
-                "expression": "#[false]",
-                DOC_DESCRIPTION: (
-                    f"Step {step.name}: Apigee condition {step.condition} (not translated yet, so this step never runs)"
-                ),
-            },
-        )
-        when.append(processor)
+        guard = _guard(f"Step {step.name}", str(step.condition), translation, "this step never runs")
+        _child(choice, CORE, "when", guard).append(processor)
         return choice
 
     def _flow_callout(self, step: Step, policy: Policy, where: str, direction: str) -> ET.Element:
@@ -852,7 +1387,7 @@ class _ProjectBuilder:
         elif name in self.in_progress:
             reason = f"FlowCallout {policy.name} calls shared flow {name} from inside itself"
         if reason is not None:
-            return self._skipped_step(step, policy.type, reason, where)
+            return self._skipped_step(step, policy.type, reason, where, direction)
         options: tuple[UnsupportedOption, ...] = ()
         parameters = [c for c in policy.settings.children if c.tag == "Parameters" and c.children]
         if parameters:
@@ -862,7 +1397,7 @@ class _ProjectBuilder:
         position = len(self.records)
         call = _element(CORE, "flow-ref", {"name": self._sub_flow(bundles[0], direction), DOC_NAME: step.name})
         result = PolicyResult(step.name, policy.type, Method.TEMPLATE, unsupported_options=options)
-        placed = self._place(step, call, result, where)
+        placed = self._place(step, call, result, where, direction)
         # The callout runs before the shared flow's own steps, which were recorded while generating it.
         self.records.insert(position, self.records.pop())
         return placed
@@ -875,6 +1410,13 @@ class _ProjectBuilder:
         name = self.names.take(f"shared-flow-{shared.name}")
         self.sub_flow_names[(shared.name, direction)] = name
         self.in_progress.add(shared.name)
+        # One sub-flow serves every call on this side, each with its own earlier changes: its conditions are
+        # checked against every request change (and dropped flow variable write) the proxy may make anywhere.
+        caller_changes, caller_dead = self.changes, self.dead
+        # The sub-flow serves every call; a call from a branch that never runs is counted at the call (see
+        # _callout_dropped), not here.
+        self.dead = None
+        self.changes = self._sub_flow_base(direction)
         sub_flow = _element(CORE, "sub-flow", {"name": name})
         flows = list(shared.shared_flows)
         entry = next((f for f in flows if f.name == SHARED_FLOW_ENTRY), flows[0] if flows else None)
@@ -885,19 +1427,23 @@ class _ProjectBuilder:
                     f"{shared.name}/{flow.name}",
                     f"shared flow bundle {shared.name}: flow {flow.name} is not its entry flow and is not generated",
                 )
-                self._skip_steps(flow.steps, f"shared flow {shared.name}/{flow.name}", policies)
+                base = self.changes
+                self._skip_steps(flow.steps, f"shared flow {shared.name}/{flow.name}", policies, direction=direction)
+                self.changes = base
         if entry is not None:
             sub_flow.extend(self._steps(entry.steps, f"shared flow {shared.name}", direction, policies))
         if not any(_is_element(child) for child in sub_flow):
             # A sub-flow needs at least one processor; this one only marks where the shared flow runs.
             sub_flow.append(_element(CORE, "logger", {"level": "DEBUG", "message": f"{name} called"}))
         self.in_progress.discard(shared.name)
+        self.changes, self.dead = caller_changes, caller_dead
         self.sub_flows.append(sub_flow)
         return name
 
     # ------------------------------------------------------------ leftovers
 
     def _report_unused(self) -> None:
+        self.changes = NO_CHANGES
         for target in self.bundle.target_endpoints:
             if target.name not in self.used_targets:
                 where = f"TargetEndpoint {target.name}"
@@ -932,6 +1478,13 @@ def _all_steps(bundle: Bundle) -> Iterator[Step]:
             yield from rule.steps
         if endpoint.default_fault_rule is not None:
             yield from endpoint.default_fault_rule.steps
+
+
+def _in_dead_branch(changes: RequestChanges, branch: str) -> RequestChanges:
+    """``changes`` (dropped flow variable writes) with each writer named as sitting in ``branch``, a Flow or
+    RouteRule whose condition can't be translated, so a refused read says why the write never happens."""
+    label = f" (in {branch}, whose condition can't be translated, so it never runs in the generated app)"
+    return dataclasses.replace(changes, variables=frozenset((name, step + label) for name, step in changes.variables))
 
 
 def _fault(body: str) -> list[ET.Element]:
@@ -972,6 +1525,37 @@ def _labelled(name: str, processors: Sequence[ET.Element]) -> ET.Element:
     return scope
 
 
+def _guard(label: str, original: str, translation: Translation, effect: str) -> dict[str, str]:
+    """The attributes of the ``when`` for a condition: its translation, or ``#[false]`` marked can't translate."""
+    if translation.ok and translation.dw is not None:
+        description = f"{label}: Apigee condition {original}"
+        return {"expression": f"#[{translation.dw}]", DOC_DESCRIPTION: _attribute_text(description)}
+    description = f"{label}: can't translate the Apigee condition {original} ({translation.reason}); {effect}"
+    return {"expression": "#[false]", DOC_DESCRIPTION: _attribute_text(description)}
+
+
+def _attribute_text(text: str) -> str:
+    """``text`` for an attribute Mule only displays: Mule resolves ``${...}`` property placeholders in every
+    attribute value when it deploys the app (an unknown key fails the deployment), so '${' becomes '$ {'.
+    The exact text stays in the condition record."""
+    return text.replace("${", "$ {")
+
+
+def _untranslated_settings(step: str, options: Sequence[UnsupportedOption]) -> list[ET.Element]:
+    """A comment for each setting of ``step`` kept because it can't be translated, holding its original text."""
+    return [
+        cast(ET.Element, ET.Comment(_comment_text(f"Step {step}: {option.reason}. Original value: {option.original}")))
+        for option in options
+        if option.original is not None
+    ]
+
+
+def _ensure_processor(container: ET.Element, label: str) -> None:
+    """Mule needs at least one processor in a route; one holding only comments gets a DEBUG logger."""
+    if not any(_is_element(child) for child in container):
+        container.append(_element(CORE, "logger", {"level": "DEBUG", "message": f"{label}: nothing to run"}))
+
+
 def _comment_text(text: str) -> str:
     """``text`` as the content of an XML comment, which may not hold '--' or end in '-'."""
     cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", text)
@@ -997,6 +1581,91 @@ def _error_body() -> str:
     cases = "".join(f"case {status} -> {fault(message, code)} " for status, _, message, code in ERROR_FAULTS)
     default = fault(*ERROR_FAULT_DEFAULT[1:])
     return f"#[output application/json --- ({_error_status()}) match {{ {cases}else -> {default} }}]"
+
+
+# ---------------------------------------------------------------- error types
+
+# The namespace of the error types a2m's generated steps raise. Mule knows such a type only when the app declares
+# it, by raising it (``raise-error``) or mapping to it (an ``error-mapping`` targetType); a handler or mapping that
+# names an undeclared one fails the deployment ("Could not find error").
+APP_ERROR_NAMESPACE = FAULT_ERROR_TYPE.split(":", 1)[0]
+_ON_ERROR_TAGS = ("on-error-continue", "on-error-propagate")
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _error_types(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _is_app_error(error_type: str) -> bool:
+    return error_type.split(":", 1)[0].strip() == APP_ERROR_NAMESPACE
+
+
+def declared_error_types(elements: Sequence[ET.Element]) -> set[str]:
+    """The app-namespace error types ``elements`` declare: raised by a ``raise-error`` or mapped to by an
+    ``error-mapping``."""
+    declared: set[str] = set()
+    for top in elements:
+        for node in top.iter():
+            if not _is_element(node):
+                continue
+            local = _local(node.tag)
+            if local == "raise-error":
+                declared.update(t for t in _error_types(node.get("type", "")) if _is_app_error(t))
+            elif local == "error-mapping":
+                declared.update(t for t in _error_types(node.get("targetType", "")) if _is_app_error(t))
+    return declared
+
+
+def _drop_undeclared_error_handlers(elements: Sequence[ET.Element]) -> None:
+    """Remove every handler entry and error mapping that names an app error type nothing in ``elements`` raises.
+
+    Such an entry can never fire (nothing raises the type), and Mule refuses to deploy an app that names an
+    undeclared type. A handler entry naming several types keeps the declared ones; one left with none is removed
+    (an entry with no type would handle every error). An error handler (or error-mappings list) left empty is
+    removed with it, so its scope passes every error on, as it did before. Removing a mapping can undeclare its
+    target type, so this repeats until nothing changes.
+    """
+    while _drop_undeclared_once(elements):
+        pass
+
+
+def _drop_undeclared_once(elements: Sequence[ET.Element]) -> bool:
+    declared = declared_error_types(elements)
+    changed = False
+    for top in elements:
+        parents = {id(child): parent for parent in top.iter() for child in parent}
+        for node in [n for n in top.iter() if _is_element(n)]:
+            local = _local(node.tag)
+            if local in _ON_ERROR_TAGS and node.get("type") is not None:
+                types = _error_types(node.get("type", ""))
+                kept = [t for t in types if not _is_app_error(t) or t in declared]
+                if kept == types:
+                    continue
+                if kept:
+                    node.set("type", ", ".join(kept))
+                    changed = True
+                    continue
+            elif local == "error-mapping":
+                source = node.get("sourceType", "").strip()
+                if not (source and _is_app_error(source) and source not in declared):
+                    continue
+            else:
+                continue
+            parent = parents[id(node)]
+            parent.remove(node)
+            changed = True
+            holder = parents.get(id(parent))
+            if (
+                holder is not None
+                and _local(parent.tag) in ("error-handler", "error-mappings")
+                and not any(_is_element(c) for c in parent)
+            ):
+                holder.remove(parent)
+    return changed
 
 
 # ---------------------------------------------------------------- serialising
