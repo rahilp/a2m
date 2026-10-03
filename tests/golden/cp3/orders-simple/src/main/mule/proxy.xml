@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://www.mulesoft.org/schema/mule/core" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+    <configuration-properties file="config.properties" />
+    <http:listener-config name="http-listener-config">
+        <http:listener-connection host="${http.listener.host}" port="${http.listener.port}" />
+    </http:listener-config>
+    <http:request-config name="target-default-config" basePath="${target.default.basePath}">
+        <http:request-connection protocol="${target.default.protocol}" host="${target.default.host}" port="${target.default.port}" />
+    </http:request-config>
+    <flow name="proxy-default">
+        <http:listener config-ref="http-listener-config" path="/v1/orders/*">
+            <http:response statusCode="#[vars.httpStatus default 200]">
+                <http:headers>#[vars.responseHeaders default {}]</http:headers>
+            </http:response>
+            <http:error-response statusCode="#[do { var id = error.errorType.identifier default '' --- if (['CONNECTIVITY', 'RETRY_EXHAUSTED', 'SERVICE_UNAVAILABLE'] contains id) 503 else if (['TIMEOUT', 'GATEWAY_TIMEOUT'] contains id) 504 else if (['BAD_GATEWAY'] contains id) 502 else 500 }]">
+                <http:body>#[output application/json --- (do { var id = error.errorType.identifier default '' --- if (['CONNECTIVITY', 'RETRY_EXHAUSTED', 'SERVICE_UNAVAILABLE'] contains id) 503 else if (['TIMEOUT', 'GATEWAY_TIMEOUT'] contains id) 504 else if (['BAD_GATEWAY'] contains id) 502 else 500 }) match { case 503 -&gt; {"fault": {"faultstring": "The Service is temporarily unavailable", "detail": {"errorcode": "messaging.adaptors.http.flow.ServiceUnavailable"}}} case 504 -&gt; {"fault": {"faultstring": "Gateway Timeout", "detail": {"errorcode": "messaging.adaptors.http.flow.GatewayTimeout"}}} case 502 -&gt; {"fault": {"faultstring": "Bad Gateway", "detail": {"errorcode": "messaging.adaptors.http.flow.BadGateway"}}} else -&gt; {"fault": {"faultstring": "Internal Server Error", "detail": {"errorcode": "messaging.runtime.InternalServerError"}}} }]</http:body>
+            </http:error-response>
+        </http:listener>
+        <http:request config-ref="target-default-config" method="#[attributes.method]" path="#[if (attributes.maskedRequestPath == '/' and not (attributes.rawRequestPath endsWith '/')) '' else attributes.maskedRequestPath]" followRedirects="false">
+            <http:headers>#[attributes.headers -- ['host', 'content-length', 'transfer-encoding', 'connection']]</http:headers>
+            <http:query-params>#[attributes.queryParams]</http:query-params>
+            <http:response-validator>
+                <http:success-status-code-validator values="0..599" />
+            </http:response-validator>
+        </http:request>
+        <set-variable variableName="httpStatus" value="#[attributes.statusCode]" />
+        <set-variable variableName="responseHeaders" value="#[attributes.headers -- ['content-length', 'transfer-encoding', 'connection', 'content-type']]" />
+    </flow>
+</mule>

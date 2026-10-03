@@ -20,11 +20,23 @@ a2m = "a2m.cli:main"
 [tool.setuptools.packages.find]
 include = ["a2m*"]
 
+[tool.setuptools.package-data]
+# The generator's fixed project files (pom.xml), read with importlib.resources.
+"a2m.generator" = ["templates/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Runtime tests need Java, Maven and Mule; run them with -m "runtime or not runtime".
+addopts = "-m 'not runtime'"
 markers = [
     "runtime: needs Java, Maven and the Mule runtime installed",
 ]
+# Runtime tests leave about 1 GB per session under pytest's tmp folder (Mule bases, Maven
+# builds) and /tmp has a small per-user quota. A passing session removes its whole tmp
+# folder at the end, session-scoped ones included; a failing session keeps its own for
+# debugging and removes every older one, so at most one failed run is ever kept.
+tmp_path_retention_policy = "failed"
+tmp_path_retention_count = 1
 
 [tool.ruff]
 # The code base wraps at about 120 characters; ruff's default of 88 would make

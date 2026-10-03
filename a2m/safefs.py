@@ -172,6 +172,15 @@ def write_text_atomic(root: Path, target: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def move(root: Path, source: Path, target: Path) -> None:
+    """Move ``source`` to ``target`` (replacing a file or empty folder there), both strictly inside ``root``.
+
+    Neither path is reached through a link; a link at ``target`` itself is
+    replaced, never followed.
+    """
+    os.replace(_checked(root, source), _checked(root, target))
+
+
 def is_regular_file(root: Path, target: Path) -> bool:
     """True only when ``target`` is a plain file reached without following any link."""
     try:

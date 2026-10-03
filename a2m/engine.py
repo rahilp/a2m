@@ -52,6 +52,8 @@ from a2m.errors import (
     UnsafePathError,
     UsageError,
 )
+from a2m.generator import generate_project
+from a2m.ir import Bundle
 from a2m.layout import collision_key, unsafe_name_reason
 from a2m.parser import read_bundle
 from a2m.runlog import get_logger, run_log
@@ -108,6 +110,8 @@ class ProxyContext:
     are under ``bundle_dir / "apiproxy"``) in the sanitized working copy under
     the results folder's work area, never a path in the input folder;
     ``source_name`` is the input item's file name, for reports only.
+    ``shared_flows`` are the shared flow bundles of the input folder that could
+    be read, for the proxy's FlowCallout steps.
     """
 
     name: str
@@ -116,6 +120,7 @@ class ProxyContext:
     bundle_dir: Path
     out_dir: Path
     options: StageOptions
+    shared_flows: tuple[Bundle, ...] = ()
 
 
 Stage = Callable[[ProxyContext], None]
@@ -134,9 +139,28 @@ def parse(context: ProxyContext) -> None:
     )
 
 
-# The per-proxy pipeline. Later checkpoints add generation and verification
-# stages here; tests replace it through ``stages=``.
-DEFAULT_STAGES: tuple[Stage, ...] = (parse,)
+def generate(context: ProxyContext) -> None:
+    """Write the proxy's Mule project into <proxy>/mule-app; log everything that was not generated."""
+    log = get_logger()
+    bundle = read_bundle(context.bundle_dir, label=context.name)
+    dest = layout.mule_app_dir(context.out_dir)
+    result = generate_project(bundle, dest, shared_flows=context.shared_flows, results_root=context.out_dir)
+    log.info("%s: wrote Mule project %s/ (%d files)", context.name, layout.MULE_APP_DIR_NAME, len(result.files))
+    for item in result.unsupported:
+        log.warning("%s: not generated: %s: %s", context.name, item.name, item.reason)
+    for pending in result.pending:
+        log.info(
+            "%s: RouteRule %s of ProxyEndpoint %s keeps its condition for translation: %s",
+            context.name,
+            pending.name,
+            pending.endpoint,
+            pending.condition,
+        )
+
+
+# The per-proxy pipeline. Later checkpoints add verification stages here;
+# tests replace it through ``stages=``.
+DEFAULT_STAGES: tuple[Stage, ...] = (parse, generate)
 
 
 class RunInterrupted(KeyboardInterrupt):
@@ -448,6 +472,7 @@ def _run_locked(plan: RunPlan, stages: Sequence[Stage]) -> BatchResult:
             not_removed = _remove_stale_results_of_refused(plan)
             not_cleared = _clear_done_markers_for_force(plan) if options.force else set()
             cleared = not not_cleared
+            shared_flows = _read_shared_flows(plan) if plan.selected else ()
 
             for source in plan.selected:
                 current = source.name
@@ -466,7 +491,7 @@ def _run_locked(plan: RunPlan, stages: Sequence[Stage]) -> BatchResult:
                     log.info("skipped %s: already done (resume)", source.name)
                     result.skipped.append(source.name)
                     continue
-                _process(source, options, stages, result)
+                _process(source, options, stages, result, shared_flows)
 
             current = None
             selected_names = {source.name for source in plan.selected}
@@ -603,7 +628,55 @@ def _proxy_folder_names(out: Path) -> set[str]:
     return {entry.name for entry in out.iterdir() if unsafe_name_reason(entry.name) is None}
 
 
-def _process(source: BundleSource, options: RunOptions, stages: Sequence[Stage], result: BatchResult) -> None:
+def _read_shared_flows(plan: RunPlan) -> tuple[Bundle, ...]:
+    """Read every shared flow bundle of the input folder, each through its own sanitized working copy.
+
+    A shared flow bundle that cannot be copied or read is logged and left out;
+    FlowCallout steps that call it are then reported as not generated. The
+    working copies are removed again before any proxy runs.
+    """
+    log = get_logger()
+    out = plan.options.out_dir
+    found: list[Bundle] = []
+    for source in plan.discovery.shared_flows:
+        work_dir: Path | None = None
+        try:
+            work_dir = layout.shared_flow_work_dir(out, source.name)
+            safefs.remove(out, work_dir)
+            safefs.make_dirs(out, work_dir)
+            _materialize(source, work_dir)
+            bundle_dir = work_dir if source.wrapper is None else work_dir / source.wrapper
+            bundle = read_bundle(bundle_dir, label=source.name)
+            log.info("read shared flow bundle %s (%d shared flows, %d policies)", bundle.name,
+                     len(bundle.shared_flows), len(bundle.policies))
+            found.append(bundle)
+        except (BundleError, OSError, UnsafePathError) as exc:
+            log.error(
+                "could not read shared flow bundle %s (%s): %s; steps that call it are not generated",
+                source.name,
+                source.path.name,
+                exc,
+            )
+        finally:
+            try:
+                if work_dir is not None:
+                    safefs.remove(out, work_dir)
+            except (OSError, UnsafePathError) as exc:
+                log.warning("could not remove unpacked copy of %s at %s: %s", source.name, work_dir, exc)
+    try:
+        safefs.remove_empty_dir(out, layout.shared_flows_work_root(out))
+    except (OSError, UnsafePathError) as exc:
+        log.warning("could not remove the shared flow work folder: %s", exc)
+    return tuple(found)
+
+
+def _process(
+    source: BundleSource,
+    options: RunOptions,
+    stages: Sequence[Stage],
+    result: BatchResult,
+    shared_flows: tuple[Bundle, ...] = (),
+) -> None:
     log = get_logger()
     out = options.out_dir
     work_dir: Path | None = None
@@ -625,6 +698,7 @@ def _process(source: BundleSource, options: RunOptions, stages: Sequence[Stage],
             bundle_dir=bundle_dir,
             out_dir=proxy_dir,
             options=StageOptions.of(options),
+            shared_flows=shared_flows,
         )
         for stage in stages:
             current = _stage_name(stage)

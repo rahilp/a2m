@@ -22,6 +22,11 @@ LOCK_NAME = ".a2m-lock"
 # some .done markers may still be from before the forced run.
 FORCE_PENDING_NAME = ".a2m-force-pending"
 FORCE_PENDING_TEXT = "a2m --force run clearing earlier .done markers\n"
+# Each proxy's generated Mule project, inside the proxy's folder.
+MULE_APP_DIR_NAME = "mule-app"
+# Inside the work area: the working copies of shared flow bundles. Proxy names
+# never start with a dot, so this never collides with a proxy's work folder.
+SHARED_FLOWS_WORK_NAME = ".shared-flows"
 
 
 
@@ -107,3 +112,15 @@ def work_root(out_dir: Path) -> Path:
 
 def proxy_work_dir(out_dir: Path, name: str) -> Path:
     return _child(work_root(out_dir), name)
+
+
+def mule_app_dir(proxy_dir: Path) -> Path:
+    return proxy_dir / MULE_APP_DIR_NAME
+
+
+def shared_flows_work_root(out_dir: Path) -> Path:
+    return work_root(out_dir) / SHARED_FLOWS_WORK_NAME
+
+
+def shared_flow_work_dir(out_dir: Path, name: str) -> Path:
+    return _child(shared_flows_work_root(out_dir), name)
