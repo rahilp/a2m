@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="1" name="orders-api">
+    <Description>a2m CP4 fixture: one step of each standard policy type</Description>
+    <DisplayName>orders-api</DisplayName>
+    <Policies>
+        <Policy>Verify-Key</Policy>
+        <Policy>Spike-Arrest</Policy>
+        <Policy>Check-IP</Policy>
+        <Policy>Hourly-Quota</Policy>
+        <Policy>Extract-Order-Id</Policy>
+        <Policy>Encode-Basic-Auth</Policy>
+        <Policy>Add-Target-Headers</Policy>
+        <Policy>Strip-Internal</Policy>
+        <Policy>Set-Response-Header</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>default</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>

@@ -1270,16 +1270,22 @@ def test_CP3_T36_every_step_in_every_flow_position_is_generated_or_reported(tmp_
     project = assert_well_formed(dest)
     calls = [e for e in project.walk(project.main_flow()) if e.tag == tag(CORE, "flow-ref")]
     reported = {name for name, _ in unsupported(result)}
+    pending = {str(item.name) for item in result.pending}
+    doc_name = tag(DOCUMENTATION, "name")
+    named = {e.get(doc_name) for e in project.all_elements()}
     policy_types = {p.name: p.type for p in (*bundle.policies, *shared.policies)}
     missing = []
+    both = []
     for step in steps:
+        generated = step.name in named
         if policy_types[step.policy] == "FlowCallout":
-            generated = any("pos-shared" in (call.get("name") or "") for call in calls)
-            if not generated and step.name not in reported:
-                missing.append(step.name)
-        elif step.name not in reported:
+            generated = generated or any("pos-shared" in (call.get("name") or "") for call in calls)
+        if not generated and step.name not in reported and step.name not in pending:
             missing.append(step.name)
+        if generated and step.name in reported:
+            both.append(step.name)
     assert not missing, f"steps neither generated nor reported: {missing}"
+    assert not both, f"steps both generated and reported as unsupported: {both}"
 
 
 def test_CP3_T37_proxy_preflow_response_steps_run_in_apigee_response_order(tmp_path: Path) -> None:
@@ -1325,9 +1331,27 @@ def test_CP3_T37_proxy_preflow_response_steps_run_in_apigee_response_order(tmp_p
 
     request = order.index("<http:request>")
     assert request < position("target-resp-flow") < position("pre-resp-flow") < position("post-resp-flow"), order
+    # Add-CORS is generated in its response slot or reported as unsupported: never both, never neither.
+    doc_name = tag(DOCUMENTATION, "name")
+    walked = list(project.walk(project.main_flow()))
+    refs = {
+        s: [i for i, e in enumerate(walked) if e.tag == tag(CORE, "flow-ref") and s in str(e.get("name"))]
+        for s in ("pre-resp-flow", "post-resp-flow")
+    }
+    assert len(refs["pre-resp-flow"]) == 1 and len(refs["post-resp-flow"]) == 1, refs
+    cors_in_chain = [i for i, e in enumerate(walked) if e.get(doc_name) == "Add-CORS"]
+    cors_anywhere = [e for e in project.all_elements() if e.get(doc_name) == "Add-CORS"]
     flagged = [reason for name, reason in unsupported(result) if name == "Add-CORS"]
-    assert len(flagged) == 1, unsupported(result)
-    assert "AssignMessage" in flagged[0], flagged
+    assert bool(cors_anywhere) != bool(flagged), (cors_anywhere, unsupported(result))
+    if cors_anywhere:
+        assert cors_in_chain, "Add-CORS is generated but never runs in the main flow"
+        assert all(refs["pre-resp-flow"][0] < i < refs["post-resp-flow"][0] for i in cors_in_chain), (
+            cors_in_chain,
+            refs,
+        )
+    else:
+        assert len(flagged) == 1, unsupported(result)
+        assert "AssignMessage" in flagged[0], flagged
 
 
 SECRETS = ("Pw-cred-1", "Pw-var-2", "Key-q-3", "alice", "bob")

@@ -1,0 +1,12 @@
+{
+  "minMuleVersion": "4.9.0",
+  "requiredProduct": "MULE",
+  "javaSpecificationVersions": [
+    "17"
+  ],
+  "configs": [
+    "proxy.xml"
+  ],
+  "secureProperties": [],
+  "redeploymentEnabled": true
+}

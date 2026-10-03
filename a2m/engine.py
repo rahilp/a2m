@@ -150,8 +150,9 @@ def generate(context: ProxyContext) -> None:
         log.warning("%s: not generated: %s: %s", context.name, item.name, item.reason)
     for pending in result.pending:
         log.info(
-            "%s: RouteRule %s of ProxyEndpoint %s keeps its condition for translation: %s",
+            "%s: %s %s (%s) keeps its condition for translation: %s",
             context.name,
+            pending.kind,
             pending.name,
             pending.endpoint,
             pending.condition,

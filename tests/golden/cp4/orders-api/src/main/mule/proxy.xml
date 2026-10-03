@@ -1,0 +1,203 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:doc="http://www.mulesoft.org/schema/mule/documentation" xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:os="http://www.mulesoft.org/schema/mule/os" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://www.mulesoft.org/schema/mule/core" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+    <configuration-properties file="config.properties" />
+    <http:listener-config name="http-listener-config">
+        <http:listener-connection host="${http.listener.host}" port="${http.listener.port}" />
+    </http:listener-config>
+    <http:request-config name="target-default-config" basePath="${target.default.basePath}">
+        <http:request-connection protocol="${target.default.protocol}" host="${target.default.host}" port="${target.default.port}" />
+    </http:request-config>
+    <os:object-store name="a2m-spike-arrest-Spike-Arrest" persistent="false" entryTtl="4000" entryTtlUnit="MILLISECONDS" />
+    <os:object-store name="a2m-quota-Hourly-Quota" persistent="false" entryTtl="3600000" entryTtlUnit="MILLISECONDS" />
+    <flow name="proxy-default">
+        <http:listener config-ref="http-listener-config" path="/orders/*">
+            <http:response statusCode="#[vars.httpStatus default 200]">
+                <http:headers>#[vars.responseHeaders default {}]</http:headers>
+            </http:response>
+            <http:error-response statusCode="#[do { var id = error.errorType.identifier default '' --- if (['CONNECTIVITY', 'RETRY_EXHAUSTED', 'SERVICE_UNAVAILABLE'] contains id) 503 else if (['TIMEOUT', 'GATEWAY_TIMEOUT'] contains id) 504 else if (['BAD_GATEWAY'] contains id) 502 else 500 }]">
+                <http:body>#[output application/json --- (do { var id = error.errorType.identifier default '' --- if (['CONNECTIVITY', 'RETRY_EXHAUSTED', 'SERVICE_UNAVAILABLE'] contains id) 503 else if (['TIMEOUT', 'GATEWAY_TIMEOUT'] contains id) 504 else if (['BAD_GATEWAY'] contains id) 502 else 500 }) match { case 503 -&gt; {"fault": {"faultstring": "The Service is temporarily unavailable", "detail": {"errorcode": "messaging.adaptors.http.flow.ServiceUnavailable"}}} case 504 -&gt; {"fault": {"faultstring": "Gateway Timeout", "detail": {"errorcode": "messaging.adaptors.http.flow.GatewayTimeout"}}} case 502 -&gt; {"fault": {"faultstring": "Bad Gateway", "detail": {"errorcode": "messaging.adaptors.http.flow.BadGateway"}}} else -&gt; {"fault": {"faultstring": "Internal Server Error", "detail": {"errorcode": "messaging.runtime.InternalServerError"}}} }]</http:body>
+            </http:error-response>
+        </http:listener>
+        <try doc:name="Verify-Key">
+            <set-variable variableName="a2mApiKey" value="#[output application/java --- (if (vars.a2mRequestQuery == null) attributes.queryParams['apikey'] else vars.a2mRequestQuery['apikey'])]" />
+            <choice>
+                <when expression="#[isEmpty(vars.a2mApiKey)]">
+                    <set-variable variableName="httpStatus" value="#[output application/java --- 401]" />
+                    <set-variable variableName="responseHeaders" value="#[output application/java --- {}]" />
+                    <set-payload value="{&quot;fault&quot;: {&quot;faultstring&quot;: &quot;Failed to resolve API Key variable request.queryparam.apikey&quot;, &quot;detail&quot;: {&quot;errorcode&quot;: &quot;steps.oauth.v2.FailedToResolveAPIKey&quot;}}}" mimeType="application/json" />
+                    <raise-error type="A2M:POLICY_FAULT" description="VerifyAPIKey Verify-Key rejected the call (401)" />
+                </when>
+                <when expression="#[not ((((((p('verifyapikey.Verify-Key.allowedKeys') default '') as String) splitBy ',') map trim($)) filter ($ != '')) contains (vars.a2mApiKey as String))]">
+                    <set-variable variableName="httpStatus" value="#[output application/java --- 401]" />
+                    <set-variable variableName="responseHeaders" value="#[output application/java --- {}]" />
+                    <set-payload value="{&quot;fault&quot;: {&quot;faultstring&quot;: &quot;Invalid ApiKey&quot;, &quot;detail&quot;: {&quot;errorcode&quot;: &quot;oauth.v2.InvalidApiKey&quot;}}}" mimeType="application/json" />
+                    <raise-error type="A2M:POLICY_FAULT" description="VerifyAPIKey Verify-Key rejected the call (401)" />
+                </when>
+            </choice>
+            <error-handler>
+                <on-error-propagate type="A2M:POLICY_FAULT" logException="false" />
+            </error-handler>
+        </try>
+        <try doc:name="Spike-Arrest">
+            <set-variable variableName="a2mSpikeNow" value="#[output application/java --- (now() as Number {unit: 'milliseconds'})]" />
+            <set-variable variableName="a2mSpikeBucket" value="#[output application/java --- floor((vars.a2mSpikeNow as Number) / 2000)]" />
+            <set-variable variableName="a2mSpikeId" value="#[output application/java --- 'client:' ++ ((vars['client_id'] default '') as String)]" />
+            <set-variable variableName="a2mSpikeVerdict" value="#[output application/java --- 'allow']" />
+            <try>
+                <os:store key="#['spike:' ++ (((vars.a2mSpikeBucket as Number)) as String) ++ ':' ++ vars.a2mSpikeId]" objectStore="a2m-spike-arrest-Spike-Arrest" failIfPresent="true">
+                    <os:value>#[vars.a2mSpikeNow]</os:value>
+                </os:store>
+                <error-handler>
+                    <on-error-continue type="OS:KEY_ALREADY_EXISTS" logException="false">
+                        <set-variable variableName="a2mSpikeVerdict" value="#[output application/java --- 'reject']" />
+                    </on-error-continue>
+                </error-handler>
+            </try>
+            <choice>
+                <when expression="#[vars.a2mSpikeVerdict == 'allow']">
+                    <os:retrieve key="#['spike:' ++ (((vars.a2mSpikeBucket as Number) - 1) as String) ++ ':' ++ vars.a2mSpikeId]" objectStore="a2m-spike-arrest-Spike-Arrest" target="a2mSpikePrevious">
+                        <os:default-value>#[-1]</os:default-value>
+                    </os:retrieve>
+                    <choice>
+                        <when expression="#[(vars.a2mSpikePrevious as Number) == -1]">
+                            <try>
+                                <os:store key="#['spike:' ++ (((vars.a2mSpikeBucket as Number) - 1) as String) ++ ':' ++ vars.a2mSpikeId]" objectStore="a2m-spike-arrest-Spike-Arrest" failIfPresent="true">
+                                    <os:value>#[0]</os:value>
+                                </os:store>
+                                <error-handler>
+                                    <on-error-continue type="OS:KEY_ALREADY_EXISTS" logException="false">
+                                        <os:retrieve key="#['spike:' ++ (((vars.a2mSpikeBucket as Number) - 1) as String) ++ ':' ++ vars.a2mSpikeId]" objectStore="a2m-spike-arrest-Spike-Arrest" target="a2mSpikePrevious">
+                                            <os:default-value>#[-1]</os:default-value>
+                                        </os:retrieve>
+                                        <choice>
+                                            <when expression="#[(vars.a2mSpikePrevious as Number) == -1]">
+                                                <set-variable variableName="a2mSpikeVerdict" value="#[output application/java --- 'release']" />
+                                            </when>
+                                        </choice>
+                                    </on-error-continue>
+                                </error-handler>
+                            </try>
+                        </when>
+                    </choice>
+                    <choice>
+                        <when expression="#[vars.a2mSpikeVerdict == 'allow' and ((vars.a2mSpikeNow as Number) - (vars.a2mSpikePrevious as Number)) &lt; 2000]">
+                            <set-variable variableName="a2mSpikeVerdict" value="#[output application/java --- 'release']" />
+                        </when>
+                    </choice>
+                </when>
+            </choice>
+            <choice>
+                <when expression="#[vars.a2mSpikeVerdict == 'release']">
+                    <try>
+                        <os:remove key="#['spike:' ++ (((vars.a2mSpikeBucket as Number)) as String) ++ ':' ++ vars.a2mSpikeId]" objectStore="a2m-spike-arrest-Spike-Arrest" />
+                        <error-handler>
+                            <on-error-continue type="OS:KEY_NOT_FOUND" logException="false" />
+                        </error-handler>
+                    </try>
+                </when>
+            </choice>
+            <choice>
+                <when expression="#[not (vars.a2mSpikeVerdict == 'allow')]">
+                    <set-variable variableName="httpStatus" value="#[output application/java --- 429]" />
+                    <set-variable variableName="responseHeaders" value="#[output application/java --- {}]" />
+                    <set-payload value="{&quot;fault&quot;: {&quot;faultstring&quot;: &quot;Spike arrest violation. Allowed rate : 30pm&quot;, &quot;detail&quot;: {&quot;errorcode&quot;: &quot;policies.ratelimit.SpikeArrestViolation&quot;}}}" mimeType="application/json" />
+                    <raise-error type="A2M:POLICY_FAULT" description="SpikeArrest Spike-Arrest rejected the call (429)" />
+                </when>
+            </choice>
+            <error-handler>
+                <on-error-propagate type="A2M:POLICY_FAULT" logException="false" />
+            </error-handler>
+        </try>
+        <choice doc:name="Check-IP">
+            <when expression="#[(do { var address = (attributes.remoteAddress default '') replace /^\/|:\d+$/ with '' var parts = address splitBy '.' var ip = if (sizeOf(parts) == 4 and sizeOf(parts filter ((part) -&gt; part matches /\d{1,3}/)) == 4) (parts reduce ((part, total = 0) -&gt; total * 256 + (part as Number))) else -1 var rules = [{action: 'ALLOW', rule: '10.0.0.0/24', first: 167772160, last: 167772415}, {action: 'DENY', rule: '192.168.1.5/32', first: 3232235781, last: 3232235781}] --- ((rules filter ((rule) -&gt; ip &gt;= rule.first and ip &lt;= rule.last))[0].action) default 'DENY' }) == 'DENY']">
+                <set-variable variableName="httpStatus" value="#[output application/java --- 403]" />
+                <set-variable variableName="responseHeaders" value="#[output application/java --- {}]" />
+                <set-payload value="{&quot;fault&quot;: {&quot;faultstring&quot;: &quot;Access Denied for client ip&quot;, &quot;detail&quot;: {&quot;errorcode&quot;: &quot;accesscontrol.IPDeniedAccess&quot;}}}" mimeType="application/json" />
+                <raise-error type="A2M:POLICY_FAULT" description="AccessControl Check-IP rejected the call (403)" />
+            </when>
+        </choice>
+        <try doc:name="Hourly-Quota">
+            <set-variable variableName="a2mQuotaWindow" value="#[output application/java --- floor((now() as Number {unit: 'milliseconds'}) / 3600000) as String]" />
+            <set-variable variableName="a2mQuotaId" value="#[output application/java --- ((vars['client_id'] default '') as String)]" />
+            <os:retrieve key="#['quota-hint:' ++ vars.a2mQuotaWindow ++ ':' ++ vars.a2mQuotaId]" objectStore="a2m-quota-Hourly-Quota" target="a2mQuotaHint">
+                <os:default-value>#[0]</os:default-value>
+            </os:retrieve>
+            <set-variable variableName="a2mQuotaSlot" value="#[output application/java --- 0]" />
+            <foreach collection="#[[1]]" counterVariableName="a2mQuotaPassCounter" rootMessageVariableName="a2mQuotaPassRoot">
+                <try>
+                    <foreach collection="#[if ((vars.a2mQuotaHint as Number) &gt;= 1000) [] else (((vars.a2mQuotaHint as Number) + 1) to 1000)]" counterVariableName="a2mQuotaSlotCounter" rootMessageVariableName="a2mQuotaSlotRoot">
+                        <try>
+                            <os:store key="#['quota-slot:' ++ vars.a2mQuotaWindow ++ ':' ++ (payload as String) ++ ':' ++ vars.a2mQuotaId]" objectStore="a2m-quota-Hourly-Quota" failIfPresent="true">
+                                <os:value>#[true]</os:value>
+                            </os:store>
+                            <set-variable variableName="a2mQuotaSlot" value="#[output application/java --- payload]" />
+                            <raise-error type="A2M:QUOTA_SLOT_TAKEN" description="a quota slot was taken; leave the slot loop" />
+                            <error-handler>
+                                <on-error-continue type="OS:KEY_ALREADY_EXISTS" logException="false" />
+                            </error-handler>
+                        </try>
+                    </foreach>
+                    <error-handler>
+                        <on-error-continue type="A2M:QUOTA_SLOT_TAKEN" logException="false" />
+                    </error-handler>
+                </try>
+            </foreach>
+            <choice>
+                <when expression="#[(vars.a2mQuotaSlot as Number) == 0]">
+                    <set-variable variableName="httpStatus" value="#[output application/java --- 429]" />
+                    <set-variable variableName="responseHeaders" value="#[output application/java --- {}]" />
+                    <set-payload value="{&quot;fault&quot;: {&quot;faultstring&quot;: &quot;Rate limit quota violation. Quota limit 1000 per 1 hour exceeded&quot;, &quot;detail&quot;: {&quot;errorcode&quot;: &quot;policies.ratelimit.QuotaViolation&quot;}}}" mimeType="application/json" />
+                    <raise-error type="A2M:POLICY_FAULT" description="Quota Hourly-Quota rejected the call (429)" />
+                </when>
+                <otherwise>
+                    <os:store key="#['quota-hint:' ++ vars.a2mQuotaWindow ++ ':' ++ vars.a2mQuotaId]" objectStore="a2m-quota-Hourly-Quota">
+                        <os:value>#[vars.a2mQuotaSlot]</os:value>
+                    </os:store>
+                </otherwise>
+            </choice>
+            <error-handler>
+                <on-error-propagate type="A2M:POLICY_FAULT" logException="false" />
+            </error-handler>
+        </try>
+        <set-variable variableName="ext.orderId" value="#[output application/java --- if ((payload is Object) or (payload is Array)) payload['order']['id'] else null]" doc:name="Extract-Order-Id" />
+        <try doc:name="Encode-Basic-Auth">
+            <choice>
+                <when expression="#[(vars['creds.user']) == null or (vars['creds.pass']) == null]">
+                    <set-variable variableName="httpStatus" value="#[output application/java --- 500]" />
+                    <set-variable variableName="responseHeaders" value="#[output application/java --- {}]" />
+                    <set-payload value="{&quot;fault&quot;: {&quot;faultstring&quot;: &quot;Unresolved variable : creds.user or creds.pass&quot;, &quot;detail&quot;: {&quot;errorcode&quot;: &quot;steps.basicauthentication.UnresolvedVariable&quot;}}}" mimeType="application/json" />
+                    <raise-error type="A2M:POLICY_FAULT" description="BasicAuthentication Encode-Basic-Auth rejected the call (500)" />
+                </when>
+            </choice>
+            <set-variable variableName="a2mRequestHeaders" value="#[output application/java --- ((vars.a2mRequestHeaders default attributes.headers) filterObject ((value, key) -&gt; not (['authorization'] contains lower(key as String)))) ++ {'authorization': 'Basic ' ++ dw::core::Binaries::toBase64(((((vars['creds.user']) default '') as String) ++ ':' ++ (((vars['creds.pass']) default '') as String)) as Binary {encoding: 'UTF-8'})}]" />
+            <error-handler>
+                <on-error-propagate type="A2M:POLICY_FAULT" logException="false" />
+            </error-handler>
+        </try>
+        <try doc:name="Add-Target-Headers">
+            <set-variable variableName="a2mRequestHeaders" value="#[output application/java --- ((vars.a2mRequestHeaders default attributes.headers) filterObject ((value, key) -&gt; not (['x-internal'] contains lower(key as String))))]" />
+            <set-variable variableName="a2mRequestQuery" value="#[output application/java --- ((vars.a2mRequestQuery default attributes.queryParams) ++ {'version': '2'})]" />
+            <set-variable variableName="a2mRequestHeaders" value="#[output application/java --- (((vars.a2mRequestHeaders default attributes.headers) filterObject ((value, key) -&gt; not (['x-env'] contains lower(key as String)))) ++ {'x-env': 'prod'})]" />
+            <set-variable variableName="target.env" value="prod" />
+            <error-handler>
+                <on-error-propagate type="A2M:POLICY_FAULT" logException="false" />
+            </error-handler>
+        </try>
+        <http:request config-ref="target-default-config" method="#[attributes.method]" path="#[if (attributes.maskedRequestPath == '/' and not (attributes.rawRequestPath endsWith '/')) '' else attributes.maskedRequestPath]" followRedirects="false">
+            <http:headers>#[(vars.a2mRequestHeaders default attributes.headers) -- ['host', 'content-length', 'transfer-encoding', 'connection']]</http:headers>
+            <http:query-params>#[vars.a2mRequestQuery default attributes.queryParams]</http:query-params>
+            <http:response-validator>
+                <http:success-status-code-validator values="0..599" />
+            </http:response-validator>
+        </http:request>
+        <set-variable variableName="httpStatus" value="#[attributes.statusCode]" />
+        <set-variable variableName="responseHeaders" value="#[attributes.headers -- ['content-length', 'transfer-encoding', 'connection', 'content-type']]" />
+        <set-variable variableName="responseHeaders" value="#[output application/java --- ((vars.responseHeaders default {}) filterObject ((value, key) -&gt; not (['x-internal'] contains lower(key as String))))]" doc:name="Strip-Internal" />
+        <set-variable variableName="responseHeaders" value="#[output application/java --- (((vars.responseHeaders default {}) filterObject ((value, key) -&gt; not (['x-served-by'] contains lower(key as String)))) ++ {'x-served-by': 'a2m'})]" doc:name="Set-Response-Header" />
+        <error-handler>
+            <on-error-continue type="A2M:POLICY_FAULT" logException="false">
+                <logger level="DEBUG" message="A policy step answered the call with its fault response" />
+            </on-error-continue>
+        </error-handler>
+    </flow>
+</mule>

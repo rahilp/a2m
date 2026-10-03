@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="1" name="policy-runtime">
+    <Description>a2m CP4 runtime fixture: VerifyAPIKey, AssignMessage, SpikeArrest and Quota without conditions</Description>
+    <DisplayName>policy-runtime</DisplayName>
+    <Policies>
+        <Policy>Verify-Key</Policy>
+        <Policy>Add-Backend-Header</Policy>
+        <Policy>Spike-Arrest</Policy>
+        <Policy>Minute-Quota</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>keyed</ProxyEndpoint>
+        <ProxyEndpoint>spike</ProxyEndpoint>
+        <ProxyEndpoint>quota</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>default</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>

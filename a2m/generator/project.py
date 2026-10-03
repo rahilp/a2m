@@ -12,13 +12,20 @@
 * ``src/main/resources/config.properties``: the listen port and every target
   address, so a runner can point the app at another port or backend.
 
-Nothing is dropped silently. Whatever this step does not generate (policy
-steps, conditional flows, fault rules, target settings, targets without a
-fixed URL, ...) is listed in :attr:`GenerateResult.unsupported` with a reason,
-and every conditional RouteRule is kept in :attr:`GenerateResult.pending` with
-its original condition for the condition translator. Until it is translated,
-a conditional route's branch is never taken (its ``when`` is ``#[false]``) and
-the original condition is kept beside it in the flow XML.
+Policy steps go through the templates of :mod:`a2m.policies`: each generated
+step is one processor labelled ``doc:name="<step name>"`` at the step's place
+in Apigee's execution order, and :attr:`GenerateResult.policies` holds one
+result record per step (``template`` or ``skipped``). A skipped step leaves an
+XML comment naming the step and its type where it would have been.
+
+Nothing is dropped silently. Whatever this step does not generate (policies
+without a template, settings a template cannot carry over, conditional flows,
+fault rules, target settings, targets without a fixed URL, ...) is listed in
+:attr:`GenerateResult.unsupported` with a reason, and every conditional
+RouteRule or step is kept in :attr:`GenerateResult.pending` with its original
+condition for the condition translator. Until it is translated, a conditional
+route's branch or step never runs (its ``when`` is ``#[false]``) and the
+original condition is kept beside it in the flow XML.
 
 All XML is built with :mod:`xml.etree.ElementTree`, so every value from the
 bundle is escaped. The output is deterministic: no timestamps, no absolute
@@ -27,6 +34,8 @@ paths, the same input gives the same bytes.
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import json
 import re
 import xml.etree.ElementTree as ET
@@ -34,6 +43,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
+from typing import cast
 from urllib.parse import urlsplit
 
 from a2m import safefs
@@ -50,18 +60,46 @@ from a2m.ir import (
     XmlElement,
 )
 from a2m.layout import collision_key
+from a2m.policies import registry
+from a2m.policies.common import (
+    FAULT_ERROR_TYPE,
+    NEED_FAULT,
+    NEED_REASON_PHRASE,
+    NEED_REQUEST_HEADERS,
+    NEED_REQUEST_QUERY,
+    REASON_PHRASE_VAR,
+    REQUEST,
+    REQUEST_HEADERS_VAR,
+    REQUEST_QUERY_VAR,
+    RESPONSE,
+    Method,
+    PolicyResult,
+    TemplateOutput,
+    UnsupportedOption,
+)
 
 CORE = "http://www.mulesoft.org/schema/mule/core"
 HTTP = "http://www.mulesoft.org/schema/mule/http"
+OS = "http://www.mulesoft.org/schema/mule/os"
+VALIDATION = "http://www.mulesoft.org/schema/mule/validation"
 DOC = "http://www.mulesoft.org/schema/mule/documentation"
 XSI = "http://www.w3.org/2001/XMLSchema-instance"
 POM = "http://maven.apache.org/POM/4.0.0"
 SCHEMA_LOCATIONS = {
     CORE: "http://www.mulesoft.org/schema/mule/core/current/mule.xsd",
     HTTP: "http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd",
+    OS: "http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd",
+    VALIDATION: "http://www.mulesoft.org/schema/mule/validation/current/mule-validation.xsd",
 }
-for _prefix, _uri in (("http", HTTP), ("doc", DOC), ("xsi", XSI)):
+# The pom dependency each module namespace beyond core and http needs, pinned to the versions proven on 4.9.0.
+MODULE_DEPENDENCIES = {
+    OS: ("org.mule.connectors", "mule-objectstore-connector", "1.2.2"),
+    VALIDATION: ("org.mule.modules", "mule-validation-module", "2.0.9"),
+}
+for _prefix, _uri in (("http", HTTP), ("os", OS), ("validation", VALIDATION), ("doc", DOC), ("xsi", XSI)):
     ET.register_namespace(_prefix, _uri)
+DOC_NAME = f"{{{DOC}}}name"
+DOC_DESCRIPTION = f"{{{DOC}}}description"
 
 MULE_DIR = ("src", "main", "mule")
 RESOURCES_DIR = ("src", "main", "resources")
@@ -93,7 +131,12 @@ REQUEST_PATH = (
     "else attributes.maskedRequestPath]"
 )
 # Hop-by-hop and length headers the HTTP connector sets itself; everything else is passed on.
-REQUEST_HEADERS = "#[attributes.headers -- ['host', 'content-length', 'transfer-encoding', 'connection']]"
+HOP_HEADERS = "['host', 'content-length', 'transfer-encoding', 'connection']"
+REQUEST_HEADERS = f"#[attributes.headers -- {HOP_HEADERS}]"
+REQUEST_QUERY = "#[attributes.queryParams]"
+# The same, once a policy step may have changed the headers or query parameters the target gets.
+CHANGED_REQUEST_HEADERS = f"#[(vars.{REQUEST_HEADERS_VAR} default attributes.headers) -- {HOP_HEADERS}]"
+CHANGED_REQUEST_QUERY = f"#[vars.{REQUEST_QUERY_VAR} default attributes.queryParams]"
 # Content-Type travels as the payload's media type, so it is not copied twice.
 RESPONSE_HEADERS = "#[attributes.headers -- ['content-length', 'transfer-encoding', 'connection', 'content-type']]"
 NO_ROUTE_FAULT = '{"fault": "No route of the migrated proxy matched this request."}'
@@ -129,11 +172,15 @@ class UnsupportedItem:
 
 @dataclass(frozen=True, slots=True)
 class PendingCondition:
-    """A conditional RouteRule kept for the condition translator: ``condition`` is the original Apigee text."""
+    """A conditional RouteRule or step kept for the condition translator: ``condition`` is the original text.
+
+    ``endpoint`` is the ProxyEndpoint of a RouteRule, or where a step sits.
+    """
 
     name: str
     condition: str
     endpoint: str
+    kind: str = "RouteRule"
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +188,8 @@ class GenerateResult:
     files: tuple[str, ...]
     unsupported: tuple[UnsupportedItem, ...]
     pending: tuple[PendingCondition, ...]
+    # One result record per policy step, in flow order (a policy used by two steps has two records).
+    policies: tuple[PolicyResult, ...] = ()
 
 
 class GeneratorError(ValueError):
@@ -170,6 +219,7 @@ def generate_project(
         files=tuple(sorted(files)),
         unsupported=tuple(builder.unsupported),
         pending=tuple(builder.pending),
+        policies=tuple(builder.records),
     )
 
 
@@ -323,7 +373,7 @@ class _ProjectBuilder:
         self.globals: list[ET.Element] = []
         self.flows: list[ET.Element] = []
         self.sub_flows: list[ET.Element] = []
-        self.sub_flow_names: dict[str, str] = {}
+        self.sub_flow_names: dict[tuple[str, str], str] = {}
         self.in_progress: set[str] = set()
         self.targets: dict[str, TargetEndpoint] = {t.name: t for t in bundle.target_endpoints}
         self.target_plans: dict[str, _TargetPlan] = {}
@@ -331,6 +381,14 @@ class _ProjectBuilder:
         # Targets named by a RouteRule of a ProxyEndpoint that is not generated (see _skip_endpoint).
         self.dropped_route_targets: set[str] = set()
         self.names.take(LISTENER_CONFIG)
+        self.records: list[PolicyResult] = []
+        # What the generated policy steps need from the flows (see a2m.policies.common), and their globals.
+        self.needs: set[str] = set()
+        self.policy_globals: list[ET.Element] = []
+        self.global_names: dict[tuple[str, str], str] = {}
+        self.property_notes: dict[str, str] = {}
+        self.requests: list[ET.Element] = []
+        self.listener_responses: list[ET.Element] = []
 
     # ------------------------------------------------------------ results
 
@@ -355,15 +413,43 @@ class _ProjectBuilder:
             else:
                 self._skip_endpoint(endpoint, reason)
         self._report_unused()
+        self._wire_policy_needs()
 
         files: dict[str, str] = {}
-        main = [listener, listener_config, *self.globals, *self.flows, *self.sub_flows]
+        main = [listener, listener_config, *self.globals, *self.policy_globals, *self.flows, *self.sub_flows]
         files["/".join((*MULE_DIR, PROXY_FILE))] = _mule_document(main)
         configs = sorted(path.rsplit("/", 1)[-1] for path in files)
-        files["/".join((*RESOURCES_DIR, PROPERTIES_FILE))] = _properties_text(self.props)
+        files["/".join((*RESOURCES_DIR, PROPERTIES_FILE))] = _properties_text(self.props, self.property_notes)
         files["mule-artifact.json"] = _artifact_json(configs)
-        files["pom.xml"] = _pom_text(self.bundle)
+        files["pom.xml"] = _pom_text(self.bundle, [ns for ns in MODULE_DEPENDENCIES if _uses(main, ns)])
         return files
+
+    def _wire_policy_needs(self) -> None:
+        """Connect the generated policy steps to the flows: changed request parts, fault answers, reason phrases."""
+        for request in self.requests:
+            headers = request.find(f"{{{HTTP}}}headers")
+            query = request.find(f"{{{HTTP}}}query-params")
+            if NEED_REQUEST_HEADERS in self.needs and headers is not None:
+                headers.text = CHANGED_REQUEST_HEADERS
+            if NEED_REQUEST_QUERY in self.needs and query is not None:
+                query.text = CHANGED_REQUEST_QUERY
+        if NEED_REASON_PHRASE in self.needs:
+            for response in self.listener_responses:
+                response.set("reasonPhrase", f"#[vars.{REASON_PHRASE_VAR}]")
+        if NEED_FAULT in self.needs:
+            # A policy step that rejects the call has set the status, headers and body of its answer; the
+            # handler ends the flow normally, so the listener sends exactly that.
+            for flow in self.flows:
+                handler = _child(flow, CORE, "error-handler")
+                continuing = _child(
+                    handler, CORE, "on-error-continue", {"type": FAULT_ERROR_TYPE, "logException": "false"}
+                )
+                _child(
+                    continuing,
+                    CORE,
+                    "logger",
+                    {"level": "DEBUG", "message": "A policy step answered the call with its fault response"},
+                )
 
     # ------------------------------------------------------------ proxy endpoints
 
@@ -375,18 +461,19 @@ class _ProjectBuilder:
         )
         response = _child(listener, HTTP, "response", {"statusCode": "#[vars.httpStatus default 200]"})
         _child(response, HTTP, "headers").text = "#[vars.responseHeaders default {}]"
+        self.listener_responses.append(response)
         error = _child(listener, HTTP, "error-response", {"statusCode": f"#[{_error_status()}]"})
         _child(error, HTTP, "body").text = _error_body()
         self._check_endpoint_settings(endpoint, where)
 
-        flow.extend(self._steps(endpoint.pre_flow.request, f"{where} PreFlow request"))
+        flow.extend(self._steps(endpoint.pre_flow.request, f"{where} PreFlow request", REQUEST))
         self._skip_flows(endpoint.flows, where)
-        flow.extend(self._steps(endpoint.post_flow.request, f"{where} PostFlow request"))
+        flow.extend(self._steps(endpoint.post_flow.request, f"{where} PostFlow request", REQUEST))
         flow.extend(self._routing(endpoint, where))
         # Apigee's response order: the target's response steps (inside the routing above), then this
         # endpoint's PreFlow, conditional Flows (reported by _skip_flows) and PostFlow response steps.
-        flow.extend(self._steps(endpoint.pre_flow.response, f"{where} PreFlow response"))
-        flow.extend(self._steps(endpoint.post_flow.response, f"{where} PostFlow response"))
+        flow.extend(self._steps(endpoint.pre_flow.response, f"{where} PreFlow response", RESPONSE))
+        flow.extend(self._steps(endpoint.post_flow.response, f"{where} PostFlow response", RESPONSE))
         if endpoint.post_client_flow is not None:
             self._skip_flow_steps(endpoint.post_client_flow, f"{where} PostClientFlow")
         self._skip_fault_rules(endpoint, where)
@@ -446,9 +533,19 @@ class _ProjectBuilder:
         for direction, items in (("request", steps.request), ("response", steps.response)):
             self._skip_steps(items, f"{where} {direction}")
 
-    def _skip_steps(self, steps: Sequence[Step], where: str) -> None:
+    def _skip_steps(self, steps: Sequence[Step], where: str, policies: dict[str, Policy] | None = None) -> None:
+        policies = self.policies if policies is None else policies
         for step in steps:
-            self.skip(step.name, f"{where}: step {step.name} is in a part of the flow that is not generated yet")
+            reason = f"{where}: step {step.name} is in a part of the flow that is not generated yet"
+            self.skip(step.name, reason)
+            self._record_skipped(step, policies, where, reason)
+
+    def _record_skipped(self, step: Step, policies: dict[str, Policy], where: str, reason: str) -> None:
+        policy = policies.get(step.policy)
+        kind = policy.type if policy is not None else "unknown"
+        self.records.append(
+            PolicyResult(step.name, kind, Method.SKIPPED, reason, location=where, condition=step.condition)
+        )
 
     def _skip_fault_rules(self, endpoint: ProxyEndpoint | TargetEndpoint, where: str) -> None:
         for rule in endpoint.fault_rules:
@@ -624,9 +721,9 @@ class _ProjectBuilder:
             self._skip_flows(target.flows, where)
             self._skip_flow_steps(target.post_flow, f"{where} PostFlow")
             return _fault(NO_TARGET_FAULT)
-        processors = self._steps(target.pre_flow.request, f"{where} PreFlow request")
+        processors = self._steps(target.pre_flow.request, f"{where} PreFlow request", REQUEST)
         self._skip_flows(target.flows, where)
-        processors += self._steps(target.post_flow.request, f"{where} PostFlow request")
+        processors += self._steps(target.post_flow.request, f"{where} PostFlow request", REQUEST)
         attrib = {
             "config-ref": plan.config,
             "method": "#[attributes.method]",
@@ -638,7 +735,8 @@ class _ProjectBuilder:
             attrib["responseTimeout"] = f"${{{plan.key}.responseTimeout}}"
         request = _element(HTTP, "request", attrib)
         _child(request, HTTP, "headers").text = REQUEST_HEADERS
-        _child(request, HTTP, "query-params").text = "#[attributes.queryParams]"
+        _child(request, HTTP, "query-params").text = REQUEST_QUERY
+        self.requests.append(request)
         validator = _child(request, HTTP, "response-validator")
         # Apigee passes the target's 4xx and 5xx answers to the caller unchanged.
         _child(validator, HTTP, "success-status-code-validator", {"values": "0..599"})
@@ -649,69 +747,133 @@ class _ProjectBuilder:
         processors.append(
             _element(CORE, "set-variable", {"variableName": "responseHeaders", "value": RESPONSE_HEADERS})
         )
-        processors += self._steps(target.pre_flow.response, f"{where} PreFlow response")
-        processors += self._steps(target.post_flow.response, f"{where} PostFlow response")
+        processors += self._steps(target.pre_flow.response, f"{where} PreFlow response", RESPONSE)
+        processors += self._steps(target.post_flow.response, f"{where} PostFlow response", RESPONSE)
         return processors
 
     # ------------------------------------------------------------ steps and shared flows
 
-    def _steps(self, steps: Sequence[Step], where: str, policies: dict[str, Policy] | None = None) -> list[ET.Element]:
-        """Processors for ``steps``: a flow-ref for each FlowCallout to a known shared flow; the rest reported."""
+    def _steps(
+        self, steps: Sequence[Step], where: str, direction: str, policies: dict[str, Policy] | None = None
+    ) -> list[ET.Element]:
+        """Processors for ``steps``, one labelled processor (or a comment, when skipped) per step, in order."""
         policies = self.policies if policies is None else policies
         found: list[ET.Element] = []
         for step in steps:
             policy = policies.get(step.policy)
-            kind = policy.type if policy is not None else "unknown"
-            if policy is not None and not policy.enabled:
-                self.skip(
-                    step.name, f"{where}: policy {policy.name} is disabled (enabled=false), so nothing is generated"
-                )
-            elif step.condition is not None:
-                self.skip(
-                    step.name,
-                    f"{where}: step {step.name} has the condition {step.condition}, which is not translated yet, "
-                    "so the step is not generated",
-                )
-            elif kind == FLOW_CALLOUT and policy is not None:
-                found += self._flow_callout(step, policy, where)
+            if policy is None:
+                found.append(self._skipped_step(step, "unknown", f"policy {step.policy} is not in the bundle", where))
+            elif not policy.enabled:
+                reason = f"policy {policy.name} is disabled (enabled=false), so nothing is generated"
+                found.append(self._skipped_step(step, policy.type, reason, where))
+            elif policy.type == FLOW_CALLOUT:
+                found.append(self._flow_callout(step, policy, where, direction))
             else:
-                self.skip(step.name, f"{where}: {kind} policy {step.policy} is not translated in this version of a2m")
+                found.append(self._policy_step(step, registry.translate(policy, direction=direction), where))
         return found
 
-    def _flow_callout(self, step: Step, policy: Policy, where: str) -> list[ET.Element]:
+    def _skipped_step(self, step: Step, kind: str, reason: str, where: str) -> ET.Element:
+        """Report a step that is not generated; the comment left at its place names the step and its type."""
+        self.skip(step.name, f"{where}: {reason}")
+        condition = f" It has the condition {step.condition}." if step.condition is not None else ""
+        self.records.append(
+            PolicyResult(step.name, kind, Method.SKIPPED, reason, location=where, condition=step.condition)
+        )
+        comment = ET.Comment(_comment_text(f"Step {step.name} ({kind}) is not generated: {reason}.{condition}"))
+        return cast(ET.Element, comment)
+
+    def _policy_step(self, step: Step, output: TemplateOutput, where: str) -> ET.Element:
+        result = output.result
+        if result.method is not Method.TEMPLATE or not output.processors:
+            return self._skipped_step(step, result.type, result.reason or "nothing could be generated", where)
+        for option in result.unsupported_options:
+            self.skip(f"{step.name} {option.name}", f"{where}: {result.type} step {step.name}: {option.reason}")
+        names = self._take_globals(step.policy, output)
+        processors = [_adopt(p, names) for p in output.processors]
+        for key, value in output.properties.items():
+            self.props.setdefault(key, value)
+        for key, note in output.property_notes.items():
+            self.property_notes.setdefault(key, note)
+        self.needs.update(output.needs)
+        return self._place(step, _labelled(step.name, processors), dataclasses.replace(result, name=step.name), where)
+
+    def _take_globals(self, policy_name: str, output: TemplateOutput) -> dict[str, str]:
+        """Add the template's global elements once per policy; returns old name -> unique Mule name."""
+        names: dict[str, str] = {}
+        for element in output.globals:
+            wanted = element.get("name") or "unnamed"
+            key = (policy_name, wanted)
+            if key not in self.global_names:
+                self.global_names[key] = self.names.take(wanted)
+                names[wanted] = self.global_names[key]
+                self.policy_globals.append(_adopt(element, names))
+            names[wanted] = self.global_names[key]
+        return names
+
+    def _place(self, step: Step, processor: ET.Element, result: PolicyResult, where: str) -> ET.Element:
+        """Record the generated step; a step with a condition is kept but never runs until it is translated."""
+        if step.condition is None:
+            self.records.append(dataclasses.replace(result, location=where))
+            return processor
+        self.pending.append(PendingCondition(step.name, step.condition, where, kind="Step"))
+        self.records.append(
+            dataclasses.replace(
+                result, location=where, condition=step.condition, tags=(*result.tags, "condition-pending")
+            )
+        )
+        choice = _element(CORE, "choice")
+        when = _child(
+            choice,
+            CORE,
+            "when",
+            {
+                "expression": "#[false]",
+                DOC_DESCRIPTION: (
+                    f"Step {step.name}: Apigee condition {step.condition} (not translated yet, so this step never runs)"
+                ),
+            },
+        )
+        when.append(processor)
+        return choice
+
+    def _flow_callout(self, step: Step, policy: Policy, where: str, direction: str) -> ET.Element:
         name = step.shared_flow
+        reason: str | None = None
+        bundles = self.shared.get(name, []) if name is not None else []
         if name is None:
-            self.skip(step.name, f"{where}: FlowCallout {policy.name} names no SharedFlowBundle")
-            return []
-        bundles = self.shared.get(name, [])
-        if not bundles:
-            self.skip(
-                step.name,
-                f"{where}: FlowCallout {policy.name} calls shared flow bundle {name}, which is not in the input "
-                "folder (or could not be read), so no sub-flow is generated",
+            reason = f"FlowCallout {policy.name} names no SharedFlowBundle"
+        elif not bundles:
+            reason = (
+                f"FlowCallout {policy.name} calls shared flow bundle {name}, which is not in the input "
+                "folder (or could not be read), so no sub-flow is generated"
             )
-            return []
-        if len(bundles) > 1:
-            self.skip(
-                step.name,
-                f"{where}: FlowCallout {policy.name} calls {name}, and {len(bundles)} shared flow bundles have that name",
-            )
-            return []
-        if name in self.in_progress:
-            self.skip(step.name, f"{where}: FlowCallout {policy.name} calls shared flow {name} from inside itself")
-            return []
+        elif len(bundles) > 1:
+            reason = f"FlowCallout {policy.name} calls {name}, and {len(bundles)} shared flow bundles have that name"
+        elif name in self.in_progress:
+            reason = f"FlowCallout {policy.name} calls shared flow {name} from inside itself"
+        if reason is not None:
+            return self._skipped_step(step, policy.type, reason, where)
+        options: tuple[UnsupportedOption, ...] = ()
         parameters = [c for c in policy.settings.children if c.tag == "Parameters" and c.children]
         if parameters:
-            self.skip(step.name, f"{where}: the parameters of FlowCallout {policy.name} are not passed to {name}")
-        return [_element(CORE, "flow-ref", {"name": self._sub_flow(bundles[0])})]
+            text = f"the parameters of FlowCallout {policy.name} are not passed to {name}"
+            self.skip(step.name, f"{where}: {text}")
+            options = (UnsupportedOption("Parameters", text),)
+        position = len(self.records)
+        call = _element(CORE, "flow-ref", {"name": self._sub_flow(bundles[0], direction), DOC_NAME: step.name})
+        result = PolicyResult(step.name, policy.type, Method.TEMPLATE, unsupported_options=options)
+        placed = self._place(step, call, result, where)
+        # The callout runs before the shared flow's own steps, which were recorded while generating it.
+        self.records.insert(position, self.records.pop())
+        return placed
 
-    def _sub_flow(self, shared: Bundle) -> str:
-        """The name of the sub-flow for ``shared``, generating it the first time."""
-        existing = self.sub_flow_names.get(shared.name)
+    def _sub_flow(self, shared: Bundle, direction: str) -> str:
+        """The name of the sub-flow for ``shared`` on the ``direction`` side, generating it the first time."""
+        existing = self.sub_flow_names.get((shared.name, direction))
         if existing is not None:
             return existing
         name = self.names.take(f"shared-flow-{shared.name}")
-        self.sub_flow_names[shared.name] = name
+        self.sub_flow_names[(shared.name, direction)] = name
         self.in_progress.add(shared.name)
         sub_flow = _element(CORE, "sub-flow", {"name": name})
         flows = list(shared.shared_flows)
@@ -723,10 +885,10 @@ class _ProjectBuilder:
                     f"{shared.name}/{flow.name}",
                     f"shared flow bundle {shared.name}: flow {flow.name} is not its entry flow and is not generated",
                 )
-                self._skip_steps(flow.steps, f"shared flow {shared.name}/{flow.name}")
+                self._skip_steps(flow.steps, f"shared flow {shared.name}/{flow.name}", policies)
         if entry is not None:
-            sub_flow.extend(self._steps(entry.steps, f"shared flow {shared.name}", policies))
-        if len(sub_flow) == 0:
+            sub_flow.extend(self._steps(entry.steps, f"shared flow {shared.name}", direction, policies))
+        if not any(_is_element(child) for child in sub_flow):
             # A sub-flow needs at least one processor; this one only marks where the shared flow runs.
             sub_flow.append(_element(CORE, "logger", {"level": "DEBUG", "message": f"{name} called"}))
         self.in_progress.discard(shared.name)
@@ -780,6 +942,44 @@ def _fault(body: str) -> list[ET.Element]:
     ]
 
 
+def _is_element(node: ET.Element) -> bool:
+    return isinstance(node.tag, str)
+
+
+def _adopt(node: ET.Element, renames: dict[str, str]) -> ET.Element:
+    """A copy of a template's element for this document: core tags plain, renamed globals referenced by new name."""
+    copied = copy.deepcopy(node)
+    for element in copied.iter():
+        if not _is_element(element):
+            continue
+        element.tag = element.tag.removeprefix(f"{{{CORE}}}")
+        for key, value in element.attrib.items():
+            if value in renames:
+                element.set(key, renames[value])
+    return copied
+
+
+def _labelled(name: str, processors: Sequence[ET.Element]) -> ET.Element:
+    """One processor labelled with the step name: the only processor, or a try scope holding them all."""
+    if len(processors) == 1:
+        processors[0].set(DOC_NAME, name)
+        return processors[0]
+    scope = _element(CORE, "try", {DOC_NAME: name})
+    scope.extend(processors)
+    # A policy fault raised inside passes on to the flow's handler without being logged as an error here.
+    handler = _child(scope, CORE, "error-handler")
+    _child(handler, CORE, "on-error-propagate", {"type": FAULT_ERROR_TYPE, "logException": "false"})
+    return scope
+
+
+def _comment_text(text: str) -> str:
+    """``text`` as the content of an XML comment, which may not hold '--' or end in '-'."""
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", text)
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "- -")
+    return f" {cleaned} "
+
+
 def _error_status() -> str:
     """DataWeave for the caller's status on a flow error, from the error type only."""
     branches = "".join(
@@ -805,22 +1005,25 @@ def _error_body() -> str:
 def _uses(elements: Sequence[ET.Element], ns: str) -> bool:
     prefix = f"{{{ns}}}"
     return any(
-        e.tag.startswith(prefix) or any(k.startswith(prefix) for k in e.attrib) for top in elements for e in top.iter()
+        _is_element(e) and (e.tag.startswith(prefix) or any(k.startswith(prefix) for k in e.attrib))
+        for top in elements
+        for e in top.iter()
     )
 
 
 def _mule_document(children: Sequence[ET.Element]) -> str:
     root = _element(CORE, "mule", {"xmlns": CORE})
     locations = [CORE, SCHEMA_LOCATIONS[CORE]]
-    if _uses(children, HTTP):
-        locations += [HTTP, SCHEMA_LOCATIONS[HTTP]]
+    for ns in (HTTP, OS, VALIDATION):
+        if _uses(children, ns):
+            locations += [ns, SCHEMA_LOCATIONS[ns]]
     root.set(f"{{{XSI}}}schemaLocation", " ".join(locations))
     root.extend(children)
     ET.indent(root, space="    ")
     return XML_HEAD + ET.tostring(root, encoding="unicode") + "\n"
 
 
-def _pom_text(bundle: Bundle) -> str:
+def _pom_text(bundle: Bundle, modules: Sequence[str] = ()) -> str:
     template = resources.files("a2m.generator").joinpath("templates", "pom.xml").read_text(encoding="utf-8")
     root = ET.fromstring(template)
     for element in root.iter():
@@ -836,6 +1039,14 @@ def _pom_text(bundle: Bundle) -> str:
         name = root.find("name")
         index = list(root).index(name) + 1 if name is not None else len(root)
         root.insert(index, _element(POM, "description", text=description.strip()))
+    dependencies = root.find("dependencies")
+    if dependencies is None:
+        raise GeneratorError("templates/pom.xml has no <dependencies> element")
+    for ns in modules:
+        group, artifact, version = MODULE_DEPENDENCIES[ns]
+        dependency = _child(dependencies, POM, "dependency")
+        for tag, value in (("groupId", group), ("artifactId", artifact), ("version", version), ("classifier", "mule-plugin")):
+            dependency.append(_element(POM, tag, text=value))
     ET.indent(root, space="  ")
     return XML_HEAD + ET.tostring(root, encoding="unicode") + "\n"
 
@@ -852,11 +1063,13 @@ def _artifact_json(configs: list[str]) -> str:
     return json.dumps(artifact, indent=2) + "\n"
 
 
-def _properties_text(props: dict[str, str]) -> str:
+def _properties_text(props: dict[str, str], notes: dict[str, str] | None = None) -> str:
     lines = ["# Settings of the generated Mule app: the port it listens on and the address of each target.\n"]
-    lines += [
-        f"{_escape_property(key, key=True)}={_escape_property(value, key=False)}\n" for key, value in props.items()
-    ]
+    for key, value in props.items():
+        note = (notes or {}).get(key)
+        if note:
+            lines.append("# " + " ".join(note.split()) + "\n")
+        lines.append(f"{_escape_property(key, key=True)}={_escape_property(value, key=False)}\n")
     return "".join(lines)
 
 

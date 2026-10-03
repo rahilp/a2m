@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<AccessControl async="false" continueOnError="false" enabled="true" name="Check-IP">
+    <DisplayName>Check IP</DisplayName>
+    <IPRules noRuleMatchAction="DENY">
+        <MatchRule action="ALLOW">
+            <SourceAddress mask="24">10.0.0.0</SourceAddress>
+        </MatchRule>
+        <MatchRule action="DENY">
+            <SourceAddress mask="32">192.168.1.5</SourceAddress>
+        </MatchRule>
+    </IPRules>
+</AccessControl>

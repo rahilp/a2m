@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Quota async="false" continueOnError="false" enabled="true" name="Minute-Quota">
+    <DisplayName>Minute Quota</DisplayName>
+    <Allow count="2"/>
+    <Interval>1</Interval>
+    <TimeUnit>minute</TimeUnit>
+</Quota>
