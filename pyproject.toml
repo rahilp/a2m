@@ -62,3 +62,8 @@ extend-select = ["E402"]
 # calls without check=, CP1-T17 string join), which may not be edited.
 # Narrowly scoped to this one file; new code elsewhere is still checked.
 "tests/test_cp1_cli.py" = ["PLW1510", "FLY002"]
+# The CP7 tests' locked function-level import blocks were sorted while a2m.verify.runner and
+# a2m.verify.compare did not exist yet (ruff then took them for third-party modules); now that
+# they exist, isort wants those locked lines merged. Narrowly scoped to these two files.
+"tests/test_cp7_verify.py" = ["I001"]
+"tests/runtime/test_cp7_verify_runtime.py" = ["I001"]

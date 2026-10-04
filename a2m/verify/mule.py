@@ -18,10 +18,22 @@ Mule answers with anything else.
 
 Java and Maven are found on PATH. When JAVA_HOME is not set, it is derived
 from the ``java`` on PATH, since Mule's wrapper starts ``$JAVA_HOME/bin/java``.
+
+A started runtime is always stopped: :meth:`MuleRunner.stop` ends its process
+group and every recorded PID, an ``atexit`` hook stops any runtime still
+running when Python exits, and the PIDs are written to ``a2m-mule.pids`` in the
+MULE_BASE so a later start under the same base first ends the processes an
+a2m that was killed outright left behind (only recorded PIDs and their
+children whose environment names this MULE_BASE; never anything found by
+name). :meth:`MuleRunner.health_problem` says when a started runtime is no
+longer usable (the launcher or the JVM exited, or the wrapper reported the
+JVM gone), so a caller can restart it instead of blaming the next app.
 """
 
 from __future__ import annotations
 
+import atexit
+import json
 import os
 import re
 import shutil
@@ -30,7 +42,7 @@ import socket
 import subprocess
 import time
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from a2m import safefs
@@ -53,11 +65,23 @@ CONTENT_LENGTH = re.compile(rb"\s*content-length\s*:\s*(\d+)\s*", re.IGNORECASE)
 ANY_HOSTS = ("", "0.0.0.0", "::", "[::]")
 JAR_SUFFIX = "-mule-application.jar"
 POLL_SECONDS = 0.5
+DEPLOY_POLL_SECONDS = 0.25
 EXCERPT_LINES = 60
 # Copied from MULE_HOME into each private MULE_BASE (conf is written to by the launcher).
 WRAPPER_ADDITIONAL = "wrapper-additional.conf"
 WRAPPER_ADDITIONAL_TEXT = (
     "# Extra JVM settings for this private Mule base; Mule's launcher appends the JVM-specific ones here.\n"
+)
+# The PIDs (and process group) of the runtime started under a MULE_BASE, kept there while it runs.
+PID_FILE = "a2m-mule.pids"
+LEFTOVER_STOP_SECONDS = 30.0
+EXIT_STOP_SECONDS = 30.0
+# What Mule's (Tanuki) wrapper prints on the console when the JVM it runs is gone or unusable.
+JVM_TROUBLE = (
+    "JVM exited unexpectedly",
+    "JVM appears hung",
+    "JVM process is gone",
+    "JVM has run out of memory",
 )
 
 
@@ -79,6 +103,14 @@ class DeployError(MuleError):
     def __init__(self, message: str, log_excerpt: str) -> None:
         super().__init__(message)
         self.log_excerpt = log_excerpt
+
+
+class RuntimeStoppedError(DeployError):
+    """The Mule runtime itself stopped (or its JVM died) while an app was deploying."""
+
+
+class RuntimeUnavailableError(MuleError):
+    """The local Mule runtime could not be started (or restarted), so no app can be run on it."""
 
 
 def java_home() -> Path | None:
@@ -123,10 +155,13 @@ class MuleRunner:
     """One headless Mule runtime under its own MULE_BASE."""
 
     def __init__(self, mule_home: Path, mule_base: Path) -> None:
-        self.mule_home = mule_home
-        self.mule_base = mule_base
+        # Absolute: the launcher runs from MULE_HOME/bin and resolves a relative MULE_BASE from there.
+        self.mule_home = Path(mule_home).absolute()
+        self.mule_base = Path(mule_base).absolute()
         self._process: subprocess.Popen[bytes] | None = None
         self._pids: list[int] = []
+        self._jvm_pids: list[int] = []
+        self._console: LogWatch | None = None
 
     @property
     def pids(self) -> Sequence[int]:
@@ -143,7 +178,16 @@ class MuleRunner:
         """Start Mule under ``mule_base`` and return once it is up; raise MuleError if it is not."""
         if self._process is not None:
             raise MuleError("this Mule runtime is already started")
-        self._prepare_base()
+        try:
+            self._stop_leftovers()
+            self._prepare_base()
+        except (OSError, UnicodeDecodeError) as exc:
+            # An unusable install (no services/ folder, e.g. a Mule 3 MULE_HOME; unreadable conf files)
+            # is a runtime that cannot start, never a crash of the proxy that needed it.
+            raise MuleError(
+                f"the Mule runtime under {self.mule_home} cannot be prepared (is it a Mule 4 standalone "
+                f"install?): {type(exc).__name__}: {exc}"
+            ) from exc
         # mule.log is kept across runs; an earlier run's "up and kicking" must not count for this one.
         log = LogWatch(self.log_path)
         env = dict(os.environ, MULE_HOME=str(self.mule_home), MULE_BASE=str(self.mule_base))
@@ -153,6 +197,8 @@ class MuleRunner:
         console_fd = safefs.open_plain_file(
             self.mule_base, self.mule_base.joinpath(*CONSOLE_LOG), os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         )
+        self._console = LogWatch(self.mule_base.joinpath(*CONSOLE_LOG))
+        self._jvm_pids = []
         try:
             self._process = subprocess.Popen(
                 [str(self.mule_home / "bin" / "mule"), "console"],
@@ -163,9 +209,14 @@ class MuleRunner:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+        except OSError as exc:
+            self._console = None
+            raise MuleError(f"the Mule launcher under {self.mule_home} cannot be run: {exc}") from exc
         finally:
             os.close(console_fd)
         self._pids = [self._process.pid]
+        _LIVE.add(self)
+        self._write_pid_file()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             # Only this launch's log output counts, and only while the launcher still runs.
@@ -173,6 +224,7 @@ class MuleRunner:
                 break
             if STARTED_SIGNAL in log.text():
                 self._record_started()
+                self._write_pid_file()
                 return
             time.sleep(POLL_SECONDS)
         console = _tail(self.mule_base.joinpath(*CONSOLE_LOG).read_text(encoding="utf-8", errors="replace"))
@@ -203,6 +255,61 @@ class MuleRunner:
             process.kill()
             process.wait()
         self._process = None
+        self._console = None
+        _LIVE.discard(self)
+        safefs.remove(self.mule_base, self.mule_base / PID_FILE)
+
+    def health_problem(self) -> str | None:
+        """Why the started runtime can no longer run apps (it or its JVM is gone), or None while it is usable."""
+        process = self._process
+        if process is None:
+            return "the Mule runtime is not running"
+        code = process.poll()
+        if code is not None:
+            return f"the Mule runtime exited with code {code}"
+        if self._jvm_pids and not any(_running(pid) for pid in self._jvm_pids):
+            return "the Mule runtime's JVM stopped"
+        console = self._console.text() if self._console is not None else ""
+        trouble = next((line for line in JVM_TROUBLE if line in console), None)
+        if trouble is not None:
+            return f"the Mule runtime's JVM stopped (the wrapper reported: {trouble})"
+        return None
+
+    def _write_pid_file(self) -> None:
+        if self._process is None:
+            return
+        data = {"pgid": self._process.pid, "pids": list(self._pids)}
+        safefs.write_text_atomic(self.mule_base, self.mule_base / PID_FILE, json.dumps(data) + "\n")
+
+    def _stop_leftovers(self) -> None:
+        """End what an earlier runtime under this MULE_BASE left running (its a2m was killed outright).
+
+        Only PIDs recorded in the base's PID file, and their children, are considered, and only those
+        whose environment names this MULE_BASE are signalled; nothing is ever found by name.
+        """
+        path = self.mule_base / PID_FILE
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        recorded = [p for p in (data.get("pids", []) if isinstance(data, dict) else []) if isinstance(p, int)]
+        group = data.get("pgid") if isinstance(data, dict) else None
+        candidates = [*recorded, *_tree(recorded)]
+        mine = sorted({pid for pid in candidates if pid > 1 and _runs_under(pid, self.mule_base)})
+        if isinstance(group, int) and group > 1 and group in mine:
+            try:
+                os.killpg(group, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        for pid in mine:
+            _kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + LEFTOVER_STOP_SECONDS
+        while time.monotonic() < deadline and any(_running(pid) for pid in mine):
+            time.sleep(POLL_SECONDS)
+        for pid in mine:
+            if _running(pid):
+                _kill(pid, signal.SIGKILL)
+        safefs.remove(self.mule_base, path)
 
     def _prepare_base(self) -> None:
         """Create the private MULE_BASE: its own conf (copied), services (linked), apps, domains/default, logs."""
@@ -254,6 +361,8 @@ class MuleRunner:
         for pid in self._descendants():
             if pid not in self._pids and _long_lived(pid):
                 self._pids.append(pid)
+                if _executable_name(pid) == "java":
+                    self._jvm_pids.append(pid)
 
     def _alive(self) -> bool:
         return bool(self._descendants()) or any(_exists(pid) for pid in self._pids)
@@ -298,35 +407,17 @@ class MuleRunner:
             shutil.copyfileobj(source, out)
         # Mule only picks up *.jar files, so it never sees a half-copied app.
         safefs.move(self.mule_base, partial, apps / f"{app_name}.jar")
-        deadline = time.monotonic() + timeout
-        started = APP_STARTED_SIGNAL.format(name=app_name)
-        waiting = list(listeners)
-        while time.monotonic() < deadline:
-            text = log.text()
-            failure = _failure_excerpt(text, app_name)
-            if failure is not None:
-                raise DeployError(f"{app_name} failed to deploy", failure)
-            if self._process.poll() is not None:
-                raise DeployError(f"Mule stopped while deploying {app_name}", _tail(text))
-            if anchor.is_file() and started in text:
-                waiting = [address for address in waiting if not _serves(*address)]
-                if not waiting:
-                    return
-            time.sleep(POLL_SECONDS)
-        if anchor.is_file() and started in log.text() and waiting:
-            shown = ", ".join(str(port) for _, port in waiting)
-            raise DeployError(
-                f"{app_name} started but its HTTP listener (port {shown}) did not serve within {timeout:.0f}s",
-                _tail(log.text()),
-            )
-        raise DeployError(f"{app_name} did not start within {timeout:.0f}s", _tail(log.text()))
+        wait_for_deploy(
+            self.mule_base, app_name, timeout=timeout, listeners=listeners, alive=self.health_problem, log=log
+        )
 
     def undeploy(self, app_name: str, *, timeout: float = 60.0) -> None:
         """Undeploy ``app_name`` and wait until Mule removed it; an app that never started is just removed."""
         apps = self.mule_base / "apps"
         anchor = apps / f"{app_name}-anchor.txt"
         app_dir = apps / app_name
-        if self._process is not None and anchor.is_file():
+        # A runtime that stopped no longer removes undeployed apps: their files are just removed.
+        if self._process is not None and anchor.is_file() and self.health_problem() is None:
             safefs.remove(self.mule_base, anchor)
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline and app_dir.exists():
@@ -399,6 +490,95 @@ class LogWatch:
 
     def _decoded(self) -> str:
         return self._data.decode("utf-8", errors="replace")
+
+
+# A connector built for a newer Mule runtime or Java names an enum constant the runtime does not have
+# (seen with mule-http-connector 1.12.x and mule-validation-module 2.0.10 on Mule 4.9.0: JavaVersion.JAVA_25).
+VERSION_MISMATCH_SIGNAL = "EnumConstantNotPresentException"
+VERSION_MISMATCH_TEXT = "connector version not compatible with Mule runtime {version}"
+BOOT_API_JAR = re.compile(r"^mule-module-boot-api-(\d+\.\d+\.\d+[^/]*)\.jar$")
+CAUSED_BY = "Caused by:"
+
+
+def wait_for_deploy(
+    mule_base: Path,
+    app_name: str,
+    *,
+    timeout: float,
+    listeners: Sequence[tuple[str, int]] = (),
+    alive: Callable[[], str | None] | None = None,
+    log: LogWatch | None = None,
+) -> None:
+    """Return once ``app_name`` started under ``mule_base`` (and serves); raise DeployError when not.
+
+    Started: ``apps/<name>-anchor.txt`` exists, or ``Started app '<name>'`` is logged; then each of
+    ``listeners`` (host, port) must answer with something other than Mule's container 503. Failed: a
+    ``Failed to deploy artifact`` line naming the app is logged. ``alive`` (when given) says why the
+    runtime is gone, which raises RuntimeStoppedError. Only log text written after the wait began (or
+    after ``log`` was made) counts, so an earlier run or deployment never decides this one. This is
+    the one deploy wait; :meth:`MuleRunner.deploy` uses it.
+    """
+    log = log if log is not None else LogWatch(mule_base.joinpath(*MULE_LOG))
+    anchor = mule_base / "apps" / f"{app_name}-anchor.txt"
+    started = APP_STARTED_SIGNAL.format(name=app_name)
+    waiting = list(listeners)
+    deadline = time.monotonic() + timeout
+    while True:
+        text = log.text()
+        failure = _failure_excerpt(text, app_name)
+        if failure is not None:
+            raise DeployError(f"{app_name} failed to deploy", failure)
+        problem = alive() if alive is not None else None
+        if problem is not None:
+            raise RuntimeStoppedError(f"{problem} while {app_name} was deploying", _tail(text))
+        up = anchor.is_file() or started in text
+        if up:
+            waiting = [address for address in waiting if not _serves(*address)]
+            if not waiting:
+                return
+        if time.monotonic() >= deadline:
+            if up:
+                shown = ", ".join(str(port) for _, port in waiting)
+                raise DeployError(
+                    f"{app_name} started but its HTTP listener (port {shown}) did not serve within {timeout:g} seconds",
+                    _tail(text),
+                )
+            raise DeployError(f"{app_name} did not start within {timeout:g} seconds", _tail(text))
+        time.sleep(min(DEPLOY_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+
+
+def mule_version(mule_home: Path) -> str | None:
+    """The version of the Mule runtime installed in ``mule_home`` (from lib/boot), or None when unknown."""
+    try:
+        names = sorted(entry.name for entry in (mule_home / "lib" / "boot").iterdir())
+    except OSError:
+        return None
+    for name in names:
+        match = BOOT_API_JAR.match(name)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+def is_version_mismatch(log_excerpt: str) -> bool:
+    """True when a deploy failure's log shows a connector built for a newer Mule runtime or Java."""
+    return DEPLOY_FAILED_SIGNAL in log_excerpt and VERSION_MISMATCH_SIGNAL in log_excerpt
+
+
+def deploy_failure_message(app_name: str, log_excerpt: str, *, mule_version: str | None) -> str:
+    """A plain-words reason for a failed deployment, read from its mule.log excerpt."""
+    runtime = mule_version or "(unknown version)"
+    if is_version_mismatch(log_excerpt):
+        return (
+            f"{app_name} failed to deploy: {VERSION_MISMATCH_TEXT.format(version=runtime)} (a connector in pom.xml "
+            f"was built for a newer Mule runtime or Java; use connector versions released for Mule {runtime})"
+        )
+    causes = [line.split(CAUSED_BY, 1)[1].strip() for line in log_excerpt.splitlines() if CAUSED_BY in line]
+    cause = causes[-1] if causes else next(
+        (line.strip(" +") for line in log_excerpt.splitlines() if DEPLOY_FAILED_SIGNAL in line), ""
+    )
+    why = f": {cause}" if cause else ", see the log excerpt"
+    return f"{app_name} failed to deploy on Mule runtime {runtime}{why}"
 
 
 def _failure_excerpt(text: str, app_name: str) -> str | None:
@@ -500,13 +680,73 @@ def _exists(pid: int) -> bool:
     return True
 
 
+def _executable_name(pid: int) -> str | None:
+    try:
+        return Path(os.readlink(f"/proc/{pid}/exe")).name
+    except OSError:
+        return None
+
+
 def _long_lived(pid: int) -> bool:
     """True for the wrapper and the JVM, not for short helpers the launcher script runs."""
+    return _executable_name(pid) in ("wrapper", "java")
+
+
+def _running(pid: int) -> bool:
+    """True while ``pid`` is a live process (not ended, not a zombie)."""
     try:
-        exe = os.readlink(f"/proc/{pid}/exe")
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return False
+    return bool(fields) and fields[0] != "Z"
+
+
+def _runs_under(pid: int, mule_base: Path) -> bool:
+    """True when live process ``pid`` was started with MULE_BASE set to ``mule_base`` (a runtime a2m started)."""
+    if not _running(pid):
+        return False
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:
         return False
-    return Path(exe).name in ("wrapper", "java")
+    return f"MULE_BASE={mule_base}".encode() in environ.split(b"\0")
+
+
+def _tree(roots: Sequence[int]) -> list[int]:
+    """Every live descendant of ``roots`` (from /proc parent PIDs)."""
+    children: dict[int, list[int]] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / "stat").read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if len(fields) > 1 and fields[0] != "Z":
+            children.setdefault(int(fields[1]), []).append(int(entry.name))
+    found: list[int] = []
+    todo = list(roots)
+    while todo:
+        for kid in children.get(todo.pop(), []):
+            if kid not in found:
+                found.append(kid)
+                todo.append(kid)
+    return found
+
+
+# Every runtime started and not yet stopped, so the exit hook can stop it whatever ended the program.
+_LIVE: set[MuleRunner] = set()
+
+
+def _stop_all_at_exit() -> None:
+    for runner in list(_LIVE):
+        try:
+            runner.stop(timeout=EXIT_STOP_SECONDS)
+        except (MuleError, OSError, subprocess.SubprocessError):
+            continue
+
+
+atexit.register(_stop_all_at_exit)
 
 
 def _kill(pid: int, sig: signal.Signals) -> None:
@@ -514,3 +754,13 @@ def _kill(pid: int, sig: signal.Signals) -> None:
         os.kill(pid, sig)
     except (ProcessLookupError, PermissionError):
         pass
+
+
+def failure_excerpt(text: str, app_name: str) -> str | None:
+    """The mule.log lines around the first 'Failed to deploy artifact' line naming ``app_name``, or None."""
+    return _failure_excerpt(text, app_name)
+
+
+def log_tail(text: str) -> str:
+    """The last lines of a log text, for an excerpt."""
+    return _tail(text)

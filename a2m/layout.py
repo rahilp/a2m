@@ -27,6 +27,12 @@ MULE_APP_DIR_NAME = "mule-app"
 # Inside the work area: the working copies of shared flow bundles. Proxy names
 # never start with a dot, so this never collides with a proxy's work folder.
 SHARED_FLOWS_WORK_NAME = ".shared-flows"
+# Inside the work area: the private MULE_BASE of the batch's Mule runtime, and the
+# working copies of the projects being verified (so build output never lands in results).
+MULE_BASE_WORK_NAME = ".mule-base"
+VERIFY_WORK_NAME = ".verify"
+# Inside a proxy's work folder: what the generator made of each step, for the verification stage.
+GENERATED_STEPS_NAME = ".a2m-generated-steps.json"
 
 
 
@@ -124,3 +130,15 @@ def shared_flows_work_root(out_dir: Path) -> Path:
 
 def shared_flow_work_dir(out_dir: Path, name: str) -> Path:
     return _child(shared_flows_work_root(out_dir), name)
+
+
+def mule_base_dir(out_dir: Path) -> Path:
+    return work_root(out_dir) / MULE_BASE_WORK_NAME
+
+
+def generated_steps_path(out_dir: Path, name: str) -> Path:
+    return proxy_work_dir(out_dir, name) / GENERATED_STEPS_NAME
+
+
+def verify_work_dir(out_dir: Path, name: str) -> Path:
+    return _child(work_root(out_dir) / VERIFY_WORK_NAME, name) / MULE_APP_DIR_NAME

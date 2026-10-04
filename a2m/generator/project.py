@@ -336,6 +336,22 @@ def generate_project(
     builder = _ProjectBuilder(bundle, shared_flows, Translator(provider) if provider is not None else None)
     files = builder.build()
     _write_tree(dest, files, results_root)
+    return _result(builder, files)
+
+
+def plan_project(bundle: Bundle, *, shared_flows: Sequence[Bundle] = ()) -> GenerateResult:
+    """What :func:`generate_project` reports for ``bundle`` without an AI provider, without writing anything.
+
+    For a caller that has a generated project but not its result (the records of a project generated with a
+    provider may differ: the AI may have translated what this leaves skipped or can't translate).
+    """
+    if bundle.kind is not BundleKind.PROXY:
+        raise GeneratorError(f"{bundle.name} is a {bundle.kind.value} bundle, not a proxy")
+    builder = _ProjectBuilder(bundle, shared_flows, None)
+    return _result(builder, builder.build())
+
+
+def _result(builder: _ProjectBuilder, files: dict[str, str]) -> GenerateResult:
     return GenerateResult(
         files=tuple(sorted(files)),
         unsupported=tuple(builder.unsupported),

@@ -17,14 +17,26 @@ input folder.
 Every delete and overwrite under the results folder goes through
 :mod:`a2m.safefs`, which refuses symbolic links on the way and anything not
 strictly inside the results folder.
+
+While a batch runs, SIGTERM and SIGHUP raise :class:`Terminated` (a
+KeyboardInterrupt, like Ctrl-C's SIGINT), so the batch ends through the same
+path as Ctrl-C and every stage is closed: the Mule runtime the verification
+stage started is stopped even when the run is killed with ``kill``,
+``timeout`` or a closed terminal. A signal the caller set to be ignored
+(``nohup``) stays ignored.
 """
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
+import logging
 import os
 import shlex
+import signal
 import stat
-from collections.abc import Callable, Sequence
+import threading
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -54,12 +66,14 @@ from a2m.errors import (
     UnsafePathError,
     UsageError,
 )
-from a2m.generator import generate_project
+from a2m.generator import GenerateResult, generate_project
 from a2m.ir import Bundle
 from a2m.layout import collision_key, unsafe_name_reason
 from a2m.parser import read_bundle
 from a2m.policies.common import Method
 from a2m.runlog import get_logger, run_log
+from a2m.verify import make_verify_stage
+from a2m.verify.generated import GeneratedSteps
 
 # Names shown when --only does not match; longer lists are cut short.
 MAX_NAMES_IN_MESSAGE = 20
@@ -82,6 +96,8 @@ class RunOptions:
     max_fix_attempts: int = 3
     llm: LlmChoice = LlmChoice.CLAUDE
     no_runtime: bool = False
+    # Extra header names a golden replay does not compare (--golden-ignore-header), on top of the defaults.
+    golden_ignore_headers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +109,7 @@ class StageOptions:
     max_fix_attempts: int = 3
     llm: LlmChoice = LlmChoice.CLAUDE
     no_runtime: bool = False
+    golden_ignore_headers: tuple[str, ...] = ()
     # The AI provider --llm picked (checked by prepare_run); None in stages built without one.
     provider: Provider | None = field(default=None, compare=False, repr=False)
 
@@ -104,6 +121,7 @@ class StageOptions:
             max_fix_attempts=options.max_fix_attempts,
             llm=options.llm,
             no_runtime=options.no_runtime,
+            golden_ignore_headers=options.golden_ignore_headers,
             provider=provider,
         )
 
@@ -158,6 +176,7 @@ def generate(context: ProxyContext) -> None:
         provider=context.options.provider,
     )
     log.info("%s: wrote Mule project %s/ (%d files)", context.name, layout.MULE_APP_DIR_NAME, len(result.files))
+    _save_generated_steps(context, result)
     if result.requires_enterprise:
         log.warning(
             "%s: the Mule app requires a Mule Enterprise runtime: it uses %s (in steps %s), which Mule Kernel "
@@ -205,9 +224,80 @@ def generate(context: ProxyContext) -> None:
             )
 
 
-# The per-proxy pipeline. Later checkpoints add verification stages here;
-# tests replace it through ``stages=``.
-DEFAULT_STAGES: tuple[Stage, ...] = (parse, generate)
+def _save_generated_steps(context: ProxyContext, result: GenerateResult) -> None:
+    """Keep what the generator made of each step in the proxy's work folder, for the verification stage (which
+    tests only the steps a2m generated and that run in the app; see a2m.verify.generated)."""
+    results_root = context.out_dir.parent
+    path = layout.generated_steps_path(results_root, context.name)
+    try:
+        safefs.make_dirs(results_root, path.parent)
+        safefs.write_text_atomic(results_root, path, GeneratedSteps.from_result(result).to_json())
+    except OSError as exc:
+        get_logger().warning(
+            "%s: could not save the generated steps for verification (%s); it uses a2m's own decisions instead",
+            context.name,
+            exc,
+        )
+
+
+def default_stages() -> tuple[Stage, ...]:
+    """The per-proxy pipeline of one batch (tests replace it through ``stages=``).
+
+    Made per batch: the verification stage keeps the batch's Mule runtime, started
+    on first use and stopped when the batch ends (see :func:`run_batch`).
+    """
+    return (parse, generate, make_verify_stage())
+
+
+class Terminated(KeyboardInterrupt):
+    """SIGTERM or SIGHUP during a batch; ``signum`` is the signal. Handled like Ctrl-C, so the batch cleans up."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"stopped by {signal.Signals(signum).name}")
+        self.signum = signum
+
+
+@contextlib.contextmanager
+def _stop_on_termination() -> Iterator[None]:
+    """For the block, make SIGTERM and SIGHUP raise :class:`Terminated` (main thread only; ignored stays ignored).
+
+    Only the first signal raises; later ones are ignored, so the clean-up it starts is not cut short.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    raised = False
+
+    def handler(signum: int, frame: object) -> None:
+        nonlocal raised
+        if raised:
+            return
+        raised = True
+        raise Terminated(signum)
+
+    previous: dict[signal.Signals, object] = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            current = signal.getsignal(sig)
+            if current == signal.SIG_IGN:
+                continue
+            previous[sig] = signal.signal(sig, handler)
+        except (OSError, ValueError):
+            continue
+    try:
+        yield
+    finally:
+        for sig, old in previous.items():
+            with contextlib.suppress(OSError, ValueError, TypeError):
+                signal.signal(sig, old if old is not None else signal.SIG_DFL)  # type: ignore[arg-type]
+
+
+def interrupted_signal(exc: BaseException) -> int | None:
+    """The signal number when ``exc`` (or what it was raised from) is a :class:`Terminated`, else None."""
+    for item in (exc, exc.__cause__, exc.__context__):
+        if isinstance(item, Terminated):
+            return item.signum
+    return None
 
 
 class RunInterrupted(KeyboardInterrupt):
@@ -270,14 +360,22 @@ class BatchResult:
     refused: list[str] = field(default_factory=list)
     crashed: list[str] = field(default_factory=list)
     log_path: Path | None = None
+    # One line per thing the whole batch could not do (e.g. verification skipped: a tool is not installed).
+    notices: list[str] = field(default_factory=list)
 
 
 def prepare_run(options: RunOptions) -> RunPlan:
-    """Check everything that can be checked before writing; raise UsageError on problems."""
+    """Check everything that can be checked before writing; raise UsageError on problems.
+
+    Every path the user gave (EXPORTS, --out, --golden) is made absolute here, once, so nothing later
+    depends on the working folder (the Mule launcher, for one, runs from its own folder).
+    """
+    options = _absolute_paths(options)
     if options.resume and options.force:
         raise UsageError("--resume and --force cannot be used together")
     if options.max_fix_attempts < 0:
         raise UsageError("--max-fix-attempts must be 0 or greater")
+    _check_golden(options)
     provider = _make_provider(options)
     discovery = discover(options.input_dir)
     names = discovery.candidate_names()
@@ -311,6 +409,25 @@ def prepare_run(options: RunOptions) -> RunPlan:
         selected_rejected=tuple(r for r in discovery.rejected if wanted(r.name)),
         provider=provider,
     )
+
+
+def _absolute_paths(options: RunOptions) -> RunOptions:
+    """``options`` with EXPORTS, --out and --golden made absolute (Path.absolute: links are not resolved)."""
+    golden = options.golden.absolute() if options.golden is not None else None
+    return dataclasses.replace(
+        options, input_dir=options.input_dir.absolute(), out_dir=options.out_dir.absolute(), golden=golden
+    )
+
+
+def _check_golden(options: RunOptions) -> None:
+    """UsageError unless --golden (when given) names an existing folder."""
+    golden = options.golden
+    if golden is None:
+        return
+    if not golden.exists():
+        raise UsageError(f"golden recordings folder {golden} does not exist")
+    if not golden.is_dir():
+        raise UsageError(f"golden recordings path {golden} is not a folder")
 
 
 def _make_provider(options: RunOptions) -> Provider:
@@ -469,8 +586,12 @@ def _check_done_markers(out: Path, names: Sequence[str]) -> None:
             continue
 
 
-def run_batch(plan: RunPlan, stages: Sequence[Stage] = DEFAULT_STAGES) -> BatchResult:
+def run_batch(plan: RunPlan, stages: Sequence[Stage] | None = None) -> BatchResult:
     """Create the results folder, log discovery, and process every selected proxy.
+
+    ``stages`` defaults to :func:`default_stages`. A stage with a ``close()``
+    method (the verification stage, which may have started a Mule runtime) is
+    closed when the batch ends, however it ends.
 
     The whole run holds an exclusive lock on the results folder, so a second
     run on the same folder stops with :class:`UsageError` instead of deleting
@@ -486,10 +607,10 @@ def run_batch(plan: RunPlan, stages: Sequence[Stage] = DEFAULT_STAGES) -> BatchR
         raise UsageError(f"cannot create results folder {out}: {exc.strerror or exc}") from exc
     _check_out_dir(options)  # before opening the lock file: it must not be a FIFO or a link
     try:
-        with safefs.exclusive_lock(out, layout.lock_path(out)):
+        with _stop_on_termination(), safefs.exclusive_lock(out, layout.lock_path(out)):
             _check_out_dir(options)
             _check_done_markers(out, plan.discovery.candidate_names())
-            return _run_locked(plan, stages)
+            return _run_locked(plan, default_stages() if stages is None else stages)
     except LockHeldError:
         raise UsageError(
             f"results folder {out} is in use by another a2m run; wait for it to finish, then run again"
@@ -525,48 +646,11 @@ def _run_locked(plan: RunPlan, stages: Sequence[Stage]) -> BatchResult:
             options.mock_backends,
             options.max_fix_attempts,
         )
-        current: str | None = None
-        cleared = not options.force
         try:
-            _log_discovery(plan)
-            not_removed = _remove_stale_results_of_refused(plan)
-            not_cleared = _clear_done_markers_for_force(plan) if options.force else set()
-            cleared = not not_cleared
-            shared_flows = _read_shared_flows(plan) if plan.selected else ()
-
-            for source in plan.selected:
-                current = source.name
-                if source.name in not_cleared:
-                    result.crashed.append(source.name)
-                    continue
-                try:
-                    already_done = options.resume and safefs.is_regular_file(
-                        out, layout.done_marker_path(out, source.name)
-                    )
-                except (OSError, UnsafePathError) as exc:
-                    log.error("failed %s: cannot check its earlier result: %s", source.name, exc)
-                    result.crashed.append(source.name)
-                    continue
-                if already_done:
-                    log.info("skipped %s: already done (resume)", source.name)
-                    result.skipped.append(source.name)
-                    continue
-                _process(source, options, stages, result, shared_flows, plan.provider)
-
-            current = None
-            selected_names = {source.name for source in plan.selected}
-            result.crashed.extend(sorted(not_cleared - selected_names))
-            for item in plan.selected_rejected:
-                (result.crashed if item.name in not_removed else result.refused).append(item.name)
-        except KeyboardInterrupt as exc:
-            where = f" while processing {current}" if current is not None else ""
-            advice = _advice(options, cleared=cleared)
-            if cleared:
-                log.error("run interrupted%s; finished proxies keep their .done marker, %s", where, advice)
-            else:
-                log.error("run interrupted%s before earlier .done markers were cleared; %s", where, advice)
-            raise RunInterrupted(advice) from exc
-
+            _run_proxies(plan, stages, result, log)
+        finally:
+            _close_stages(stages)
+            result.notices.extend(_stage_notices(stages))
         _remove_empty_work_root(out)
         log.info(
             "run finished: %d done, %d skipped as already done, %d refused, %d failed",
@@ -576,6 +660,75 @@ def _run_locked(plan: RunPlan, stages: Sequence[Stage]) -> BatchResult:
             len(result.crashed),
         )
     return result
+
+
+def _close_stages(stages: Sequence[Stage]) -> None:
+    """Close every stage that has ``close()`` (e.g. stop the batch's Mule runtime); a failure is logged."""
+    log = get_logger()
+    for stage in stages:
+        close = getattr(stage, "close", None)
+        if close is None:
+            continue
+        try:
+            close()
+        except Exception as exc:  # batch boundary: a stage that cannot clean up must not hide the run's result
+            log.exception("could not close stage %s: %s: %s", _stage_name(stage), type(exc).__name__, exc)  # noqa: TRY401
+
+
+def _stage_notices(stages: Sequence[Stage]) -> list[str]:
+    """The batch-wide notices of every stage that has them (e.g. verification skipped), each once."""
+    found: list[str] = []
+    for stage in stages:
+        for notice in getattr(stage, "notices", ()):
+            if isinstance(notice, str) and notice not in found:
+                found.append(notice)
+    return found
+
+
+def _run_proxies(plan: RunPlan, stages: Sequence[Stage], result: BatchResult, log: logging.Logger) -> None:
+    options = plan.options
+    out = options.out_dir
+    current: str | None = None
+    cleared = not options.force
+    try:
+        _log_discovery(plan)
+        not_removed = _remove_stale_results_of_refused(plan)
+        not_cleared = _clear_done_markers_for_force(plan) if options.force else set()
+        cleared = not not_cleared
+        shared_flows = _read_shared_flows(plan) if plan.selected else ()
+
+        for source in plan.selected:
+            current = source.name
+            if source.name in not_cleared:
+                result.crashed.append(source.name)
+                continue
+            try:
+                already_done = options.resume and safefs.is_regular_file(
+                    out, layout.done_marker_path(out, source.name)
+                )
+            except (OSError, UnsafePathError) as exc:
+                log.error("failed %s: cannot check its earlier result: %s", source.name, exc)
+                result.crashed.append(source.name)
+                continue
+            if already_done:
+                log.info("skipped %s: already done (resume)", source.name)
+                result.skipped.append(source.name)
+                continue
+            _process(source, options, stages, result, shared_flows, plan.provider)
+
+        current = None
+        selected_names = {source.name for source in plan.selected}
+        result.crashed.extend(sorted(not_cleared - selected_names))
+        for item in plan.selected_rejected:
+            (result.crashed if item.name in not_removed else result.refused).append(item.name)
+    except KeyboardInterrupt as exc:
+        where = f" while processing {current}" if current is not None else ""
+        advice = _advice(options, cleared=cleared)
+        if cleared:
+            log.error("run interrupted%s; finished proxies keep their .done marker, %s", where, advice)
+        else:
+            log.error("run interrupted%s before earlier .done markers were cleared; %s", where, advice)
+        raise RunInterrupted(advice) from exc
 
 
 def _log_discovery(plan: RunPlan) -> None:

@@ -3,7 +3,9 @@
 Exit codes: 0 when the batch finishes, 1 when any proxy failed with an error
 or the results (run.log included) could not be written, 2 for usage errors
 (bad flags, missing input folder, results folder in use), 130 when the run was
-interrupted (Ctrl-C).
+interrupted (Ctrl-C), 128 plus the signal number when it was stopped by
+SIGTERM (143) or SIGHUP (129). An interrupted or stopped run still stops the
+Mule runtime it started.
 
 Terminal output is best effort and never changes the exit code: when stdout
 or stderr is closed, is a pipe whose reader has gone (``a2m ... | head``) or
@@ -16,13 +18,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 from a2m import __version__
-from a2m.engine import DEFAULT_STAGES, LlmChoice, RunOptions, Stage, prepare_run, rerun_advice, run_batch
+from a2m.engine import LlmChoice, RunOptions, Stage, interrupted_signal, prepare_run, rerun_advice, run_batch
 from a2m.errors import UnsafePathError, UsageError
 from a2m.redaction import redact
 from a2m.runlog import one_line
@@ -121,6 +124,17 @@ def _path_arg(value: str) -> Path:
     return Path(value)
 
 
+HEADER_NAME_CHARS = frozenset("!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def _header_name(value: str) -> str:
+    """The argparse type for --golden-ignore-header: one HTTP header name."""
+    name = value.strip()
+    if not name or any(ch not in HEADER_NAME_CHARS for ch in name):
+        raise argparse.ArgumentTypeError(f"expected an HTTP header name, got {value!r}")
+    return name
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="a2m", description="Migrate Apigee proxy bundles to Mule 4 projects.")
     parser.add_argument("--version", action="version", version=f"a2m {__version__}")
@@ -139,6 +153,19 @@ def build_parser() -> argparse.ArgumentParser:
     rerun.add_argument("--force", action="store_true", help="redo every proxy, even ones already finished")
     migrate.add_argument(
         "--golden", type=_path_arg, metavar="DIR", help="recorded Apigee responses to compare the Mule apps against"
+    )
+    migrate.add_argument(
+        "--golden-ignore-header",
+        action="append",
+        type=_header_name,
+        default=[],
+        metavar="NAME",
+        help=(
+            "a header that differs on every call (e.g. X-Apigee-Message-ID): a golden replay does not compare it in "
+            "responses or backend calls; repeat for more. Always ignored: Date, Server, Content-Length, "
+            "Transfer-Encoding, Connection, X-Request-ID, X-Correlation-ID, Keep-Alive, and Host and forwarding "
+            "headers on backend calls"
+        ),
     )
     migrate.add_argument(
         "--mock-backends", action="store_true", help="run the Mule apps against mock backends that record calls"
@@ -180,13 +207,16 @@ def main(argv: list[str] | None = None, *, stages: Sequence[Stage] | None = None
         max_fix_attempts=args.max_fix_attempts,
         llm=LlmChoice(args.llm),
         no_runtime=args.no_runtime,
+        golden_ignore_headers=tuple(args.golden_ignore_header),
     )
     try:
         plan = prepare_run(options)
-        result = run_batch(plan, DEFAULT_STAGES if stages is None else stages)
+        result = run_batch(plan, stages)
     except KeyboardInterrupt as exc:
-        _say(f"a2m migrate: interrupted; {rerun_advice(options, exc)}", err=True)
-        return EXIT_INTERRUPTED
+        signum = interrupted_signal(exc)
+        what = "interrupted" if signum is None else f"stopped by {signal.Signals(signum).name}"
+        _say(f"a2m migrate: {what}; {rerun_advice(options, exc)}", err=True)
+        return EXIT_INTERRUPTED if signum is None else 128 + signum
     except UsageError as exc:
         _say(f"a2m migrate: usage error: {exc}", err=True)
         return EXIT_USAGE
@@ -194,6 +224,8 @@ def main(argv: list[str] | None = None, *, stages: Sequence[Stage] | None = None
         _say(f"a2m migrate: error: cannot write results to {options.out_dir}: {exc}", err=True)
         return EXIT_PROXY_FAILED
 
+    for notice in result.notices:
+        _say(f"a2m: {notice}", err=True)
     _say(
         f"a2m: {len(result.finished)} done, {len(result.skipped)} skipped as already done, "
         f"{len(result.refused)} refused, {len(result.crashed)} failed. "
