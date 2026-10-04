@@ -30,6 +30,8 @@ from enum import StrEnum
 from pathlib import Path
 
 from a2m import layout, pathid, safefs
+from a2m.ai import Provider, ProviderSetupError, make_provider
+from a2m.ai.prompts import PromptError, load_prompts
 from a2m.discovery import (
     BUNDLE_ROOTS,
     PROXY_ROOT,
@@ -56,6 +58,7 @@ from a2m.generator import generate_project
 from a2m.ir import Bundle
 from a2m.layout import collision_key, unsafe_name_reason
 from a2m.parser import read_bundle
+from a2m.policies.common import Method
 from a2m.runlog import get_logger, run_log
 
 # Names shown when --only does not match; longer lists are cut short.
@@ -90,15 +93,18 @@ class StageOptions:
     max_fix_attempts: int = 3
     llm: LlmChoice = LlmChoice.CLAUDE
     no_runtime: bool = False
+    # The AI provider --llm picked (checked by prepare_run); None in stages built without one.
+    provider: Provider | None = field(default=None, compare=False, repr=False)
 
     @classmethod
-    def of(cls, options: RunOptions) -> StageOptions:
+    def of(cls, options: RunOptions, provider: Provider | None = None) -> StageOptions:
         return cls(
             golden=options.golden,
             mock_backends=options.mock_backends,
             max_fix_attempts=options.max_fix_attempts,
             llm=options.llm,
             no_runtime=options.no_runtime,
+            provider=provider,
         )
 
 
@@ -144,12 +150,49 @@ def generate(context: ProxyContext) -> None:
     log = get_logger()
     bundle = read_bundle(context.bundle_dir, label=context.name)
     dest = layout.mule_app_dir(context.out_dir)
-    result = generate_project(bundle, dest, shared_flows=context.shared_flows, results_root=context.out_dir)
+    result = generate_project(
+        bundle,
+        dest,
+        shared_flows=context.shared_flows,
+        results_root=context.out_dir,
+        provider=context.options.provider,
+    )
     log.info("%s: wrote Mule project %s/ (%d files)", context.name, layout.MULE_APP_DIR_NAME, len(result.files))
+    if result.requires_enterprise:
+        log.warning(
+            "%s: the Mule app requires a Mule Enterprise runtime: it uses %s (in steps %s), which Mule Kernel "
+            "(Community Edition) does not have",
+            context.name,
+            ", ".join(result.enterprise_components),
+            ", ".join(result.enterprise_steps) or "-",
+        )
     for item in result.unsupported:
         log.warning("%s: not generated: %s: %s", context.name, item.name, item.reason)
+    for policy in result.policies:
+        if policy.method is Method.AI:
+            (log.warning if policy.needs_review else log.info)(
+                "%s: step %s (%s) sent to the AI: %s, confidence %s, %s; notes: %s",
+                context.name,
+                policy.name,
+                policy.type,
+                "needs review" if policy.needs_review else "translated",
+                policy.confidence.value if policy.confidence is not None else "none",
+                policy.reason or "no review reason",
+                policy.notes or "-",
+            )
     for record in result.conditions:
-        if record.ok:
+        if record.method is Method.AI:
+            (log.warning if record.needs_review else log.info)(
+                "%s: %s %s condition sent to the AI: %s, confidence %s; notes: %s; condition: %s",
+                context.name,
+                record.kind,
+                record.name,
+                f"needs review ({record.reason})" if record.needs_review else f"translated as {record.dw}",
+                record.confidence.value if record.confidence is not None else "none",
+                record.notes or "-",
+                record.original,
+            )
+        elif record.ok:
             log.info("%s: %s %s condition translated: %s", context.name, record.kind, record.name, record.original)
         else:
             log.warning(
@@ -203,6 +246,7 @@ class RunPlan:
     discovery: Discovery
     selected: tuple[BundleSource, ...]
     selected_rejected: tuple[RejectedItem, ...]
+    provider: Provider | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(slots=True)
@@ -234,6 +278,7 @@ def prepare_run(options: RunOptions) -> RunPlan:
         raise UsageError("--resume and --force cannot be used together")
     if options.max_fix_attempts < 0:
         raise UsageError("--max-fix-attempts must be 0 or greater")
+    provider = _make_provider(options)
     discovery = discover(options.input_dir)
     names = discovery.candidate_names()
     if not names:
@@ -264,7 +309,18 @@ def prepare_run(options: RunOptions) -> RunPlan:
         discovery=discovery,
         selected=tuple(p for p in discovery.proxies if wanted(p.name)),
         selected_rejected=tuple(r for r in discovery.rejected if wanted(r.name)),
+        provider=provider,
     )
+
+
+def _make_provider(options: RunOptions) -> Provider:
+    """The AI provider --llm picks, and its prompt files, checked before anything is processed: a missing API key,
+    SDK or prompt file stops the run with one clear line."""
+    try:
+        load_prompts()
+        return make_provider(options.llm.value)
+    except (ProviderSetupError, PromptError) as exc:
+        raise UsageError(str(exc)) from None
 
 
 def _check_not_a_bundle(input_dir: Path) -> None:
@@ -495,7 +551,7 @@ def _run_locked(plan: RunPlan, stages: Sequence[Stage]) -> BatchResult:
                     log.info("skipped %s: already done (resume)", source.name)
                     result.skipped.append(source.name)
                     continue
-                _process(source, options, stages, result, shared_flows)
+                _process(source, options, stages, result, shared_flows, plan.provider)
 
             current = None
             selected_names = {source.name for source in plan.selected}
@@ -680,6 +736,7 @@ def _process(
     stages: Sequence[Stage],
     result: BatchResult,
     shared_flows: tuple[Bundle, ...] = (),
+    provider: Provider | None = None,
 ) -> None:
     log = get_logger()
     out = options.out_dir
@@ -701,7 +758,7 @@ def _process(
             kind=source.kind,
             bundle_dir=bundle_dir,
             out_dir=proxy_dir,
-            options=StageOptions.of(options),
+            options=StageOptions.of(options, provider),
             shared_flows=shared_flows,
         )
         for stage in stages:

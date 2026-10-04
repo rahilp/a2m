@@ -1,0 +1,6 @@
+{
+  "status": "translated",
+  "confidence": "high",
+  "notes": "The Mule code is not well-formed XML.",
+  "mule": "<ee:transform><ee:message>"
+}

@@ -64,10 +64,19 @@ from typing import cast
 from urllib.parse import urlsplit
 
 from a2m import safefs
+from a2m.ai.checks import DeclaredWrites, all_steps, callout_reads, changed_steps, describe_changes
+from a2m.ai.provider import Confidence, Provider
+from a2m.ai.sources import CalloutSource, callout_kind, callout_source
+from a2m.ai.translate import NONE, CalloutTranslated, NotTranslated, Place, Translator
 from a2m.conditions import (
     ANY,
     FAULT,
     NO_CHANGES,
+    REQUEST_CONTENT,
+    REQUEST_CONTENT_TYPE,
+    RESPONSE_CONTENT,
+    RESPONSE_CONTENT_TYPE,
+    RESPONSE_HEADER_PREFIX,
     SNAPSHOT_VAR,
     RequestChanges,
     Translation,
@@ -76,7 +85,9 @@ from a2m.conditions import (
     translate_condition,
     translate_template,
 )
-from a2m.conditions.variables import EXACT_PATH_SUFFIX_DW, RESPONSE_FRAMING_HEADERS, fold
+from a2m.conditions.lexer import ConditionError, TokenKind, tokenize
+from a2m.conditions.parser import OPERATORS
+from a2m.conditions.variables import EXACT_PATH_SUFFIX_DW, RESPONSE_FRAMING_HEADERS, accessor, fold
 from a2m.ir import (
     Bundle,
     BundleKind,
@@ -84,6 +95,7 @@ from a2m.ir import (
     FlowSteps,
     Policy,
     ProxyEndpoint,
+    Resource,
     RouteRule,
     Step,
     TargetEndpoint,
@@ -107,11 +119,13 @@ from a2m.policies.common import (
     PolicyResult,
     TemplateOutput,
     UnsupportedOption,
+    is_true,
 )
 
 CORE = "http://www.mulesoft.org/schema/mule/core"
 HTTP = "http://www.mulesoft.org/schema/mule/http"
 OS = "http://www.mulesoft.org/schema/mule/os"
+EE = "http://www.mulesoft.org/schema/mule/ee/core"
 VALIDATION = "http://www.mulesoft.org/schema/mule/validation"
 DOC = "http://www.mulesoft.org/schema/mule/documentation"
 XSI = "http://www.w3.org/2001/XMLSchema-instance"
@@ -120,6 +134,7 @@ SCHEMA_LOCATIONS = {
     CORE: "http://www.mulesoft.org/schema/mule/core/current/mule.xsd",
     HTTP: "http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd",
     OS: "http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd",
+    EE: "http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd",
     VALIDATION: "http://www.mulesoft.org/schema/mule/validation/current/mule-validation.xsd",
 }
 # The pom dependency each module namespace beyond core and http needs, pinned to the versions proven on 4.9.0.
@@ -127,7 +142,14 @@ MODULE_DEPENDENCIES = {
     OS: ("org.mule.connectors", "mule-objectstore-connector", "1.2.2"),
     VALIDATION: ("org.mule.modules", "mule-validation-module", "2.0.9"),
 }
-for _prefix, _uri in (("http", HTTP), ("os", OS), ("validation", VALIDATION), ("doc", DOC), ("xsi", XSI)):
+for _prefix, _uri in (
+    ("http", HTTP),
+    ("os", OS),
+    ("ee", EE),
+    ("validation", VALIDATION),
+    ("doc", DOC),
+    ("xsi", XSI),
+):
     ET.register_namespace(_prefix, _uri)
 DOC_NAME = f"{{{DOC}}}name"
 DOC_DESCRIPTION = f"{{{DOC}}}description"
@@ -200,6 +222,9 @@ ERROR_FAULT_DEFAULT = (500, "Internal Server Error", "messaging.runtime.Internal
 # Characters kept in Mule names and property keys; anything else becomes '-'.
 UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 ARTIFACT_UNSAFE = re.compile(r"[^a-z0-9._-]+")
+# Words in a condition that are not variables: connectives, literals and word operators (see a2m.conditions.parser).
+CONDITION_WORDS = frozenset({"and", "or", "not", "null", "true", "false", *OPERATORS})
+NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +258,14 @@ class ConditionRecord:
     (Step, Flow, FaultRule, DefaultFaultRule, RouteRule); ``location`` is where
     it sits; ``original`` is the condition text as read from the bundle; ``dw``
     is the DataWeave expression without the ``#[ ]`` wrapper.
+
+    ``method`` is ``template`` (a2m translated it), ``ai`` (sent to the AI:
+    translated when ``ok``, else flagged for review) or ``skipped`` (can't
+    translate, not sent to the AI). For ``ai``: ``confidence`` and ``notes``
+    are the AI's (``notes`` also says why its answer was not used),
+    ``needs_review`` is True unless the AI's translation is used with medium or
+    high confidence, and ``reason`` keeps why a2m's own translator refused it
+    when the AI's answer is not used either.
     """
 
     name: str
@@ -242,6 +275,10 @@ class ConditionRecord:
     ok: bool
     dw: str | None
     reason: str | None
+    method: Method = Method.TEMPLATE
+    confidence: Confidence | None = None
+    notes: str = ""
+    needs_review: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +290,15 @@ class GenerateResult:
     policies: tuple[PolicyResult, ...] = ()
     # One record per non-empty condition, in the order the generator met them (a step generated twice has two).
     conditions: tuple[ConditionRecord, ...] = ()
+    # The Mule Enterprise components the app uses (e.g. "ee:transform", Transform Message from an AI answer),
+    # sorted, and the steps that hold them in document order; empty when the app runs on Mule Kernel (CE) too.
+    enterprise_components: tuple[str, ...] = ()
+    enterprise_steps: tuple[str, ...] = ()
+
+    @property
+    def requires_enterprise(self) -> bool:
+        """True when the app can only run on a Mule Enterprise runtime (Mule Kernel CE cannot deploy it)."""
+        return bool(self.enterprise_components)
 
 
 class GeneratorError(ValueError):
@@ -265,6 +311,7 @@ def generate_project(
     *,
     shared_flows: Sequence[Bundle] = (),
     results_root: Path | None = None,
+    provider: Provider | None = None,
 ) -> GenerateResult:
     """Write the Mule project for proxy ``bundle`` into ``dest``, replacing any older project there.
 
@@ -272,10 +319,21 @@ def generate_project(
     may call, matched by bundle name. Every write and delete goes through
     :mod:`a2m.safefs` and stays strictly inside ``results_root`` (default: the
     folder holding ``dest``, created when missing).
+
+    ``provider`` (see :mod:`a2m.ai`) translates what the templates cannot: the
+    code of JavaScript, Python and Java callouts, and conditions a2m's own
+    translator refuses, unless the condition reads a value an earlier step may
+    have changed (the AI cannot see that change either) or an Apigee built-in
+    variable a2m has no mapping for (it does not exist in the generated app).
+    A callout whose code may read a value an earlier step changed is
+    translated but flagged for review. An AI-translated step is a faithful
+    writer only of what its checked ``writes`` declaration names; otherwise it
+    may change anything. With None nothing is sent anywhere and those stay
+    skipped or can't translate.
     """
     if bundle.kind is not BundleKind.PROXY:
         raise GeneratorError(f"{bundle.name} is a {bundle.kind.value} bundle, not a proxy")
-    builder = _ProjectBuilder(bundle, shared_flows)
+    builder = _ProjectBuilder(bundle, shared_flows, Translator(provider) if provider is not None else None)
     files = builder.build()
     _write_tree(dest, files, results_root)
     return GenerateResult(
@@ -284,6 +342,8 @@ def generate_project(
         pending=(),
         policies=tuple(builder.records),
         conditions=tuple(builder.conditions),
+        enterprise_components=builder.enterprise_components,
+        enterprise_steps=builder.enterprise_steps,
     )
 
 
@@ -466,8 +526,9 @@ class _TargetPlan:
 
 
 class _ProjectBuilder:
-    def __init__(self, bundle: Bundle, shared_flows: Sequence[Bundle]) -> None:
+    def __init__(self, bundle: Bundle, shared_flows: Sequence[Bundle], ai: Translator | None = None) -> None:
         self.bundle = bundle
+        self.ai = ai
         self.policies = {policy.name: policy for policy in bundle.policies}
         self.shared: dict[str, list[Bundle]] = {}
         for shared in shared_flows:
@@ -492,6 +553,8 @@ class _ProjectBuilder:
         self.conditions: list[ConditionRecord] = []
         # What the generated policy steps need from the flows (see a2m.policies.common), and their globals.
         self.needs: set[str] = set()
+        self.enterprise_components: tuple[str, ...] = ()
+        self.enterprise_steps: tuple[str, ...] = ()
         self.policy_globals: list[ET.Element] = []
         self.global_names: dict[tuple[str, str], str] = {}
         self.property_notes: dict[str, str] = {}
@@ -509,6 +572,13 @@ class _ProjectBuilder:
         self.dead_flows: set[int] = set()
         # Every request snapshot written (one per place a route ends); removed again when nothing reads them.
         self.snapshots: list[ET.Element] = []
+        # The guard each generated when actually uses (a2m's translation, the AI's, or a refusal for #[false]), by
+        # (id of the Step, Flow or RouteRule, side, changes it was read after), and every guard by owner and side:
+        # the one source for whether a step, Flow or route runs in the generated app (see _runs_in_app).
+        self.guards: dict[tuple[int, str, RequestChanges], Translation] = {}
+        self.owner_guards: dict[tuple[int, str], list[Translation]] = {}
+        # The checked write model of each AI-translated step (by id of the Step and side); None: it may change anything.
+        self.write_models: dict[tuple[int, str], registry.WriteModel | None] = {}
 
     # ------------------------------------------------------------ results
 
@@ -517,15 +587,124 @@ class _ProjectBuilder:
             self._seen_items.add((name, reason))
             self.unsupported.append(UnsupportedItem(name, reason))
 
-    def _condition(self, name: str, kind: str, where: str, text: str | None, direction: str) -> Translation | None:
-        """Translate and record a condition; None when there is none (absent or empty: Apigee runs always)."""
+    def _condition(
+        self, name: str, kind: str, where: str, text: str | None, direction: str, *, ask_ai: bool = False
+    ) -> Translation | None:
+        """Translate and record a condition; None when there is none (absent or empty: Apigee runs always).
+
+        ``ask_ai`` is True where the condition is generated into the app: one a2m's translator refuses then goes to
+        the AI (see :meth:`_ai_may_read`), and the AI's expression is used when it is valid and not low confidence.
+        """
         if text is None or not text.strip():
             return None
         translation = translate_condition(text, direction=direction, changes=self.changes)
-        self.conditions.append(
-            ConditionRecord(name, kind, where, text, translation.ok, translation.dw, translation.reason)
-        )
+        reason = translation.reason
+        if translation.ok:
+            record = ConditionRecord(name, kind, where, text, True, translation.dw, translation.reason)
+        else:
+            refusal = self._ai_refusal(text, direction) if ask_ai and self.ai is not None else None
+            if ask_ai and self.ai is not None and refusal is None:
+                return self._ai_condition(name, kind, where, text, direction, translation)
+            if refusal is not None and refusal not in (reason or ""):
+                reason = f"{reason}; not sent to the AI: {refusal}"
+            record = ConditionRecord(name, kind, where, text, False, None, reason, method=Method.SKIPPED)
+        self.conditions.append(record)
         return translation
+
+    def _ai_refusal(self, text: str, direction: str) -> str | None:
+        """Why condition ``text`` is not sent to the AI, or None when it may be: every variable it reads must be one
+        a2m can read faithfully here. A built-in variable a2m has no mapping for does not exist in the generated app,
+        and a value an earlier step may have changed would be read stale (the AI cannot see that change either), so
+        no translation of the condition could be faithful."""
+        if direction not in (REQUEST, RESPONSE):
+            return "it is read in a fault rule"
+        try:
+            tokens = tokenize(text)
+        except ConditionError as exc:
+            return f"a2m cannot tell which values it reads ({exc})"
+        for token in tokens:
+            word = token.text
+            if token.kind is not TokenKind.WORD or fold(word) in CONDITION_WORDS or NUMBER.fullmatch(word):
+                continue
+            try:
+                accessor(word, direction, self.changes)
+            except ConditionError as exc:
+                return str(exc)
+        return None
+
+    def _emit_guard(self, owner: object, direction: str, changes: RequestChanges, translation: Translation) -> None:
+        """Remember the guard a generated ``when`` of ``owner`` (a Step, Flow or RouteRule) uses."""
+        self.guards[(id(owner), direction, changes)] = translation
+        self.owner_guards.setdefault((id(owner), direction), []).append(translation)
+
+    def _runs_in_app(self, owner: object, condition: str | None, direction: str, changes: RequestChanges) -> bool:
+        """Whether ``owner`` (a Step, Flow or RouteRule with ``condition``, read after ``changes``) may run in the
+        generated app: decided by the guard its generated ``when`` uses (a2m's or the AI's translation, or ``#[false]``),
+        never by translating again. Read after other changes than where it was generated, it may run when any of its
+        generated guards is not ``#[false]``; one not generated yet is decided by a2m's own translator."""
+        if condition is None or not condition.strip():
+            return True
+        emitted = self.guards.get((id(owner), direction, changes))
+        if emitted is not None:
+            return emitted.ok
+        others = self.owner_guards.get((id(owner), direction))
+        if others:
+            return any(guard.ok for guard in others)
+        return translate_condition(condition, direction=direction, changes=changes).ok
+
+    def _ai_condition(
+        self, name: str, kind: str, where: str, text: str, direction: str, refused: Translation
+    ) -> Translation:
+        """Send a condition a2m's translator refused to the AI, record the result, and return what the generated
+        ``when`` uses: the AI's expression, or a refusal (the ``when`` stays ``#[false]``)."""
+        assert self.ai is not None
+        refusal = refused.reason or "a2m's translator refused it"
+        outcome = self.ai.expression(
+            f"{kind} {name}", name, text, Place(self.bundle.name, where, direction), refusal, self.changes
+        )
+        if isinstance(outcome, NotTranslated):
+            reason = f"{refusal}; {outcome.reason}"
+            notes = outcome.notes
+            if outcome.proposal is not None:
+                notes = f"{notes} Proposed DataWeave (not used): {outcome.proposal}".strip()
+            self.conditions.append(
+                ConditionRecord(
+                    name,
+                    kind,
+                    where,
+                    text,
+                    False,
+                    None,
+                    reason,
+                    method=Method.AI,
+                    confidence=outcome.confidence,
+                    notes=notes,
+                    needs_review=True,
+                )
+            )
+            return Translation(text, ok=False, dw=None, reason=reason)
+        dw = outcome.dataweave
+        self.conditions.append(
+            ConditionRecord(
+                name,
+                kind,
+                where,
+                text,
+                True,
+                dw,
+                None,
+                method=Method.AI,
+                confidence=outcome.confidence,
+                notes=outcome.notes,
+            )
+        )
+        return Translation(
+            text,
+            ok=True,
+            dw=dw,
+            reason=f"translated by AI, confidence {outcome.confidence.value}",
+            reads_request_snapshot=SNAPSHOT_VAR in dw,
+        )
 
     def build(self) -> dict[str, str]:
         listener = _element(CORE, "configuration-properties", {"file": PROPERTIES_FILE})
@@ -548,10 +727,12 @@ class _ProjectBuilder:
         files: dict[str, str] = {}
         main = [listener, listener_config, *self.globals, *self.policy_globals, *self.flows, *self.sub_flows]
         _drop_undeclared_error_handlers(main)
+        components, steps = _enterprise_uses(main)
+        self.enterprise_components, self.enterprise_steps = tuple(sorted(components)), tuple(steps)
         files["/".join((*MULE_DIR, PROXY_FILE))] = _mule_document(main)
         configs = sorted(path.rsplit("/", 1)[-1] for path in files)
         files["/".join((*RESOURCES_DIR, PROPERTIES_FILE))] = _properties_text(self.props, self.property_notes)
-        files["mule-artifact.json"] = _artifact_json(configs)
+        files["mule-artifact.json"] = _artifact_json(configs, enterprise=bool(components))
         files["pom.xml"] = _pom_text(self.bundle, [ns for ns in MODULE_DEPENDENCIES if _uses(main, ns)])
         return files
 
@@ -758,7 +939,9 @@ class _ProjectBuilder:
                 self._condition(flow.name, "Flow", where, flow.condition, REQUEST)
                 self._skip_flow_steps(FlowSteps(flow.request, flow.response), f"{where} flow {flow.name}")
                 continue
-            translation = self._condition(flow.name, "Flow", where, flow.condition, REQUEST)
+            translation = self._condition(flow.name, "Flow", where, flow.condition, REQUEST, ask_ai=True)
+            if translation is not None:
+                self._emit_guard(flow, REQUEST, before, translation)
             if translation is None:
                 fallback = flow
                 branch = _element(CORE, "otherwise")
@@ -817,7 +1000,9 @@ class _ProjectBuilder:
         conditional: list[tuple[RouteRule, str, Translation]] = []
         fallback: RouteRule | None = None
         for rule in endpoint.route_rules:
-            translation = self._condition(rule.name, "RouteRule", where, rule.condition, REQUEST)
+            translation = self._condition(
+                rule.name, "RouteRule", where, rule.condition, REQUEST, ask_ai=fallback is None
+            )
             if fallback is not None:
                 self.skip(
                     rule.name,
@@ -827,6 +1012,7 @@ class _ProjectBuilder:
             elif translation is None:
                 fallback = rule
             else:
+                self._emit_guard(rule, REQUEST, self.changes, translation)
                 conditional.append((rule, rule.condition or "", translation))
         if not endpoint.route_rules:
             return self._null_route()
@@ -1064,12 +1250,21 @@ class _ProjectBuilder:
     # ------------------------------------------------------------ steps and shared flows
 
     def _steps(
-        self, steps: Sequence[Step], where: str, direction: str, policies: dict[str, Policy] | None = None
+        self,
+        steps: Sequence[Step],
+        where: str,
+        direction: str,
+        policies: dict[str, Policy] | None = None,
+        resources: Sequence[Resource] | None = None,
     ) -> list[ET.Element]:
-        """Processors for ``steps``, one labelled processor (or a comment, when skipped) per step, in order."""
+        """Processors for ``steps``, one labelled processor (or a comment, when skipped) per step, in order.
+
+        ``policies`` and ``resources`` are those of the bundle the steps belong to (default: the proxy's).
+        """
         policies = self.policies if policies is None else policies
+        resources = self.bundle.resources if resources is None else resources
         found: list[ET.Element] = []
-        for step in steps:
+        for index, step in enumerate(steps):
             before = self.changes
             policy = policies.get(step.policy)
             if policy is None:
@@ -1080,6 +1275,12 @@ class _ProjectBuilder:
                 found.append(self._skipped_step(step, policy.type, reason, where, direction))
             elif policy.type == FLOW_CALLOUT:
                 found.append(self._flow_callout(step, policy, where, direction))
+            elif self.ai is not None and callout_kind(policy) is not None:
+                neighbours = (
+                    steps[index - 1].name if index > 0 else NONE,
+                    steps[index + 1].name if index + 1 < len(steps) else NONE,
+                )
+                found.append(self._ai_step(step, policy, where, direction, resources, neighbours))
             else:
                 output = registry.translate(policy, direction=direction, changes=self.changes)
                 found.extend(_untranslated_settings(step.name, output.result.unsupported_options))
@@ -1122,15 +1323,18 @@ class _ProjectBuilder:
         policy = policies.get(step.policy)
         if policy is None or not policy.enabled:
             return NO_CHANGES
-        if runs and step.condition is not None and step.condition.strip():
-            runs = translate_condition(step.condition, direction=direction, changes=changes).ok
+        if runs:
+            runs = self._runs_in_app(step, step.condition, direction, changes)
         if policy.type == FLOW_CALLOUT:
             return self._callout_dropped(step, policy, direction, visiting, runs, base)
-        writes = registry.variable_writes(policy, direction=direction)
+        model = self.write_models.get((id(step), direction))
+        writes = registry.variable_writes(policy, direction=direction, declared=model)
         if not writes:
             return NO_CHANGES
         written: frozenset[str] = frozenset()
-        if runs:
+        if runs and model is not None:
+            written = model.written
+        elif runs:
             output = registry.translate(policy, direction=direction, changes=changes)
             if output.result.method is Method.TEMPLATE and output.processors:
                 written = output.written
@@ -1213,7 +1417,8 @@ class _ProjectBuilder:
         if policy is None or not policy.enabled:
             return NO_CHANGES
         if policy.type != FLOW_CALLOUT:
-            return registry.request_changes(policy, direction=direction)
+            model = self.write_models.get((id(step), direction))
+            return registry.request_changes(policy, direction=direction, declared=model)
         name = step.shared_flow
         bundles = self.shared.get(name, []) if name is not None else []
         if name is None or len(bundles) != 1:
@@ -1264,10 +1469,10 @@ class _ProjectBuilder:
         Flow or behind a RouteRule whose condition can't be translated.
         """
 
-        def can_run(condition: str | None) -> bool:
-            if context is None or condition is None or not condition.strip():
+        def can_run(owner: Flow | RouteRule) -> bool:
+            if context is None:
                 return True
-            return translate_condition(condition, direction=REQUEST, changes=context).ok
+            return self._runs_in_app(owner, owner.condition, REQUEST, context)
 
         live: dict[int, bool] = {}
         for proxy in self.bundle.proxy_endpoints:
@@ -1275,7 +1480,7 @@ class _ProjectBuilder:
             live[id(proxy)] = generated
             for rule in proxy.route_rules:
                 target = self.targets.get(rule.target) if rule.target is not None else None
-                if target is not None and not (generated and can_run(rule.condition)):
+                if target is not None and not (generated and can_run(rule)):
                     live[id(target)] = False
         for target in self.bundle.target_endpoints:
             if isinstance(self._target_address(target), str):
@@ -1284,7 +1489,7 @@ class _ProjectBuilder:
         for endpoint in endpoints:
             runs = live.get(id(endpoint), True)
             groups = [(REQUEST, runs, endpoint.pre_flow.request), (REQUEST, runs, endpoint.post_flow.request)]
-            flows = [(f, runs and can_run(f.condition)) for f in endpoint.flows]
+            flows = [(f, runs and can_run(f)) for f in endpoint.flows]
             groups += [(REQUEST, flow_runs, f.request) for f, flow_runs in flows]
             if direction == RESPONSE:
                 groups += [(RESPONSE, runs, endpoint.pre_flow.response), (RESPONSE, runs, endpoint.post_flow.response)]
@@ -1340,6 +1545,100 @@ class _ProjectBuilder:
         labelled = _labelled(step.name, processors)
         return self._place(step, labelled, dataclasses.replace(result, name=step.name), where, direction)
 
+    def _ai_step(
+        self,
+        step: Step,
+        policy: Policy,
+        where: str,
+        direction: str,
+        resources: Sequence[Resource],
+        neighbours: tuple[str, str],
+    ) -> ET.Element:
+        """A custom code step translated by the AI, labelled with the step name at its place; or, when its code is
+        not in the bundle, the AI declines, fails or its answer cannot be used, a comment (flagged for review)."""
+        assert self.ai is not None
+        source = callout_source(policy, resources)
+        if isinstance(source, str):
+            return self._skipped_step(step, policy.type, source, where, direction)
+        options = _callout_options(policy)
+        place = Place(self.bundle.name, where, direction, *neighbours)
+        changed = "\n".join(f"- {line}" for line in describe_changes(self.changes)) or NONE
+        outcome = self.ai.callout(source, step.name, policy.type, policy.raw_xml, place, changed)
+        key = (id(step), direction)
+        if isinstance(outcome, CalloutTranslated):
+            for option in options:
+                self.skip(f"{step.name} {option.name}", f"{where}: {policy.type} step {step.name}: {option.reason}")
+            processors = [_adopt(p, {}) for p in outcome.processors]
+            self.needs.update(_ai_needs(processors))
+            stale = self._stale_inputs(source)
+            # Code that may read a stale value may write a stale value: its writes are not faithful, so it stays a
+            # step that may change anything (a later read of what it writes is refused).
+            self.write_models[key] = (
+                _write_model(outcome.writes, step.name, direction)
+                if outcome.writes is not None and stale is None
+                else None
+            )
+            low = outcome.confidence is Confidence.LOW
+            reasons = ["the AI's confidence in this translation is low, so it needs review"] if low else []
+            if stale is not None:
+                reasons.append(stale)
+            result = PolicyResult(
+                step.name,
+                policy.type,
+                Method.AI,
+                "; ".join(reasons),
+                unsupported_options=options,
+                confidence=outcome.confidence,
+                notes=outcome.notes,
+                needs_review=bool(reasons),
+                original=source.original,
+            )
+            return self._place(step, _labelled(step.name, processors), result, where, direction)
+        self.write_models[key] = None
+        self.skip(step.name, f"{where}: {outcome.reason}")
+        self._condition(step.name, "Step", where, step.condition, direction)
+        self.records.append(
+            PolicyResult(
+                step.name,
+                policy.type,
+                Method.AI,
+                outcome.reason,
+                unsupported_options=options,
+                location=where,
+                condition=step.condition,
+                confidence=outcome.confidence,
+                notes=outcome.notes,
+                needs_review=True,
+                original=source.original,
+            )
+        )
+        comment = ET.Comment(_comment_text(f"Step {step.name} ({policy.type}) is not generated: {outcome.reason}."))
+        return cast(ET.Element, comment)
+
+    def _stale_inputs(self, source: CalloutSource) -> str | None:
+        """Why the AI's translation of a callout may read a stale value (flagged for review), or None: the code reads a
+        value an earlier step may have changed in Apigee in a way the generated app may not carry over. The values read
+        are the getVariable calls with a fixed name in the main script and in every included script; code that may
+        read anything else counts as reading every value."""
+        reads = callout_reads([source.original, *(text for _, text in source.includes)], source.kind)
+        if reads is None:
+            steps = all_steps(self.changes)
+            if not steps:
+                return None
+            return (
+                "a2m cannot tell which values its code reads, and the earlier step "
+                f"{', '.join(steps)} may change values in Apigee in a way the generated app may not carry over; "
+                "check that the translation reads the values as Apigee would"
+            )
+        stale = {name: changed_steps(name, self.changes) for name in sorted(reads)}
+        found = [f"{name} (by {', '.join(steps)})" for name, steps in stale.items() if steps]
+        if not found:
+            return None
+        return (
+            f"its code reads {', '.join(found)}, which the earlier step may change in Apigee in a way the generated "
+            "app may not carry over; check that the translation reads the changed value"
+        )
+
     def _take_globals(self, policy_name: str, output: TemplateOutput) -> dict[str, str]:
         """Add the template's global elements once per policy; returns old name -> unique Mule name."""
         names: dict[str, str] = {}
@@ -1358,10 +1657,11 @@ class _ProjectBuilder:
     ) -> ET.Element:
         """Record the generated step; a step with a condition runs inside a when guarded by its translation, or
         never (``#[false]``, marked can't translate) when the condition can't be translated."""
-        translation = self._condition(step.name, "Step", where, step.condition, direction)
+        translation = self._condition(step.name, "Step", where, step.condition, direction, ask_ai=True)
         if translation is None:
             self.records.append(dataclasses.replace(result, location=where))
             return processor
+        self._emit_guard(step, direction, self.changes, translation)
         if translation.ok and translation.reads_request_snapshot:
             self.needs.add(NEED_REQUEST_SNAPSHOT)
         tags = result.tags if translation.ok else (*result.tags, CANT_TRANSLATE_TAG)
@@ -1431,7 +1731,9 @@ class _ProjectBuilder:
                 self._skip_steps(flow.steps, f"shared flow {shared.name}/{flow.name}", policies, direction=direction)
                 self.changes = base
         if entry is not None:
-            sub_flow.extend(self._steps(entry.steps, f"shared flow {shared.name}", direction, policies))
+            sub_flow.extend(
+                self._steps(entry.steps, f"shared flow {shared.name}", direction, policies, shared.resources)
+            )
         if not any(_is_element(child) for child in sub_flow):
             # A sub-flow needs at least one processor; this one only marks where the shared flow runs.
             sub_flow.append(_element(CORE, "logger", {"level": "DEBUG", "message": f"{name} called"}))
@@ -1512,6 +1814,59 @@ def _adopt(node: ET.Element, renames: dict[str, str]) -> ET.Element:
     return copied
 
 
+def _write_model(declared: DeclaredWrites, step: str, direction: str) -> registry.WriteModel:
+    """The registry's write model for an AI-translated step ``step`` on the ``direction`` side, from its checked
+    declaration: the body it sets is written exactly (its Content-Type pairing is not, so a later read of that is
+    refused), and so are the flow variables and response headers it declared. The registry's names are in lower case
+    (a near miss in case is read as changed, never as unchanged)."""
+    content, content_type = (
+        (RESPONSE_CONTENT, RESPONSE_CONTENT_TYPE) if direction == RESPONSE else (REQUEST_CONTENT, REQUEST_CONTENT_TYPE)
+    )
+    variables = {fold(name) for name in declared.variables}
+    written = variables | {RESPONSE_HEADER_PREFIX + name for name in declared.response_headers}
+    if declared.payload:
+        written.add(content)
+    writes = written | ({content_type} if declared.payload else set())
+    request = RequestChanges(
+        headers=frozenset((name, step) for name in declared.request_headers),
+        queries=frozenset((fold(name), step) for name in declared.query_params),
+    )
+    return registry.WriteModel(request, frozenset(writes), frozenset(written))
+
+
+def _callout_options(policy: Policy) -> tuple[UnsupportedOption, ...]:
+    """The settings of a custom code policy the AI's translation does not carry over."""
+    options: list[UnsupportedOption] = []
+    if policy.continue_on_error:
+        options.append(
+            UnsupportedOption(
+                "continueOnError",
+                "continueOnError=true is not carried over: when this step fails, the generated flow stops",
+            )
+        )
+    if is_true(policy.settings.attributes.get("async")):
+        options.append(UnsupportedOption("async", "async=true is not carried over; the step runs in line"))
+    return tuple(options)
+
+
+def _ai_needs(processors: Sequence[ET.Element]) -> set[str]:
+    """What the AI's processors need from the flows (see a2m.policies.common), from the variables they use."""
+    text = " ".join(
+        " ".join([element.text or "", *element.attrib.values()])
+        for processor in processors
+        for element in processor.iter()
+        if _is_element(element)
+    )
+    wanted = (
+        (REQUEST_HEADERS_VAR, NEED_REQUEST_HEADERS),
+        (REQUEST_QUERY_VAR, NEED_REQUEST_QUERY),
+        (REASON_PHRASE_VAR, NEED_REASON_PHRASE),
+        (SNAPSHOT_VAR, NEED_REQUEST_SNAPSHOT),
+        (FAULT_ERROR_TYPE, NEED_FAULT),
+    )
+    return {need for marker, need in wanted if marker in text}
+
+
 def _labelled(name: str, processors: Sequence[ET.Element]) -> ET.Element:
     """One processor labelled with the step name: the only processor, or a try scope holding them all."""
     if len(processors) == 1:
@@ -1529,6 +1884,8 @@ def _guard(label: str, original: str, translation: Translation, effect: str) -> 
     """The attributes of the ``when`` for a condition: its translation, or ``#[false]`` marked can't translate."""
     if translation.ok and translation.dw is not None:
         description = f"{label}: Apigee condition {original}"
+        if translation.reason:  # how it was translated, when not by a2m's own translator (the AI)
+            description += f" ({translation.reason})"
         return {"expression": f"#[{translation.dw}]", DOC_DESCRIPTION: _attribute_text(description)}
     description = f"{label}: can't translate the Apigee condition {original} ({translation.reason}); {effect}"
     return {"expression": "#[false]", DOC_DESCRIPTION: _attribute_text(description)}
@@ -1680,10 +2037,38 @@ def _uses(elements: Sequence[ET.Element], ns: str) -> bool:
     )
 
 
+def _enterprise_uses(elements: Sequence[ET.Element]) -> tuple[set[str], list[str]]:
+    """The Mule Enterprise (``ee:``) components under ``elements`` as ``ee:<name>``, and the labels (doc:name) of
+    the steps holding them, each once in document order."""
+    prefix = f"{{{EE}}}"
+    components: set[str] = set()
+    steps: list[str] = []
+
+    def walk(node: ET.Element, label: str | None) -> None:
+        label = node.get(DOC_NAME, label)
+        for child in node:
+            if not _is_element(child):
+                continue
+            if child.tag.startswith(prefix):
+                components.add(f"ee:{_local(child.tag)}")
+                step = child.get(DOC_NAME, label)
+                if step is not None and step not in steps:
+                    steps.append(step)
+            else:
+                walk(child, label)
+
+    for top in elements:
+        if _is_element(top) and top.tag.startswith(prefix):
+            components.add(f"ee:{_local(top.tag)}")
+        else:
+            walk(top, None)
+    return components, steps
+
+
 def _mule_document(children: Sequence[ET.Element]) -> str:
     root = _element(CORE, "mule", {"xmlns": CORE})
     locations = [CORE, SCHEMA_LOCATIONS[CORE]]
-    for ns in (HTTP, OS, VALIDATION):
+    for ns in (HTTP, OS, EE, VALIDATION):
         if _uses(children, ns):
             locations += [ns, SCHEMA_LOCATIONS[ns]]
     root.set(f"{{{XSI}}}schemaLocation", " ".join(locations))
@@ -1720,10 +2105,11 @@ def _pom_text(bundle: Bundle, modules: Sequence[str] = ()) -> str:
     return XML_HEAD + ET.tostring(root, encoding="unicode") + "\n"
 
 
-def _artifact_json(configs: list[str]) -> str:
+def _artifact_json(configs: list[str], *, enterprise: bool = False) -> str:
     artifact = {
         "minMuleVersion": MIN_MULE_VERSION,
-        "requiredProduct": "MULE",
+        # MULE_EE when the app uses Mule Enterprise components (Transform Message), which Mule Kernel CE lacks.
+        "requiredProduct": "MULE_EE" if enterprise else "MULE",
         "javaSpecificationVersions": [JAVA_VERSION],
         "configs": configs,
         "secureProperties": [],
@@ -1772,6 +2158,9 @@ def _write_tree(dest: Path, files: dict[str, str], results_root: Path | None) ->
     if results_root is None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         results_root = dest.parent
+    else:
+        # The caller's own results folder (trusted, like dest's parent above); everything below it goes through safefs.
+        results_root.mkdir(parents=True, exist_ok=True)
     staging = dest.with_name(f".{dest.name}.a2m-new")
     safefs.remove(results_root, staging)
     safefs.make_dirs(results_root, staging)

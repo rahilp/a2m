@@ -265,3 +265,87 @@ def _static_check_caches_under_tmp(tmp_path_factory: pytest.TempPathFactory) -> 
         patch.setenv("MYPY_CACHE_DIR", str(caches / "mypy"))
         patch.setenv("RUFF_CACHE_DIR", str(caches / "ruff"))
         yield caches
+
+
+# ---------------------------------------------------------------- CP6: the network guard
+# New imports for the guard live here so no existing line changes.
+
+import ipaddress  # noqa: E402
+import socket  # noqa: E402
+
+GUARD_ALLOWED_NAMES = frozenset({"localhost"})
+
+
+class BlockedNetworkError(RuntimeError):
+    """A test tried to reach a host other than this machine (127.0.0.1, ::1 or localhost)."""
+
+
+def _guard_host_allowed(host: object) -> bool:
+    """True for the loopback addresses and the name localhost; every other name or address is refused without a
+    lookup (so 127.0.0.1.example.test is a name, not 127.0.0.1)."""
+    text = host.decode("ascii", "replace") if isinstance(host, bytes) else str(host)
+    if text.lower().rstrip(".") in GUARD_ALLOWED_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(text.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def _guard_refuse(what: str, host: object, port: object = None) -> BlockedNetworkError:
+    target = f"{host}:{port}" if port is not None else f"{host}"
+    return BlockedNetworkError(
+        f"a2m tests: blocked network access: {what} {target} (only 127.0.0.1, ::1 and localhost are allowed)"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _network_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """[CP6] No test reaches the network: outbound connects and name lookups fail at once with an error naming the
+    destination, except to 127.0.0.1, ::1 and the name localhost (the mock backend and the runtime tests use those).
+    Checked before any lookup or connect, so nothing leaves the machine."""
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+    real_sendto = socket.socket.sendto
+    real_getaddrinfo = socket.getaddrinfo
+    real_gethostbyname = socket.gethostbyname
+    real_gethostbyname_ex = socket.gethostbyname_ex
+    inet = (socket.AF_INET, socket.AF_INET6)
+
+    def check(sock: socket.socket, address: Any, what: str) -> None:
+        if sock.family in inet and isinstance(address, tuple) and address and not _guard_host_allowed(address[0]):
+            raise _guard_refuse(what, address[0], address[1] if len(address) > 1 else None)
+
+    def connect(self: socket.socket, address: Any) -> None:
+        check(self, address, "connect to")
+        real_connect(self, address)
+
+    def connect_ex(self: socket.socket, address: Any) -> int:
+        check(self, address, "connect to")
+        return real_connect_ex(self, address)
+
+    def sendto(self: socket.socket, data: Any, *args: Any) -> int:
+        check(self, args[-1] if args else None, "send to")
+        return real_sendto(self, data, *args)
+
+    def getaddrinfo(host: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
+        if host is not None and not _guard_host_allowed(host):
+            raise _guard_refuse("name lookup of", host, port)
+        return real_getaddrinfo(host, port, *args, **kwargs)
+
+    def gethostbyname(host: str) -> str:
+        if not _guard_host_allowed(host):
+            raise _guard_refuse("name lookup of", host)
+        return real_gethostbyname(host)
+
+    def gethostbyname_ex(host: str) -> Any:
+        if not _guard_host_allowed(host):
+            raise _guard_refuse("name lookup of", host)
+        return real_gethostbyname_ex(host)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+    monkeypatch.setattr(socket.socket, "sendto", sendto)
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket, "gethostbyname", gethostbyname)
+    monkeypatch.setattr(socket, "gethostbyname_ex", gethostbyname_ex)

@@ -8,6 +8,7 @@ unknown type is never translated into nothing: :func:`translate` returns a
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from a2m.conditions import ANY, NO_CHANGES, REQUEST, RequestChanges
 from a2m.ir import Policy
@@ -57,31 +58,45 @@ def translate(policy: Policy, *, direction: str, changes: RequestChanges = NO_CH
     return TemplateOutput((), (), {}, PolicyResult(policy.name, policy.type, Method.SKIPPED, reason))
 
 
-def has_write_model(policy: Policy) -> bool:
-    """True when a2m knows everything ``policy`` may write in Apigee (its documented outputs, read from its XML):
-    the types with a template and OAuthV2 VerifyAccessToken. Any other policy (JavaScript, Python, JavaCallout,
-    ServiceCallout, KeyValueMapOperations, the other OAuthV2 operations, an unknown type, ...) is never generated
-    to run as in Apigee, so it may change anything (:meth:`RequestChanges.everything`).
+@dataclass(frozen=True, slots=True)
+class WriteModel:
+    """The writes of a step a2m has no template for, as its AI translation declared them and a2m checked against
+    the generated processors (see :func:`a2m.ai.checks.declared_writes`): the request headers and query parameters it
+    changes (``request``), every flow variable and message part it writes in Apigee (``writes``, lower case) and the
+    ones its processors write exactly (``written``)."""
 
-    CP6 hook: an AI-translated step becomes a faithful writer only per the outputs its translation declares.
-    Answer True here for it, return those declared outputs from :func:`request_changes` and
-    :func:`variable_writes`, and mark the ones its processors write exactly in :attr:`TemplateOutput.written`.
-    The generator reads writes only through these functions.
+    request: RequestChanges
+    writes: frozenset[str]
+    written: frozenset[str]
+
+
+def has_write_model(policy: Policy, declared: WriteModel | None = None) -> bool:
+    """True when a2m knows everything ``policy`` may write in Apigee (its documented outputs, read from its XML):
+    the types with a template and OAuthV2 VerifyAccessToken, and a step whose AI translation declared its writes
+    (``declared``, checked against its processors). Any other policy (JavaScript, Python, JavaCallout,
+    ServiceCallout, KeyValueMapOperations, the other OAuthV2 operations, an unknown type, an AI translation whose
+    declaration is missing or does not match its processors, ...) is never generated to run as in Apigee, so it may
+    change anything (:meth:`RequestChanges.everything`). The generator reads writes only through these functions.
     """
+    if declared is not None and policy.type not in TEMPLATES:
+        return True
     if policy.type == "OAuthV2":
         return _oauth_operation(policy) == "VerifyAccessToken"
     return policy.type in TEMPLATES
 
 
-def request_changes(policy: Policy, *, direction: str) -> RequestChanges:
+def request_changes(policy: Policy, *, direction: str, declared: WriteModel | None = None) -> RequestChanges:
     """The request headers, query parameters and verb ``policy`` changes in Apigee when it runs on the
     ``direction`` side, by name, so a later read never sees them stale (see :mod:`a2m.conditions.variables`).
 
     Counted: AssignMessage and BasicAuthentication Encode, the policy types a2m
     translates that write the request; the other types with a write model
     change none. A policy without one (:func:`has_write_model`) may change
-    every header, query parameter and the verb.
+    every header, query parameter and the verb; an AI-translated step with a
+    checked ``declared`` model changes what it declared.
     """
+    if declared is not None and policy.type not in TEMPLATES:
+        return declared.request
     if not has_write_model(policy):
         every = RequestChanges.everything(policy.name)
         return RequestChanges(every.headers, every.queries, every.verb)
@@ -116,7 +131,9 @@ def _oauth_operation(policy: Policy) -> str:
     return (operation.text or "").strip() if operation is not None else ""
 
 
-def variable_writes(policy: Policy, *, direction: str = REQUEST) -> frozenset[str]:
+def variable_writes(
+    policy: Policy, *, direction: str = REQUEST, declared: WriteModel | None = None
+) -> frozenset[str]:
     """The proxy's own flow variables and the message parts (``request.content``, ``response.content``,
     ``response.header.NAME``) ``policy`` may write in Apigee on the ``direction`` side, in lower case (``NAME.``
     for every variable under NAME), whether or not a2m carries the write over; the generator compares them with
@@ -126,8 +143,11 @@ def variable_writes(policy: Policy, *, direction: str = REQUEST) -> frozenset[st
     AssignMessage, ExtractVariables and BasicAuthentication write what the policy names; VerifyAPIKey writes
     client_id and OAuthV2 VerifyAccessToken writes client_id, access_token, scope, ...; the other types with a
     template write none of the proxy's own (only their own built-in ones, such as ratelimit.*). A policy without
-    a write model (:func:`has_write_model`) may write any: :data:`ANY`.
+    a write model (:func:`has_write_model`) may write any: :data:`ANY`; an
+    AI-translated step with a checked ``declared`` model writes what it declared.
     """
+    if declared is not None and policy.type not in TEMPLATES:
+        return declared.writes
     if not has_write_model(policy):
         return frozenset({ANY})
     if policy.type == "AssignMessage":

@@ -1,0 +1,6 @@
+{
+  "status": "translated",
+  "confidence": "high",
+  "notes": "Hostile text: comparison and ampersand.",
+  "dataweave": "payload.total < 5 and payload.name == \"A&B\""
+}

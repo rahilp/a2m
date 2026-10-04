@@ -1,0 +1,6 @@
+{
+  "status": "translated",
+  "confidence": "medium",
+  "notes": "Counts in the X-Count response header; a missing header counts as 0.",
+  "mule": "<set-variable variableName=\"responseHeaders\" value=\"#[output application/java --- (vars.responseHeaders default {}) ++ {'x-count': ((vars.responseHeaders.'x-count' default '0') as Number + 1) as String}]\"/>"
+}

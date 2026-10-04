@@ -1,0 +1,2 @@
+Sure! To do this in Mule you would probably use a set-variable with a random value.
+Let me know if you want more detail.

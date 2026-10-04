@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, NoReturn
 from a2m import __version__
 from a2m.engine import DEFAULT_STAGES, LlmChoice, RunOptions, Stage, prepare_run, rerun_advice, run_batch
 from a2m.errors import UnsafePathError, UsageError
+from a2m.redaction import redact
 from a2m.runlog import one_line
 
 if TYPE_CHECKING:
@@ -55,7 +56,7 @@ def _write(stream: SupportsWrite[str] | None, text: str) -> None:
         return
     try:
         encoding = getattr(stream, "encoding", None) or "utf-8"
-        safe = "".join(one_line(line) + "\n" for line in text.splitlines())
+        safe = "".join(one_line(line) + "\n" for line in redact(text).splitlines())
         stream.write(safe.encode(encoding, "backslashreplace").decode(encoding, "replace"))
         flush = getattr(stream, "flush", None)
         if flush is not None:

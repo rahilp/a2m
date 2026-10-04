@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="1" name="js-callout">
+    <Description>a2m CP6 fixture</Description>
+    <DisplayName>js-callout</DisplayName>
+    <Policies>
+        <Policy>AM-SetHeader</Policy>
+        <Policy>JS-AddCorrelation</Policy>
+        <Policy>VA-Key</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>default</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>

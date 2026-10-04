@@ -76,6 +76,11 @@ PATH_SUFFIX_ROOT = (
     "slash (Apigee has '' and '/'), so this check would not give Apigee's result"
 )
 PATTERN_OPERATORS = (Operator.MATCHES, Operator.MATCHES_PATH, Operator.JAVA_REGEX)
+# What a missing (null) value reads as in the comparison this module writes, by operator: the patterns read it as ""
+# (the read is written ``(LHS default "")``); every other comparison written here reads it as null. For ``:=`` that
+# is ``lower(null) == lower("value")``, false: DataWeave's Core has ``fun lower(value: Null): Null = null`` (2.4 and
+# later; Mule 4.9 ships 2.9). The AI condition checker (:mod:`a2m.ai.checks`) models comparisons with this same table.
+MISSING_READS_AS: dict[Operator, str] = {operator: "" for operator in PATTERN_OPERATORS}
 REGEX_SPECIAL = frozenset("\\.[]{}()*+?^$|")
 # A {n}, {n,} or {n,m} quantifier.
 QUANTIFIER = re.compile(r"\{\d+(?:,\d*)?\}")
@@ -214,7 +219,7 @@ def _comparison(node: Comparison, direction: str, changes: RequestChanges) -> st
             )
         if node.variable == PATH_SUFFIX and matches_empty != (re.fullmatch(_python_regex(regex), "/") is not None):
             raise ConditionError(f"{where}: {PATH_SUFFIX_ROOT}")
-        return f'(({lhs.dw} default "") matches /{regex}/)'
+        return f"(({lhs.dw} default {dw_string(MISSING_READS_AS[node.operator])}) matches /{regex}/)"
     if node.variable == PATH_SUFFIX and (value.kind is LiteralKind.NULL or fold(value.text) in ("", "/")):
         raise ConditionError(f"{where}: {PATH_SUFFIX_ROOT}")
     if value.kind is LiteralKind.NULL and not lhs.nullable:

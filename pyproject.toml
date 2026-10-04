@@ -13,6 +13,8 @@ dependencies = ["defusedxml>=0.7.1"]
 [project.optional-dependencies]
 # ruff and mypy are the project's static checks; CP1-T55/T61 run them.
 dev = ["pytest>=8", "ruff>=0.16", "mypy>=2.4", "types-defusedxml>=0.7"]
+# The Anthropic SDK for --llm claude (the default); imported lazily, so a2m runs without it with --llm fake.
+claude = ["anthropic>=0.40"]
 
 [project.scripts]
 a2m = "a2m.cli:main"
@@ -23,6 +25,9 @@ include = ["a2m*"]
 [tool.setuptools.package-data]
 # The generator's fixed project files (pom.xml), read with importlib.resources.
 "a2m.generator" = ["templates/*"]
+# The AI prompts (data, editable without touching code) and the fake provider's built-in answers.
+"a2m" = ["prompts/*.md"]
+"a2m.ai" = ["canned/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -43,6 +48,9 @@ tmp_path_retention_count = 1
 # isort rewrap one-line imports (I001) that fit the project's own style.
 line-length = 120
 target-version = "py311"
+# Apigee bundle fixtures hold the proxies' own JavaScript and Python callout scripts (input data written against
+# Apigee's object model, e.g. a global `response`), not a2m code.
+extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
 # The round-01 and round-02 test blocks import mid-file so no locked test line

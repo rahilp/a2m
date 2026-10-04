@@ -1,0 +1,6 @@
+{
+  "status": "translated",
+  "confidence": "high",
+  "notes": "random() replaced by uuid()",
+  "mule": "<set-variable variableName=\"corr.id\" value=\"#[%dw 2.0 output application/java --- uuid()]\"/>\n<set-variable variableName=\"a2mRequestHeaders\" value=\"#[output application/java --- (vars.a2mRequestHeaders default attributes.headers) ++ {'x-correlation-id': vars.'corr.id'}]\"/>"
+}

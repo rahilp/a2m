@@ -1,0 +1,6 @@
+{
+  "status": "translated",
+  "confidence": "medium",
+  "notes": "Assumes the response body is JSON with a top-level card field.",
+  "mule": "<ee:transform>\n  <ee:message>\n    <ee:set-payload><![CDATA[%dw 2.0\noutput application/json\n---\npayload update {\n  case card at .card -> \"**** **** **** \" ++ ((card as String)[-4 to -1] default \"\")\n}]]></ee:set-payload>\n  </ee:message>\n</ee:transform>"
+}

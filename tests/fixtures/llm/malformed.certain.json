@@ -1,0 +1,6 @@
+{
+  "status": "translated",
+  "confidence": "certain",
+  "notes": "Confidence is not one of high, medium, low.",
+  "mule": "<set-variable variableName=\"corr.id\" value=\"#[uuid()]\"/>"
+}

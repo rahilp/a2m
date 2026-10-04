@@ -1,0 +1,6 @@
+{
+  "status": "translated",
+  "confidence": "high",
+  "notes": "=| is Apigee's StartsWith operator.",
+  "dataweave": "startsWith(attributes.headers.'user-agent', \"curl\")"
+}

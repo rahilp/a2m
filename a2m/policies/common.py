@@ -37,6 +37,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from a2m.ai.provider import Confidence
 from a2m.conditions import NO_CHANGES, RequestChanges, Translation, translate_template
 from a2m.conditions.lexer import ConditionError
 from a2m.conditions.template import has_reference
@@ -90,6 +91,8 @@ ASCII_FOLD = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 UNSAFE_KEY_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 class Method(StrEnum):
     TEMPLATE = "template"
+    # Translated by the AI (a2m.ai), or sent to it and flagged for review when it could not be used.
+    AI = "ai"
     SKIPPED = "skipped"
 
 
@@ -111,6 +114,12 @@ class PolicyResult:
     ``name`` is the policy name in a template's output and the step name in
     :attr:`a2m.generator.GenerateResult.policies`; ``location`` and
     ``condition`` are filled in by the generator.
+
+    For a step sent to the AI (method ``ai``): ``confidence`` is the AI's
+    (None when it declined or gave no usable answer), ``notes`` its notes or
+    why its answer could not be used, ``needs_review`` True for low confidence
+    and for every answer that was not used, ``original`` the callout's source
+    code, and ``reason`` why the step needs review.
     """
 
     name: str
@@ -121,6 +130,10 @@ class PolicyResult:
     tags: tuple[str, ...] = ()
     location: str = ""
     condition: str | None = None
+    confidence: Confidence | None = None
+    notes: str = ""
+    needs_review: bool = False
+    original: str | None = None
 
 
 @dataclass(frozen=True)

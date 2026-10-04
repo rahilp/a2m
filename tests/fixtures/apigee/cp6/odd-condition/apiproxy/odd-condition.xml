@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="1" name="odd-condition">
+    <Description>a2m CP6 fixture</Description>
+    <DisplayName>odd-condition</DisplayName>
+    <Policies>
+        <Policy>AM-Curl</Policy>
+        <Policy>AM-Orders</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>default</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>

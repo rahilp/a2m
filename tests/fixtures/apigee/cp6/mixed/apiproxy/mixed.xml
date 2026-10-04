@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="1" name="mixed">
+    <Description>a2m CP6 fixture</Description>
+    <DisplayName>mixed</DisplayName>
+    <Policies>
+        <Policy>AM-SetHeader</Policy>
+        <Policy>JS-One</Policy>
+        <Policy>JS-Two</Policy>
+        <Policy>PY-One</Policy>
+        <Policy>SA-10ps</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>default</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>

@@ -1,0 +1,6 @@
+{
+  "status": "translated",
+  "confidence": "low",
+  "notes": "crypto library mapping uncertain",
+  "mule": "<set-variable variableName=\"signature\" value=\"#[%dw 2.0 import dw::Crypto output text/plain --- Crypto::hashWith(payload as Binary, &quot;SHA-1&quot;)]\"/>"
+}

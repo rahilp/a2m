@@ -31,6 +31,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from a2m.errors import LockHeldError, NotPlainFileError, UnsafePathError
+from a2m.redaction import redact
 
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 # Opening a FIFO without a reader blocks; with O_NONBLOCK the open returns and
@@ -168,7 +169,7 @@ def write_text_atomic(root: Path, target: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o666)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text)
+        handle.write(redact(text))
     os.replace(tmp, path)
 
 

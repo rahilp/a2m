@@ -1,0 +1,7 @@
+{
+  "status": "translated",
+  "confidence": "low",
+  "notes": "Placeholder from a2m's fake AI provider (--llm fake): no AI translated this step, it only logs a warning when it runs. Translate it by hand, or run a2m with --llm claude.",
+  "mule": "<logger level=\"WARN\" message=\"a2m placeholder: this custom code step was not translated (fake AI provider)\"/>",
+  "writes": null
+}

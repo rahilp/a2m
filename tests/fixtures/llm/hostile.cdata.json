@@ -1,0 +1,6 @@
+{
+  "status": "translated",
+  "confidence": "high",
+  "notes": "Hostile text: closes the CDATA section and the element.",
+  "mule": "<ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0 output text/plain --- \"]]]]><![CDATA[></ee:set-payload><flow name=\"evil\"/>\"]]></ee:set-payload></ee:message></ee:transform>"
+}

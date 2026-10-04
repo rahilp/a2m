@@ -1,0 +1,6 @@
+{
+  "status": "translated",
+  "confidence": "high",
+  "notes": "Sets the X-One response header.",
+  "mule": "<set-variable variableName=\"responseHeaders\" value=\"#[output application/java --- (vars.responseHeaders default {}) ++ {'x-one': 'one'}]\"/>"
+}

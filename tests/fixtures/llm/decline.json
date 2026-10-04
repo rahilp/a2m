@@ -1,0 +1,4 @@
+{
+  "status": "cannot_translate",
+  "reason": "uses Apigee crypto API with no Mule equivalent"
+}

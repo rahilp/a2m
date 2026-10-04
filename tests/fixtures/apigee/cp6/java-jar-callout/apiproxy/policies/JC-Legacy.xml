@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<JavaCallout async="false" continueOnError="false" enabled="true" name="JC-Legacy">
+    <DisplayName>JC-Legacy</DisplayName>
+    <ClassName>com.example.Legacy</ClassName>
+    <ResourceURL>java://legacy.jar</ResourceURL>
+</JavaCallout>

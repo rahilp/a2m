@@ -22,6 +22,8 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from a2m.redaction import redact
+
 LOGGER_NAME = "a2m"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S%z"
 
@@ -50,7 +52,8 @@ class LinePrefixFormatter(logging.Formatter):
             body = f"{body}\n{self.formatStack(record.stack_info)}"
         # Traceback lines can carry exception text (file names, input values);
         # each line is escaped the same way as the message.
-        lines = body.splitlines() or [""]
+        # Secrets (the API key) are masked whatever the message or traceback holds.
+        lines = redact(body).splitlines() or [""]
         return "\n".join(prefix + one_line(line) for line in lines)
 
 

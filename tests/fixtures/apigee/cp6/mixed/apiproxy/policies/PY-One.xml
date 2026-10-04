@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Script async="false" continueOnError="false" enabled="true" name="PY-One">
+    <DisplayName>PY-One</DisplayName>
+    <ResourceURL>py://one.py</ResourceURL>
+</Script>

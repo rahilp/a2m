@@ -1,0 +1,5 @@
+{
+  "status": "translated",
+  "notes": "Confidence was left out of this answer.",
+  "mule": "<set-variable variableName=\"corr.id\" value=\"#[uuid()]\"/>"
+}
