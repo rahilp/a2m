@@ -1,0 +1,6 @@
+[tools]
+java = "temurin-17"
+maven = "3.9"
+
+[env]
+MULE_HOME = "{{env.HOME}}/.local/share/mule/mule-standalone-4.9.0"
