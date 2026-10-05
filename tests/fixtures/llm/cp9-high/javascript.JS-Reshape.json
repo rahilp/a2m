@@ -1,0 +1,6 @@
+{
+  "status": "translated",
+  "confidence": "high",
+  "notes": "CP9 canned answer: reshape.js read as one DataWeave variable step, checked line by line against the script",
+  "mule": "<set-variable variableName=\"reshapedId\" value=\"#[output application/java --- 'reshaped']\"/>"
+}

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="1" name="kitchen-sink-missing-policy">
+    <DisplayName>kitchen-sink-missing-policy</DisplayName>
+    <Description>a2m CP9 end-to-end fixture</Description>
+    <Policies>
+        <Policy>CT-Custom</Policy>
+        <Policy>AM-Unused</Policy>
+        <Policy>AM-Form</Policy>
+        <Policy>AM-Verb</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>default</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>

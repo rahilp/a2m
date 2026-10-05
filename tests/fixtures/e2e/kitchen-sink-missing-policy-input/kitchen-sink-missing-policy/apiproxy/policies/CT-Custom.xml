@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<CustomThing async="false" continueOnError="false" enabled="true" name="CT-Custom">
+    <DisplayName>CT-Custom</DisplayName>
+    <Setting>on</Setting>
+</CustomThing>

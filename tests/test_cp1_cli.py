@@ -2228,7 +2228,10 @@ def test_CP1_T66_console_script_prints_one_line_for_an_undecodable_out_path(
     assert len(lines) == 1, out
     _assert_safe_line(lines[0])
     assert "1 done" in lines[0] and "0 failed" in lines[0]
-    assert os.path.isfile(out_dir + b"/alpha/.done")
+    # CP9 layout: the proxy's folder is results/<bucket>/alpha/, in exactly one bucket (tests/e2e_support.py).
+    homes = [b for b in (b"verified", b"needs-review", b"unsupported") if os.path.isdir(out_dir + b"/" + b + b"/alpha")]
+    assert len(homes) == 1, f"alpha must sit in exactly one of results/<bucket>/alpha, found in {homes!r}"
+    assert os.path.isfile(out_dir + b"/" + homes[0] + b"/alpha/.done")
 
 
 def _is_sys_stream(node: ast.AST) -> bool:

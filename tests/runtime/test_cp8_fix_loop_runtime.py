@@ -21,7 +21,7 @@ engine pipeline (no injected stages, no injected runner): ``a2m migrate <input> 
   means is never read; its mere presence on disk is the trap (a loop that over-retries would consume it).
 
 Nothing here records what the fake provider was asked directly (the production FakeProvider has no test
-hook): the proof is in ``<out>/js-header-proxy/verification.json`` (exactly one recorded fix attempt that
+hook): the proof is in ``<out>/<bucket>/js-header-proxy/verification.json`` (exactly one recorded fix attempt that
 helped, result type golden) together with run.log's one "sent to the AI" line for the translation, which
 between them account for the exactly-two AI round trips the plan asks for.
 """
@@ -121,8 +121,15 @@ def write_golden(golden_root: Path) -> Path:
     return golden_root
 
 
+def proxy_dir(out_dir: Path) -> Path:
+    """CP9 layout: <out>/<bucket>/<APP>/ in exactly one of verified, needs-review, unsupported."""
+    homes = [out_dir / b / APP for b in ("verified", "needs-review", "unsupported") if (out_dir / b / APP).is_dir()]
+    assert len(homes) == 1, f"{APP} must sit in exactly one of <out>/<bucket>/{APP}, found {homes}"
+    return homes[0]
+
+
 def generated_flow_text(out_dir: Path) -> str:
-    return (out_dir / APP / "mule-app" / "src" / "main" / "mule" / "proxy.xml").read_text(encoding="utf-8")
+    return (proxy_dir(out_dir) / "mule-app" / "src" / "main" / "mule" / "proxy.xml").read_text(encoding="utf-8")
 
 
 @pytest.mark.runtime
@@ -188,7 +195,7 @@ def test_CP8_T18_a_wrong_js_callout_translation_fails_and_the_ai_fix_corrects_it
     )
 
     assert code == 0, (out / "run.log").read_text(encoding="utf-8", errors="replace")[-4000:]
-    data = json.loads((out / APP / "verification.json").read_text(encoding="utf-8"))
+    data = json.loads((proxy_dir(out) / "verification.json").read_text(encoding="utf-8"))
     assert data["type"] == "golden", data
     assert len(data["attempts"]) == 1, data["attempts"]
     attempt = data["attempts"][0]

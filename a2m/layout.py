@@ -36,7 +36,21 @@ MULE_BASE_WORK_NAME = ".mule-base"
 VERIFY_WORK_NAME = ".verify"
 # Inside a proxy's work folder: what the generator made of each step, for the verification stage.
 GENERATED_STEPS_NAME = ".a2m-generated-steps.json"
+# Inside a proxy's work folder: the generator's full records (every step and condition), for the report stage.
+GENERATE_RECORDS_NAME = ".a2m-generate-records.json"
 
+# The three buckets every migrated proxy lands in (results/<bucket>/<proxy>/), always created by a reporting run.
+VERIFIED_DIR_NAME = "verified"
+NEEDS_REVIEW_DIR_NAME = "needs-review"
+UNSUPPORTED_DIR_NAME = "unsupported"
+BUCKET_DIR_NAMES: tuple[str, ...] = (VERIFIED_DIR_NAME, NEEDS_REVIEW_DIR_NAME, UNSUPPORTED_DIR_NAME)
+# Inside a proxy's folder: its report, the diffs and logs a reviewer needs, and the facts the batch summary reads.
+REPORT_NAME = "REPORT.md"
+DIFFS_DIR_NAME = "diffs"
+PROXY_SUMMARY_NAME = ".a2m-summary.json"
+# The batch summary, directly in the results folder.
+SUMMARY_MD_NAME = "SUMMARY.md"
+SUMMARY_JSON_NAME = "summary.json"
 
 
 def collision_key(name: str) -> str:
@@ -56,7 +70,16 @@ def collision_key(name: str) -> str:
 # Proxy names that would collide with files a2m owns in the results folder.
 # Compared by collision_key, since macOS and Windows file systems ignore case.
 RESERVED_NAMES: frozenset[str] = frozenset(
-    {RUN_LOG_NAME, WORK_DIR_NAME, RESULTS_MARKER_NAME, LOCK_NAME, FORCE_PENDING_NAME}
+    {
+        RUN_LOG_NAME,
+        WORK_DIR_NAME,
+        RESULTS_MARKER_NAME,
+        LOCK_NAME,
+        FORCE_PENDING_NAME,
+        SUMMARY_MD_NAME,
+        SUMMARY_JSON_NAME,
+        *BUCKET_DIR_NAMES,
+    }
 )
 _RESERVED_KEYS: frozenset[str] = frozenset(collision_key(name) for name in RESERVED_NAMES)
 _FORBIDDEN_CHARS = ("/", "\\", "\x00")
@@ -141,6 +164,28 @@ def mule_base_dir(out_dir: Path) -> Path:
 
 def generated_steps_path(out_dir: Path, name: str) -> Path:
     return proxy_work_dir(out_dir, name) / GENERATED_STEPS_NAME
+
+
+def generate_records_path(out_dir: Path, name: str) -> Path:
+    return proxy_work_dir(out_dir, name) / GENERATE_RECORDS_NAME
+
+
+def bucket_dir(out_dir: Path, bucket: str) -> Path:
+    if bucket not in BUCKET_DIR_NAMES:
+        raise UnsafePathError(f"refusing to use {bucket!r} under {out_dir}: it is not one of {BUCKET_DIR_NAMES}")
+    return out_dir / bucket
+
+
+def bucket_proxy_dir(out_dir: Path, bucket: str, name: str) -> Path:
+    return _child(bucket_dir(out_dir, bucket), name)
+
+
+def summary_md_path(out_dir: Path) -> Path:
+    return out_dir / SUMMARY_MD_NAME
+
+
+def summary_json_path(out_dir: Path) -> Path:
+    return out_dir / SUMMARY_JSON_NAME
 
 
 def verify_work_dir(out_dir: Path, name: str) -> Path:

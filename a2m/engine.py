@@ -40,6 +40,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 
 from a2m import layout, pathid, safefs
 from a2m.ai import Provider, ProviderSetupError, make_provider
@@ -67,10 +68,12 @@ from a2m.errors import (
     UsageError,
 )
 from a2m.generator import GenerateResult, generate_project
+from a2m.inventory import GenerateRecords
 from a2m.ir import Bundle
 from a2m.layout import collision_key, unsafe_name_reason
 from a2m.parser import read_bundle
 from a2m.policies.common import Method
+from a2m.report import ReportStage
 from a2m.runlog import get_logger, run_log
 from a2m.verify import make_verify_stage
 from a2m.verify.generated import GeneratedSteps
@@ -226,7 +229,8 @@ def generate(context: ProxyContext) -> None:
 
 def _save_generated_steps(context: ProxyContext, result: GenerateResult) -> None:
     """Keep what the generator made of each step in the proxy's work folder, for the verification stage (which
-    tests only the steps a2m generated and that run in the app; see a2m.verify.generated)."""
+    tests only the steps a2m generated and that run in the app; see a2m.verify.generated), and the generator's full
+    records for the report stage (see a2m.inventory; written whether or not a report stage runs)."""
     results_root = context.out_dir.parent
     path = layout.generated_steps_path(results_root, context.name)
     try:
@@ -238,15 +242,55 @@ def _save_generated_steps(context: ProxyContext, result: GenerateResult) -> None
             context.name,
             exc,
         )
+    records = layout.generate_records_path(results_root, context.name)
+    try:
+        safefs.write_text_atomic(results_root, records, GenerateRecords.from_result(result).to_json())
+    except OSError as exc:
+        get_logger().warning("%s: could not save the generator's records for the report (%s)", context.name, exc)
 
 
 def default_stages() -> tuple[Stage, ...]:
     """The per-proxy pipeline of one batch (tests replace it through ``stages=``).
 
     Made per batch: the verification stage keeps the batch's Mule runtime, started
-    on first use and stopped when the batch ends (see :func:`run_batch`).
+    on first use and stopped when the batch ends (see :func:`run_batch`). The
+    report stage writes each proxy's REPORT.md and picks its bucket; with it in
+    the list, each proxy ends in ``<bucket>/<proxy>/`` and the batch gets
+    SUMMARY.md and summary.json (see :func:`_reporter`).
     """
-    return (parse, generate, make_verify_stage())
+    return (parse, generate, make_verify_stage(), ReportStage())
+
+
+class Reporter(Protocol):
+    """A stage that sorts proxies into buckets (found by duck typing: see :func:`_reporter`)."""
+
+    def bucket_for(self, name: str) -> str | None: ...
+
+    def write_unsupported(
+        self,
+        out: Path,
+        name: str,
+        source: str,
+        cause: str,
+        *,
+        refused: bool,
+        bundle_dir: Path | None = None,
+        roots: Sequence[tuple[Path, str]] = (),
+    ) -> Path: ...
+
+    def finish_batch(
+        self, out: Path, extra: Sequence[tuple[str, str]] = (), roots: Sequence[tuple[Path, str]] = ()
+    ) -> None: ...
+
+
+def _reporter(stages: Sequence[Stage]) -> Reporter | None:
+    """The first stage that sorts proxies into buckets (it has ``bucket_for``, ``write_unsupported`` and
+    ``finish_batch``), or None. Without one (custom stage lists), each proxy's folder stays ``<results>/<proxy>/``
+    and no summary is written."""
+    for stage in stages:
+        if all(callable(getattr(stage, attr, None)) for attr in ("bucket_for", "write_unsupported", "finish_batch")):
+            return stage  # type: ignore[return-value]
+    return None
 
 
 class Terminated(KeyboardInterrupt):
@@ -548,6 +592,9 @@ def _check_owned_entries(out: Path) -> None:
         layout.WORK_DIR_NAME: "a folder",
         layout.LOCK_NAME: "a plain file",
         layout.FORCE_PENDING_NAME: "a plain file",
+        layout.SUMMARY_MD_NAME: "a plain file",
+        layout.SUMMARY_JSON_NAME: "a plain file",
+        **{bucket: "a folder" for bucket in layout.BUCKET_DIR_NAMES},
     }
     for name, kind in expected.items():
         _check_entry_kind(out, out / name, name, folder=kind == "a folder")
@@ -582,15 +629,25 @@ def _check_done_markers(out: Path, names: Sequence[str]) -> None:
     for name in names:
         if unsafe_name_reason(name) is not None:
             continue
-        proxy_dir = out / name
-        try:
-            info = os.lstat(proxy_dir)
-            if not stat.S_ISDIR(info.st_mode) or safefs.is_link_like(info):
+        for proxy_dir in _proxy_dirs(out, name):
+            try:
+                info = os.lstat(proxy_dir)
+                if not stat.S_ISDIR(info.st_mode) or safefs.is_link_like(info):
+                    continue
+                marker = proxy_dir / layout.DONE_MARKER_NAME
+                shown = proxy_dir.relative_to(out).as_posix()
+                _check_entry_kind(out, marker, f"{shown}/{layout.DONE_MARKER_NAME}", folder=False)
+            except OSError:
                 continue
-            marker = proxy_dir / layout.DONE_MARKER_NAME
-            _check_entry_kind(out, marker, f"{name}/{layout.DONE_MARKER_NAME}", folder=False)
-        except OSError:
-            continue
+
+
+def _proxy_dirs(out: Path, name: str, *, flat: bool = True, buckets: bool = True) -> list[Path]:
+    """Every folder proxy ``name`` may have in ``out``: ``<out>/<name>`` (custom stage lists, and the working
+    folder of a reporting run) and ``<out>/<bucket>/<name>``. ``name`` must be a safe name."""
+    found = [layout.proxy_out_dir(out, name)] if flat else []
+    if buckets:
+        found += [layout.bucket_proxy_dir(out, bucket, name) for bucket in layout.BUCKET_DIR_NAMES]
+    return found
 
 
 def run_batch(plan: RunPlan, stages: Sequence[Stage] | None = None) -> BatchResult:
@@ -653,8 +710,11 @@ def _run_locked(plan: RunPlan, stages: Sequence[Stage]) -> BatchResult:
             options.mock_backends,
             options.max_fix_attempts,
         )
+        reporter = _reporter(stages)
         try:
-            _run_proxies(plan, stages, result, log)
+            unlisted = _run_proxies(plan, stages, result, log)
+            if reporter is not None:
+                reporter.finish_batch(out, unlisted, _roots(options))
         finally:
             _close_stages(stages)
             result.notices.extend(_stage_notices(stages))
@@ -692,11 +752,24 @@ def _stage_notices(stages: Sequence[Stage]) -> list[str]:
     return found
 
 
-def _run_proxies(plan: RunPlan, stages: Sequence[Stage], result: BatchResult, log: logging.Logger) -> None:
+def _roots(options: RunOptions) -> list[tuple[Path, str]]:
+    """The absolute folders a report shows by label instead (the results, input and --golden folders)."""
+    roots = [(options.out_dir, "<results>"), (options.input_dir, "<exports>")]
+    if options.golden is not None:
+        roots.append((options.golden, "<golden>"))
+    return roots
+
+
+def _run_proxies(
+    plan: RunPlan, stages: Sequence[Stage], result: BatchResult, log: logging.Logger
+) -> list[tuple[str, str]]:
+    """Process every selected proxy; return the refused items a reporting run could give no folder (name, reason)."""
     options = plan.options
     out = options.out_dir
     current: str | None = None
     cleared = not options.force
+    reporter = _reporter(stages)
+    unlisted: list[tuple[str, str]] = []
     try:
         _log_discovery(plan)
         not_removed = _remove_stale_results_of_refused(plan)
@@ -710,8 +783,9 @@ def _run_proxies(plan: RunPlan, stages: Sequence[Stage], result: BatchResult, lo
                 result.crashed.append(source.name)
                 continue
             try:
-                already_done = options.resume and safefs.is_regular_file(
-                    out, layout.done_marker_path(out, source.name)
+                already_done = options.resume and any(
+                    safefs.is_regular_file(out, folder / layout.DONE_MARKER_NAME)
+                    for folder in _proxy_dirs(out, source.name)
                 )
             except (OSError, UnsafePathError) as exc:
                 log.error("failed %s: cannot check its earlier result: %s", source.name, exc)
@@ -726,8 +800,22 @@ def _run_proxies(plan: RunPlan, stages: Sequence[Stage], result: BatchResult, lo
         current = None
         selected_names = {source.name for source in plan.selected}
         result.crashed.extend(sorted(not_cleared - selected_names))
+        processed = {collision_key(name) for name in selected_names}
         for item in plan.selected_rejected:
             (result.crashed if item.name in not_removed else result.refused).append(item.name)
+            if reporter is None or item.name in not_removed:
+                continue
+            if unsafe_name_reason(item.name) is not None or collision_key(item.name) in processed:
+                unlisted.append((item.name, item.reason))
+                continue
+            try:
+                reporter.write_unsupported(
+                    out, item.name, item.path.name, item.reason, refused=True, roots=_roots(options)
+                )
+            except (OSError, UnsafePathError) as exc:
+                log.error("could not write the report of refused %s: %s", item.name, exc)
+                unlisted.append((item.name, item.reason))
+        return unlisted
     except KeyboardInterrupt as exc:
         where = f" while processing {current}" if current is not None else ""
         advice = _advice(options, cleared=cleared)
@@ -786,7 +874,9 @@ def _remove_stale_results_of_refused(plan: RunPlan) -> set[str]:
         if unsafe_name_reason(name) is not None or collision_key(name) in processed:
             continue
         try:
-            removed = safefs.remove(out, layout.proxy_out_dir(out, name))
+            removed = False
+            for folder in _proxy_dirs(out, name):
+                removed = safefs.remove(out, folder) or removed
         except (OSError, UnsafePathError) as exc:
             log.error(
                 "failed %s: could not remove its earlier results, which no longer match its input: %s", name, exc
@@ -829,10 +919,11 @@ def _clear_done_markers_for_force(plan: RunPlan) -> set[str]:
     cleared = 0
     for name in names:
         try:
-            marker = layout.done_marker_path(out, name)
-            if safefs.is_regular_file(out, marker):
-                safefs.remove(out, marker)
-                cleared += 1
+            for folder in _proxy_dirs(out, name):
+                marker = folder / layout.DONE_MARKER_NAME
+                if safefs.is_regular_file(out, marker):
+                    safefs.remove(out, marker)
+                    cleared += 1
         except (OSError, UnsafePathError) as exc:
             log.error("failed %s: could not remove its earlier .done marker before redoing it (--force): %s", name, exc)
             not_cleared.add(name)
@@ -844,8 +935,14 @@ def _clear_done_markers_for_force(plan: RunPlan) -> set[str]:
 
 
 def _proxy_folder_names(out: Path) -> set[str]:
-    """Names of the entries directly in ``out`` that could be a proxy's folder."""
-    return {entry.name for entry in out.iterdir() if unsafe_name_reason(entry.name) is None}
+    """Names of the entries directly in ``out`` or in one of its bucket folders that could be a proxy's folder."""
+    names = {entry.name for entry in out.iterdir() if unsafe_name_reason(entry.name) is None}
+    for bucket in layout.BUCKET_DIR_NAMES:
+        folder = layout.bucket_dir(out, bucket)
+        if safefs.is_link(folder) or not folder.is_dir():
+            continue
+        names |= {entry.name for entry in folder.iterdir() if unsafe_name_reason(entry.name) is None}
+    return names
 
 
 def _read_shared_flows(plan: RunPlan) -> tuple[Bundle, ...]:
@@ -901,12 +998,16 @@ def _process(
     log = get_logger()
     out = options.out_dir
     work_dir: Path | None = None
+    bundle_dir: Path | None = None
+    reporter = _reporter(stages)
     log.info("processing %s", source.name)
     current = "prepare"
     try:
         proxy_dir = layout.proxy_out_dir(out, source.name)
         work_dir = layout.proxy_work_dir(out, source.name)
-        safefs.remove(out, proxy_dir)  # first, so a refused bundle leaves no stale .done
+        # First, so a refused bundle leaves no stale .done, and the proxy never has two folders.
+        for folder in _proxy_dirs(out, source.name):
+            safefs.remove(out, folder)
         safefs.remove(out, work_dir)
         safefs.make_dirs(out, work_dir)
         _materialize(source, work_dir)
@@ -926,10 +1027,15 @@ def _process(
             stage(context)
             log.info("%s: stage %s finished", source.name, current)
         current = "finish"
-        _write_done_marker(out, source.name)
+        if reporter is None:
+            _write_done_marker(out, source.name)
+        else:
+            _place(out, source.name, proxy_dir, reporter)
     except BundleError as exc:
         log.error("refused %s (%s): %s", source.name, source.path.name, exc)
         result.refused.append(source.name)
+        if reporter is not None:
+            _report_unsupported(reporter, options, source, str(exc), refused=True, bundle_dir=bundle_dir)
     except Exception as exc:  # proxy boundary: one proxy failing never stops the batch
         # The entry names the error on its own line too, so grepping run.log finds it without the traceback.
         log.exception(
@@ -940,6 +1046,9 @@ def _process(
             exc,  # noqa: TRY401
         )
         result.crashed.append(source.name)
+        if reporter is not None:
+            cause = f"stage {current} failed: {type(exc).__name__}: {exc}"
+            _report_unsupported(reporter, options, source, cause, refused=False, bundle_dir=bundle_dir)
     else:
         log.info("done %s", source.name)
         result.finished.append(source.name)
@@ -949,6 +1058,43 @@ def _process(
                 safefs.remove(out, work_dir)
         except (OSError, UnsafePathError) as exc:
             log.warning("could not remove unpacked copy of %s at %s: %s", source.name, work_dir, exc)
+
+
+def _place(out: Path, name: str, proxy_dir: Path, reporter: Reporter) -> None:
+    """Move the finished proxy's folder into the bucket the reporter chose, then write its ``.done`` there last."""
+    bucket = reporter.bucket_for(name)
+    if bucket not in layout.BUCKET_DIR_NAMES:
+        raise RuntimeError(f"the report stage chose no bucket for {name}")
+    final = layout.bucket_proxy_dir(out, bucket, name)
+    safefs.make_dirs(out, final.parent)
+    safefs.remove(out, final)
+    safefs.move(out, proxy_dir, final)
+    safefs.write_text_atomic(out, final / layout.DONE_MARKER_NAME, f"a2m finished {name}\n")
+    get_logger().info("%s: results in %s/%s/", name, bucket, name)
+
+
+def _report_unsupported(
+    reporter: Reporter,
+    options: RunOptions,
+    source: BundleSource,
+    cause: str,
+    *,
+    refused: bool,
+    bundle_dir: Path | None,
+) -> None:
+    """Replace whatever the proxy has in the results folder with ``unsupported/<proxy>/REPORT.md`` naming
+    ``cause``; a failure to do so is logged, never raised (the proxy is already counted as refused or failed)."""
+    out = options.out_dir
+    log = get_logger()
+    try:
+        for folder in _proxy_dirs(out, source.name):
+            safefs.remove(out, folder)
+        reporter.write_unsupported(
+            out, source.name, source.path.name, cause, refused=refused, bundle_dir=bundle_dir, roots=_roots(options)
+        )
+        log.info("%s: results in %s/%s/", source.name, layout.UNSUPPORTED_DIR_NAME, source.name)
+    except (OSError, UnsafePathError) as exc:
+        log.error("could not write the unsupported report of %s: %s", source.name, exc)
 
 
 def _materialize(source: BundleSource, work_dir: Path) -> None:

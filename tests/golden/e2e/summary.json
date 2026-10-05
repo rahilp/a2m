@@ -1,0 +1,117 @@
+{
+  "buckets": {
+    "needs-review": 5,
+    "unsupported": 1,
+    "verified": 0
+  },
+  "policy_types": {
+    "AssignMessage": 3,
+    "BasicAuthentication": 1,
+    "ExtractVariables": 1,
+    "FlowCallout": 1,
+    "Javascript": 1,
+    "KeyValueMapOperations": 1,
+    "OAuthV2": 1,
+    "RaiseFault": 1,
+    "SpikeArrest": 1,
+    "VerifyAPIKey": 2
+  },
+  "proxies": [
+    {
+      "bucket": "needs-review",
+      "name": "Test-API",
+      "policy_types": {
+        "FlowCallout": 1,
+        "KeyValueMapOperations": 1
+      },
+      "report": "needs-review/Test-API/REPORT.md",
+      "rows": {
+        "condition": 0,
+        "policy": 2,
+        "step": 2
+      },
+      "verification_type": "static"
+    },
+    {
+      "bucket": "unsupported",
+      "name": "broken-proxy",
+      "policy_types": {},
+      "report": "unsupported/broken-proxy/REPORT.md",
+      "rows": null,
+      "verification_type": null
+    },
+    {
+      "bucket": "needs-review",
+      "name": "catalog-api",
+      "policy_types": {
+        "AssignMessage": 1,
+        "VerifyAPIKey": 1
+      },
+      "report": "needs-review/catalog-api/REPORT.md",
+      "rows": {
+        "condition": 0,
+        "policy": 2,
+        "step": 2
+      },
+      "verification_type": "static"
+    },
+    {
+      "bucket": "needs-review",
+      "name": "js-transform",
+      "policy_types": {
+        "AssignMessage": 1,
+        "Javascript": 1
+      },
+      "report": "needs-review/js-transform/REPORT.md",
+      "rows": {
+        "condition": 1,
+        "policy": 2,
+        "step": 2
+      },
+      "verification_type": "static"
+    },
+    {
+      "bucket": "needs-review",
+      "name": "legacy-auth",
+      "policy_types": {
+        "BasicAuthentication": 1,
+        "OAuthV2": 1
+      },
+      "report": "needs-review/legacy-auth/REPORT.md",
+      "rows": {
+        "condition": 1,
+        "policy": 2,
+        "step": 2
+      },
+      "verification_type": "static"
+    },
+    {
+      "bucket": "needs-review",
+      "name": "weather-api",
+      "policy_types": {
+        "AssignMessage": 1,
+        "ExtractVariables": 1,
+        "RaiseFault": 1,
+        "SpikeArrest": 1,
+        "VerifyAPIKey": 1
+      },
+      "report": "needs-review/weather-api/REPORT.md",
+      "rows": {
+        "condition": 2,
+        "policy": 5,
+        "step": 5
+      },
+      "verification_type": "static"
+    }
+  ],
+  "run": {
+    "a2m_version": "0.1.0",
+    "finished": "<timestamp>"
+  },
+  "verification_types": {
+    "battery": 0,
+    "failed": 0,
+    "golden": 0,
+    "static": 5
+  }
+}

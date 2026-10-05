@@ -38,6 +38,11 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE
 ```
 
+## tests/fixtures/e2e/input/Test-API/ and tests/fixtures/e2e/input/GetSharedFlow/
+
+Unchanged copies of `azure/Test-API/` and `azure/GetSharedFlow/` above (same source, commit and MIT licence),
+used by the CP9 end-to-end fixture run.
+
 ## Everything else
 
 All other bundles under `tests/fixtures/apigee/` (orders-api, audit-flow,

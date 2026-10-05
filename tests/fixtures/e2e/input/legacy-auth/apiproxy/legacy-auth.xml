@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="1" name="legacy-auth">
+    <DisplayName>legacy-auth</DisplayName>
+    <Description>a2m CP9 end-to-end fixture</Description>
+    <Policies>
+        <Policy>BA-Decode</Policy>
+        <Policy>OA-Verify</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>default</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>

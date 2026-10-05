@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ProxyEndpoint name="default">
+    <PreFlow name="PreFlow">
+        <Request>
+            <Step>
+                <Name>CT-Custom</Name>
+            </Step>
+            <Step>
+                <Name>Missing-Policy</Name>
+            </Step>
+            <Step>
+                <Name>AM-Form</Name>
+                <Condition>request.formparam.a =| "x"</Condition>
+            </Step>
+            <Step>
+                <Name>AM-Verb</Name>
+                <Condition>request.verb JavaRegex "^(GET|HEAD)$"</Condition>
+            </Step>
+        </Request>
+        <Response/>
+    </PreFlow>
+    <Flows/>
+    <PostFlow name="PostFlow">
+        <Request/>
+        <Response/>
+    </PostFlow>
+    <HTTPProxyConnection>
+        <BasePath>/kitchen-missing</BasePath>
+        <VirtualHost>default</VirtualHost>
+    </HTTPProxyConnection>
+    <RouteRule name="default">
+        <TargetEndpoint>default</TargetEndpoint>
+    </RouteRule>
+</ProxyEndpoint>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="1" name="js-transform">
+    <DisplayName>js-transform</DisplayName>
+    <Description>a2m CP9 end-to-end fixture</Description>
+    <Policies>
+        <Policy>AM-Stamp</Policy>
+        <Policy>JS-Reshape</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>default</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>
