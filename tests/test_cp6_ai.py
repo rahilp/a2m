@@ -148,6 +148,30 @@ def with_changes(name: str, **changes: Any) -> str:
     return json.dumps(data)
 
 
+def shown_condition(text: str) -> str:
+    """CP10: a condition as a2m shows it to the AI in a request of its own (every value a placeholder)."""
+    from a2m.ai.placeholders import Placeholders
+
+    return Placeholders().condition(text)
+
+
+def shown_code(text: str, kind: str) -> str:
+    """CP10: custom code (``kind``: javascript, python or java) as a2m shows it to the AI in a request of its own."""
+    from a2m.ai.placeholders import Placeholders
+    from a2m.ai.provider import ItemKind
+
+    return Placeholders().code(text, ItemKind(kind))
+
+
+def shown_codes(kind: str, *texts: str) -> list[str]:
+    """CP10: custom code and its included scripts, in that order, as a2m shows them to the AI in one request."""
+    from a2m.ai.placeholders import Placeholders
+    from a2m.ai.provider import ItemKind
+
+    table = Placeholders()
+    return [table.code(text, ItemKind(kind)) for text in texts]
+
+
 class FakeLLM:
     """A provider that answers from canned text, keyed by condition text or step name, and records every request."""
 
@@ -158,7 +182,13 @@ class FakeLLM:
 
     def key(self, request: Any) -> str:
         original = str(request.original)
-        return original if original in self.answers or original in self.errors else str(request.name)
+        if original in self.answers or original in self.errors:
+            return original
+        # CP10: the request carries the condition as the AI is shown it (every value a placeholder).
+        for known in (*self.answers, *self.errors):
+            if original == shown_condition(known):
+                return known
+        return str(request.name)
 
     def complete(self, request: Any) -> str:
         self.requests.append(request)
@@ -379,7 +409,7 @@ def test_CP6_T03_untranslatable_condition_sent_to_ai_and_answer_used(tmp_path: P
     orders = condition_record(m.result, "get-orders")
     assert orders.method == "template"
     assert expression_body(when_holding(m, "AM-Orders").get("expression")) == unparen(str(cp5_get_orders.dw))
-    assert [str(r.original) for r in llm.requests] == [ODD]
+    assert [str(r.original) for r in llm.requests] == [shown_condition(ODD)]
 
 
 def test_CP6_T04_java_callout_goes_to_ai_only_with_java_source(tmp_path: Path) -> None:
@@ -394,7 +424,7 @@ def test_CP6_T04_java_callout_goes_to_ai_only_with_java_source(tmp_path: Path) -
     assert sign.confidence == "low"
     prompts = llm.prompts("JC-Sign")
     assert len(prompts) == 1
-    assert SIGN_JAVA in prompts[0]
+    assert shown_code(SIGN_JAVA, "java") in prompts[0]
 
     legacy = step_record(jar_only.result, "JC-Legacy")
     assert legacy.method == "skipped"
@@ -525,7 +555,7 @@ def test_CP6_T09_prompt_has_code_place_in_flow_and_mule_examples(tmp_path: Path,
 
     prompt = prompt_for(tmp_path, case)
 
-    assert original in prompt
+    assert (shown_condition(original) if case == "condition" else shown_code(original, case)) in prompt
     assert bundle in prompt
     assert "default" in prompt
     assert flow in prompt
@@ -556,7 +586,7 @@ def test_CP6_T10_code_with_braces_and_percent_signs_sent_exactly(tmp_path: Path)
 
     prompts = llm.prompts("JS-AddCorrelation")
     assert len(prompts) == 1
-    assert TRICKY_JS in prompts[0]
+    assert shown_code(TRICKY_JS, "javascript") in prompts[0]
     assert "{{{{b}}}}" not in prompts[0] and "{{request.header.x}}" not in prompts[0]
 
 
@@ -1176,7 +1206,7 @@ def test_CP6_T20_claude_provider_sends_prompt_and_reads_answer(
     sent = calls.creates[0]
     assert sent.get("model") == "claude-test-model"
     text = message_text(sent)
-    assert JS_SOURCE in text
+    assert shown_code(JS_SOURCE, "javascript") in text
     assert js_wording in text
     elements = mule_xml_of(results, "js-callout")
     assert len([el for el in elements if el.get(DOC_NAME) == "JS-AddCorrelation"]) == 1
@@ -2224,7 +2254,7 @@ def test_CP6_T43_callout_whose_included_script_reads_a_changed_value_needs_revie
     rec = step_record(m.result, "JS-AddCorrelation")
     assert (rec.method, rec.confidence) == ("ai", "high")
     (prompt,) = llm.prompts("JS-AddCorrelation")
-    assert helper in prompt
+    assert shown_codes("javascript", MAIN_CALLS_HELPER, helper)[1] in prompt
     assert rec.needs_review is flagged
     if flagged:
         assert "AM-Tier" in why(rec), why(rec)

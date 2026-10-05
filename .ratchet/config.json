@@ -55,5 +55,86 @@
     ]
   },
   "max_adversarial_rounds": 12,
-  "max_adversarial_rounds_run": 100
+  "max_adversarial_rounds_run": 100,
+  "blocking_severities": {
+    "high": [
+      "blocker",
+      "major"
+    ]
+  },
+  "checks": [
+    {
+      "kind": "secret-sent-to-ai-provider",
+      "command": ".venv/bin/python tools/checks/credential_canary.py a2m",
+      "title": "Guardrail: Credential canary check",
+      "template": ".venv/bin/python tools/checks/credential_canary.py {target}",
+      "target": "a2m",
+      "bad_example": "tests/fixtures/guardrails/credential-leak",
+      "why": "Literal credentials from Apigee bundles, test traffic or golden recordings reached run.log, diffs, verification.json or the AI provider unmasked, and harmless look-alike values were masked instead.",
+      "test_command": "env -u FORCE_COLOR .venv/bin/python -m pytest -q --color=no tests/test_guardrail_credentials.py",
+      "test_files": [
+        "tests/test_guardrail_credentials.py"
+      ],
+      "high_risk": true,
+      "variants_dir": "tests/fixtures/guardrails/credential-variants",
+      "cases": [
+        {
+          "cp": "CP10",
+          "round": 16,
+          "file": "a2m/ai/placeholders.py",
+          "tree": "a55b1aa2cf22fd39be276e6f7ed1ffe04b8a1b75"
+        },
+        {
+          "cp": "CP10",
+          "round": 15,
+          "file": "a2m/verify/fix_loop.py",
+          "tree": "2358b0fbfb8d6025ef2ea880f007e118303086cc"
+        },
+        {
+          "cp": "CP10",
+          "round": 13,
+          "file": "a2m/verify/fix_loop.py",
+          "tree": "8647b05368d201db317558862093bc3dd1dbd604"
+        },
+        {
+          "cp": "CP10",
+          "round": 3,
+          "file": "a2m/ai/placeholders.py",
+          "tree": "777c6baeda789979edde5de0b6b2e65052f9ca27"
+        },
+        {
+          "cp": "CP10",
+          "round": 1,
+          "file": "tools/checks/credential_canary.py",
+          "tree": "31bc90af9ec21f85a14cdbbf93e69c3926505df9"
+        },
+        {
+          "cp": "CP8",
+          "round": 4,
+          "file": "a2m/verify/fix_loop.py",
+          "tree": "2aa9a5296e4b4c27beefd4cacbc26b092b4f1b8a"
+        },
+        {
+          "cp": "CP8",
+          "round": 3,
+          "file": "a2m/verify/masking.py",
+          "tree": "24c6a0e462b4e8e01e2228f6ce17f2aa4eec20c6"
+        },
+        {
+          "cp": "CP8",
+          "round": 2,
+          "file": "a2m/verify/fix_loop.py",
+          "tree": "1c40420e28c002c030bc65c43ef9d48744df408b"
+        },
+        {
+          "cp": "CP8",
+          "round": 1,
+          "file": "a2m/verify/fix_loop.py",
+          "tree": "def596b4c3a46a5d4aee5e0519ccf2170efba1be"
+        }
+      ],
+      "added": "2026-10-05",
+      "from": "a2m-python-cli-that-migrates-apigee-proxy-bundle/CP10"
+    }
+  ]
 }

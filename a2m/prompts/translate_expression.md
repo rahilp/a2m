@@ -21,6 +21,16 @@ the Mule `choice` router's `when expression="#[...]"` from it itself.
 
 Why a2m's translator refused it: {{refusal}}
 
+## Values shown as placeholders
+
+Every literal value of the condition above is shown as a placeholder; its
+variables and operators are shown as they are. A text placeholder such as
+`«v1»` stands for text: write it as the `VALUE` (`"value": "«v1»"`), and a2m
+puts the exact value back before it checks the tree. A number placeholder
+such as `«n2»` stands for a number: the condition compares with a number,
+which a2m does not translate, so decline it (a2m refuses any translation of a
+condition that holds one). A placeholder a2m did not show is refused.
+
 ## The condition tree
 
 Each node is one JSON object of one of these shapes:

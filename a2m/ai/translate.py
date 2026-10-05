@@ -56,6 +56,28 @@ A condition is a tree a2m checks and writes as DataWeave itself: every value
 it reads must be one a2m's own condition translator reads faithfully at that
 point, and it may not be a constant (see :mod:`a2m.ai.checks`).
 
+The AI never sees a literal value of the proxy. Each item gets a table of
+placeholders of its own (:class:`a2m.ai.placeholders.Placeholders`, default
+deny, as for the fix loop): every string literal, comment and regular
+expression of the custom code (and of its included scripts), every value of
+the policy XML (only names at the schema positions of names stay) and every
+value of a condition is shown as a placeholder such as ``«v1»`` (a number
+literal of the code or the condition as a number placeholder such as
+``«n2»``, so the AI sees it is a number); the code's
+structure, the condition's variables and operators, and the step, flow and
+proxy names stay visible. a2m's refusal reason is swept with the same table.
+A condition that compares with a number (one shown as a number placeholder)
+is never translated, as a2m's own translator never translates one: every
+answer would be refused, whatever it did with the number, so it is not sent
+to the AI at all.
+In the answer, each placeholder is written back before any check runs: in the
+Mule code, spelled and escaped for where it stands (an attribute, element
+text, a DataWeave string literal); in a condition tree's values and declared
+writes, as the exact value; in a legacy DataWeave condition, spelled for its
+string literal. An unknown placeholder, or one that cannot stand where it was
+written, makes the answer unusable. The AI's notes and reasons are kept as it
+wrote them, placeholders and all.
+
 A provider error (any exception from ``complete``) affects only that item.
 Identical prompts are asked once per translator.
 """
@@ -66,7 +88,7 @@ import copy
 import json
 import re
 import xml.etree.ElementTree as ET
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -74,6 +96,7 @@ from defusedxml import ElementTree as SafeET
 
 from a2m.ai import checks
 from a2m.ai.checks import DeclaredWrites
+from a2m.ai.placeholders import PlaceholderError, Placeholders
 from a2m.ai.prompts import load_prompts, render
 from a2m.ai.provider import AiRequest, Confidence, ItemKind, Provider
 from a2m.ai.sources import CalloutSource
@@ -180,6 +203,8 @@ FENCE = re.compile(r"```(?:json)?[ \t]*\n(.*?)\n?```", re.DOTALL)
 NOT_USABLE = "the AI answer could not be used"
 MAX_REASON_CHARS = 500
 NONE = "none"
+# Shown in place of a policy configuration that cannot be read as XML (then none of it may be shown).
+POLICY_NOT_SHOWN = "(not shown: a2m could not read it as XML)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,12 +245,14 @@ class NotTranslated:
     ``confidence`` is LOW for an answer that could not be used, None when the
     AI declined or gave no answer. ``proposal`` is a usable condition the AI was
     not confident in (low confidence), shown to the reviewer but not used.
+    ``sent`` is False when a2m refused the item without asking the AI.
     """
 
     reason: str
     notes: str = ""
     confidence: Confidence | None = None
     proposal: str | None = None
+    sent: bool = True
 
 
 class _Unusable(ValueError):
@@ -270,18 +297,23 @@ class Translator:
     ) -> CalloutTranslated | NotTranslated:
         """Translate the custom code of step ``step`` into Mule processors. ``changed`` lists the values earlier steps
         may have changed in Apigee in a way the generated app may not carry over."""
-        includes = "\n\n".join(f"{file}:\n{text}" for file, text in source.includes) or NONE
+        # The code first, so its placeholders are numbered as a table showing the code alone numbers them.
+        table = Placeholders()
+        code = table.code(source.original, source.kind)
+        includes = "\n\n".join(f"{file}:\n{table.code(text, source.kind)}" for file, text in source.includes) or NONE
+        table.learn_apigee(policy_xml)
+        shown_policy = table.apigee(policy_xml.strip())
         values = {
             **_place_values(place),
             "step": step,
             "policy_type": policy_type,
-            "policy_xml": policy_xml.strip(),
+            "policy_xml": shown_policy if shown_policy is not None else POLICY_NOT_SHOWN,
             "resource": source.file,
-            "original": source.original,
+            "original": code,
             "includes": includes,
             "changed": changed,
         }
-        answer = self._ask(source.kind, step, source.original, values)
+        answer = self._ask(source.kind, step, code, values)
         if isinstance(answer, _Failed):
             return NotTranslated(answer.reason)
         try:
@@ -289,7 +321,8 @@ class Translator:
             if data["status"] == DECLINED:
                 return _declined(data)
             confidence, notes = _confidence(data), _notes(data)
-            processors = parse_mule(_code(data, CALLOUT_FIELD), place.side)
+            mule = _restore(lambda: table.restore(step, _code(data, CALLOUT_FIELD)), "its Mule code")
+            processors = parse_mule(mule, place.side)
             builtins = checks.builtin_reads(processors)
             if builtins:
                 raise _Unusable(
@@ -300,7 +333,11 @@ class Translator:
             return _unusable(str(exc))
         if confidence is Confidence.LOW:
             return CalloutTranslated(confidence, notes, processors, None, "the AI's confidence is low")
-        model = checks.declared_writes(data.get(WRITES_FIELD), processors)
+        try:
+            writes = _restore(lambda: _restore_values(table, data.get(WRITES_FIELD)), "its writes")
+        except _Unusable as exc:
+            return _unusable(str(exc))
+        model = checks.declared_writes(writes, processors)
         if isinstance(model, str):
             return CalloutTranslated(confidence, notes, processors, None, model)
         return CalloutTranslated(confidence, notes, processors, model)
@@ -317,8 +354,21 @@ class Translator:
         """Translate the condition ``original`` of ``owner`` (e.g. ``Flow curl-clients``; ``name`` is its name),
         which a2m's own translator refused for ``refusal``, into a DataWeave expression read after ``changes`` (what
         earlier steps on the path may have changed)."""
-        values = {**_place_values(place), "owner": owner, "original": original, "refusal": refusal}
-        answer = self._ask(ItemKind.EXPRESSION, name, original, values)
+        table = Placeholders()
+        shown = table.condition(original)
+        numbers = table.numbers_in(shown)
+        if numbers:
+            # CP5's rule: a condition that compares with a number is not translated (an answer that drops the number,
+            # or compares it as text, would not be the same condition). Every answer would be refused, so the AI is
+            # not asked.
+            return NotTranslated(
+                f"the condition compares with a number ({', '.join(numbers)}), and comparing with a number is not "
+                "translated, since Apigee converts between numbers and text by its own rules; it was not sent to the "
+                "AI",
+                sent=False,
+            )
+        values = {**_place_values(place), "owner": owner, "original": shown, "refusal": table.sweep(refusal)}
+        answer = self._ask(ItemKind.EXPRESSION, name, shown, values)
         if isinstance(answer, _Failed):
             return NotTranslated(answer.reason)
         try:
@@ -326,7 +376,16 @@ class Translator:
             if data["status"] == DECLINED:
                 return _declined(data)
             confidence, notes = _confidence(data), _notes(data)
-            dataweave = _condition(data, place.side, changes)
+            restored = dict(data)
+            if EXPRESSION_FIELD in data:
+                restored[EXPRESSION_FIELD] = _restore(
+                    lambda: _restore_values(table, data[EXPRESSION_FIELD]), "its condition"
+                )
+            if isinstance(data.get(LEGACY_EXPRESSION_FIELD), str):
+                restored[LEGACY_EXPRESSION_FIELD] = _restore(
+                    lambda: table.restore_code(data[LEGACY_EXPRESSION_FIELD]), "its DataWeave"
+                )
+            dataweave = _condition(restored, place.side, changes)
         except _Unusable as exc:
             return _unusable(str(exc))
         if confidence is Confidence.LOW:
@@ -337,6 +396,29 @@ class Translator:
                 proposal=dataweave,
             )
         return ExpressionTranslated(confidence, notes, dataweave)
+
+
+def _restore(put_back: Callable[[], Any], what: str) -> Any:
+    """What ``put_back`` returns (part of the answer with its placeholders written back); :class:`_Unusable`, naming
+    ``what``, when a placeholder is unknown or cannot stand where the AI wrote it."""
+    try:
+        return put_back()
+    except PlaceholderError as exc:
+        raise _Unusable(f"{what} {exc}") from None
+    except RecursionError:
+        raise _Unusable(f"{what} is nested too deeply to put its placeholders back") from None
+
+
+def _restore_values(table: Placeholders, value: Any) -> Any:
+    """``value`` (JSON data of the answer: a condition tree, declared writes) with every placeholder in its strings
+    replaced by the exact value it stands for; keys are left as they are."""
+    if isinstance(value, str):
+        return table.restore_plain(value)
+    if isinstance(value, list):
+        return [_restore_values(table, item) for item in value]
+    if isinstance(value, dict):
+        return {key: _restore_values(table, item) for key, item in value.items()}
+    return value
 
 
 def _text_of(exc: BaseException) -> str:

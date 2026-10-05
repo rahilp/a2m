@@ -44,8 +44,9 @@ The AI never sees a literal value of the proxy. Every request is built from
 placeholdered material only (:mod:`a2m.verify.placeholders`, default deny):
 every literal value in the policies, the custom code, the Mule files and the
 diffs (element text, attribute values, every string literal of code,
-expressions and conditions in any position, URL parts and query items, quoted
-diff values) is replaced by a placeholder such as ``«v3»``, the same value by
+expressions and conditions in any position, URL parts and query items, every
+value, number and JSON field path segment of a diff) is replaced by a placeholder
+such as ``«v3»`` (a number by ``«n3»``), the same value by
 the same placeholder for the whole loop. Only a closed list stays visible:
 element and attribute names, the names the Apigee XML declares at the schema
 positions of names (never in a payload or other data), known names in a
@@ -54,7 +55,28 @@ the IR, and the names of the Mule files as a2m generated them, learned before
 the first request; a string literal or other value equal to a known name is
 still a placeholder), unquoted identifiers and selectors, object keys, numbers, booleans, HTTP methods, MIME types, query parameter
 names and code structure (in data, numbers and booleans are placeholders too).
-The previous attempt's reason is swept the same way.
+In a diff only a2m's own words, status codes and counts (a2m's expectations),
+``null``, HTTP methods, header names, query parameter names as a URL shows
+them, and JSON keys that are known names or plain words of letters stay.
+Nothing a2m restored goes back to the AI: the previous attempt's reason (a refusal
+that quotes the restored fix, a build or deploy error that quotes the restored
+code) is taken whole, before it is cut short and before the masker changes it (a
+partly masked credential, ``Bearer abcd*** (16 chars):tail``, is no spelling of
+its value), and every value the table knows is
+replaced by its placeholder in every spelling a2m knows of it (as it is,
+XML-escaped, spelled for a DataWeave, JSON, JavaScript, Java or Python string,
+repr-quoted, URL-encoded, and each spelling a2m saw in the source or wrote back
+into an answer; :meth:`~a2m.ai.placeholders.Placeholders.sweep`). When the
+letters and digits of a value could still be read in what is left
+(:meth:`~a2m.ai.placeholders.Placeholders.holds_value`), or the masker still finds a
+credential there (it would show its first characters, and the rest after the first
+character a token cannot hold), the AI gets a2m's own words for what happened
+instead, never the rest of that reason. Both are asked of the reason without the
+names a2m shows the AI anyway (the proxy's name, which every build and deploy
+error starts with, and every known name), so a value whose letters stand only
+inside such a name (a base path ``/orders`` in ``orders-api``) does not hide
+why the build or deploy failed. The reason is swept with its blanks as they are
+and again with them collapsed, before either check.
 Then every text field of the :class:`~a2m.ai.provider.AiRequest` goes through
 the proxy's :class:`~a2m.verify.masking.Masker` (outside the placeholders) as
 the last step before the provider gets it. In an answer, each placeholder is
@@ -119,6 +141,14 @@ from defusedxml import ElementTree as SafeET
 
 from a2m import layout, redaction, safefs
 from a2m.ai import checks
+from a2m.ai.placeholders import (
+    DATAWEAVE,
+    TOKEN_SPLIT,
+    PlaceholderError,
+    Placeholders,
+    code_shape,
+    expression_end,
+)
 from a2m.ai.prompts import FIX_PROMPT_FILE, PromptError, load_prompt, render
 from a2m.ai.provider import AiRequest, Confidence, ItemKind, Provider, ProviderLimitError
 from a2m.ai.sources import callout_source
@@ -133,14 +163,6 @@ from a2m.verify.generated import GeneratedSteps
 from a2m.verify.masking import Masker
 from a2m.verify.mock_backend import MockBackend
 from a2m.verify.model import CaseResult, ReviewFlag, Runner, VerificationResult, VerificationType
-from a2m.verify.placeholders import (
-    DATAWEAVE,
-    TOKEN_SPLIT,
-    PlaceholderError,
-    Placeholders,
-    _expression_end,
-    code_shape,
-)
 
 if TYPE_CHECKING:
     from a2m.verify.harness import VerifyConfig
@@ -159,6 +181,11 @@ MAX_DIFF_CHARS = 20_000
 MAX_REASON_CHARS = 500
 PASSED_TYPES = (VerificationType.BATTERY, VerificationType.GOLDEN)
 CONFIDENCES = frozenset(c.value for c in Confidence)
+# What the AI is told in place of the rest of a reason that may quote a value of the proxy a2m cannot hide.
+WITHHELD = (
+    "a2m does not repeat the rest of the reason here: it quotes a value of the proxy (from the fix as a2m wrote it "
+    "back, or from the build or Mule) in a form a2m cannot replace with a placeholder"
+)
 # What every masked value shows (a2m.verify.masking.masked and a2m.redaction.MASK both hold it).
 MASK_MARK = redaction.MASK
 # A value a2m masked: an optional prefix, then "*** (N chars)" (a2m.verify.masking.masked).
@@ -249,19 +276,21 @@ def run_with_fixes(
     failing test (it passed, or was only built: static, or the app did not build or start).
     """
     # Imported here: the harness's engine stage runs this loop, so the harness imports this module.
-    from a2m.verify.harness import verify_proxy
+    from a2m.verify.harness import verify_proxy_unmasked
 
     masker = masker or Masker.for_bundle(bundle)
 
     def verify() -> VerificationResult:
-        return verify_proxy(
+        # Unmasked: what the AI is told is built from it (swept, then masked); all the loop records or returns is
+        # masked, as verify_proxy's result is.
+        return verify_proxy_unmasked(
             bundle, app_dir, runner=runner, backend=backend, golden=golden, config=config, generated=generated,
             masker=masker,
         )
 
     first = verify()
     if provider is None or max_fix_attempts <= 0 or first.type is not VerificationType.FAILED or first.failed <= 0:
-        return FixLoopResult(first, ())
+        return FixLoopResult(masker.mask_result(first), ())
     steps = generated if generated is not None else GeneratedSteps.planned(bundle)
     with masker.active(), masker.logging():
         return _FixLoop(bundle, app_dir, provider, max_fix_attempts, masker, verify, steps).run(first)
@@ -307,6 +336,8 @@ class _FixLoop:
         verify: Callable[[], VerificationResult],
         generated: GeneratedSteps,
     ) -> None:
+        # ``verify`` returns the result unmasked (a2m.verify.harness.verify_proxy_unmasked): what the AI is told is
+        # built from its text before any mask changes a value there; whatever is recorded is masked.
         self.bundle = bundle
         self.app_dir = app_dir
         self.provider = provider
@@ -327,6 +358,8 @@ class _FixLoop:
         self.table = Placeholders()
         # Whether the table knows the proxy's names yet (learned before the first request is built).
         self._named = False
+        # Each attempt's reason as the next request tells the AI (by attempt number; see :meth:`_for_ai`).
+        self._ai_reasons: dict[int, str] = {}
 
     def run(self, first: VerificationResult) -> FixLoopResult:
         self.generated = self._generated_files()
@@ -374,7 +407,8 @@ class _FixLoop:
             if not_run is not None:
                 message += f"; the AI fix loop stopped: {not_run}"
         flags = self._review_flags(attempts, best)
-        result = replace(best, message=self.masker.mask(message), review_flags=(*best.review_flags, *flags))
+        # Every verification result of the loop is unmasked (see run_with_fixes): masked here, as verify_proxy does.
+        result = self.masker.mask_result(replace(best, message=message, review_flags=(*best.review_flags, *flags)))
         return FixLoopResult(result, tuple(attempts))
 
     def _attempt(
@@ -389,7 +423,7 @@ class _FixLoop:
         """One fix request: the attempt, the new best result when it is kept, and whether the loop must stop."""
 
         def failed(reason: str, *, stop: bool = False) -> tuple[FixAttempt, None, bool]:
-            return FixAttempt(number, (), "", before, before, False, self._short(reason)), None, stop
+            return FixAttempt(number, (), "", before, before, False, self._reason(number, reason)), None, stop
 
         request = self._request(number, best, template, previous)
         try:
@@ -423,7 +457,8 @@ class _FixLoop:
                 else f"failing tests on a re-run: {failing}"
             )
             reason = f"the AI changed nothing, so it did not help ({rerun}){notes}"
-            return FixAttempt(number, (), "", before, failing, False, self._short(reason), (), confidence), None, False
+            unchanged = FixAttempt(number, (), "", before, failing, False, self._reason(number, reason), (), confidence)
+            return unchanged, None, False
         problem = self._apply(changed)
         if problem is not None:
             return failed(f"the fix could not be written, nothing was kept: {problem}")
@@ -440,7 +475,7 @@ class _FixLoop:
 
         def attempt(after_count: int, helped: bool, reason: str) -> FixAttempt:
             return FixAttempt(
-                number, names, diff, before, after_count, helped, self._short(reason), steps, confidence
+                number, names, diff, before, after_count, helped, self._reason(number, reason), steps, confidence
             )
 
         if after.type in PASSED_TYPES:
@@ -517,7 +552,7 @@ class _FixLoop:
             "mule": mule,
             "diff": diff,
             "ai_steps": _ai_steps_text(self.ai_steps),
-            "previous": table.sweep(_previous_text(previous)),
+            "previous": self._previous(previous),
         }
         return AiRequest(ItemKind.FIX, self.bundle.name, original, render(template, values))
 
@@ -625,6 +660,49 @@ class _FixLoop:
         text = self.masker.mask(" ".join(text.split()))
         return text if len(text) <= MAX_REASON_CHARS else text[:MAX_REASON_CHARS] + "..."
 
+    def _reason(self, number: int, text: str) -> str:
+        """Attempt ``number``'s reason ``text`` as recorded (:meth:`_short`); what the next request tells the AI is
+        kept apart (:meth:`_for_ai`), built from the whole text."""
+        self._ai_reasons[number] = self._for_ai(text)
+        return self._short(text)
+
+    def _for_ai(self, text: str) -> str:
+        """``text`` (a reason, which may quote the restored fix or a build or deploy error about it) as the AI may
+        be told it: whole (before any cut, so no value is cut where the sweep cannot recognise it) and unmasked (the
+        loop's verification results are unmasked, so a value the masker would change is still whole), every value
+        the table knows replaced by its placeholder in every spelling (:meth:`Placeholders.sweep`); a2m's own opening
+        words and :data:`WITHHELD` when a value could still be read in it (:meth:`Placeholders.holds_value`) or the
+        masker still finds a credential in it (:func:`_masks_credential`); then masked outside the placeholders and
+        cut short. The text is swept as it is, blanks included (a value with two blanks or a tab in it is found
+        there), and swept again once its blanks are collapsed (a value with one blank where the text has two); both
+        are checked, and only then is it shown with its blanks collapsed."""
+        raw = self.table.sweep(text)
+        swept = self.table.sweep(" ".join(raw.split()))
+        if self._unsafe(raw) or self._unsafe(swept):
+            swept = _withheld(swept, self._unsafe)
+        swept = _mask_around_placeholders(swept, self.masker)
+        return swept if len(swept) <= MAX_REASON_CHARS else swept[:MAX_REASON_CHARS] + "..."
+
+    def _unsafe(self, text: str) -> bool:
+        """Whether ``text`` (swept) may not be shown to the AI: a value of the table could still be read in it, or the
+        masker would mask a credential in it (the masked form keeps the first characters, and a token is masked only
+        up to the first character a token cannot hold). Both are asked of the text without the names a2m shows the AI
+        anyway (:meth:`Placeholders.without_names`: the proxy's name, which every build and deploy error starts with,
+        and every known name), so a value whose letters only stand inside such a name (the base path ``/orders`` in
+        ``orders-api``) does not withhold the reason; a value anywhere else still does."""
+        return self.table.holds_unshown_value(text) or _masks_credential(self.table.without_names(text), self.masker)
+
+    def _previous(self, previous: FixAttempt | None) -> str:
+        """What came of the previous attempt, as the AI is told it: its reason as :meth:`_for_ai` made it, swept
+        once more with every value the table knows now; a2m's own words alone when a value could still be read."""
+        if previous is None:
+            return _previous_text(None)
+        reason = self._ai_reasons.get(previous.number, WITHHELD)
+        text = self.table.sweep(_previous_text(previous, reason))
+        if self._unsafe(text):
+            return _previous_text(previous, WITHHELD)
+        return text
+
 
 def _failing(result: VerificationResult, total: int) -> int:
     """The failing tests of ``result`` out of ``total`` (the tests of the first run); a test that did not run fails."""
@@ -666,11 +744,30 @@ def _ai_steps_text(ai_steps: frozenset[str]) -> str:
     return "\n".join(f"- {name}" for name in sorted(ai_steps))
 
 
-def _previous_text(previous: FixAttempt | None) -> str:
+def _previous_text(previous: FixAttempt | None, reason: str = "") -> str:
     if previous is None:
         return "none: this is the first attempt"
     outcome = "kept" if previous.helped else "not kept"
-    return f"Attempt {previous.number} was {outcome}: {previous.reason}"
+    return f"Attempt {previous.number} was {outcome}: {reason}"
+
+
+# Where a2m's own opening words of a reason end: every reason starts with them, and anything quoted comes after.
+_OPENING_END = re.compile(r"[:(]")
+
+
+def _withheld(text: str, unsafe: Callable[[str], bool]) -> str:
+    """A swept reason ``text`` that may still hold a value: its opening words (a2m's own, up to the first ":" or
+    "("; left out too when ``unsafe`` says they may hold one) and :data:`WITHHELD`."""
+    opening = _OPENING_END.split(text, maxsplit=1)[0].strip()
+    if not opening or unsafe(opening):
+        return WITHHELD
+    return f"{opening}: {WITHHELD}"
+
+
+def _masks_credential(text: str, masker: Masker) -> bool:
+    """Whether ``masker`` masks a credential in ``text`` (outside its placeholders): masking makes a masked value
+    (``abcd*** (12 chars)``) the text did not hold."""
+    return len(MASKED_VALUE.findall(_mask_around_placeholders(text, masker))) > len(MASKED_VALUE.findall(text))
 
 
 
@@ -704,6 +801,8 @@ def _learn_names(table: Placeholders, bundle: Bundle, steps: Mapping[str, str], 
             *(flow.name for endpoint in endpoints for flow in endpoint.flows),
         )
     )
+    # The proxy's name (the app's name too) is in the prompt and starts every build and deploy error.
+    table.mention((bundle.name,))
     for raw_xml in (*(policy.raw_xml for policy in bundle.policies), *(endpoint.raw_xml for endpoint in endpoints)):
         table.learn_apigee(raw_xml)
     table.learn_mule(generated.values())
@@ -883,7 +982,7 @@ def _expression_shape(value: str) -> str:
     text around it, or an end a2m cannot find for sure) ``#[exact:`` and the value as written. Both start with ``#[``,
     so neither can equal a value that is left as it is."""
     stripped = value.strip()
-    if _expression_end(stripped, len(EXPRESSION_START)) == len(stripped) - 1:
+    if expression_end(stripped, len(EXPRESSION_START)) == len(stripped) - 1:
         lead = value[: len(value) - len(value.lstrip())]
         trail = value[len(value.rstrip()) :]
         body = stripped[len(EXPRESSION_START) : -1]

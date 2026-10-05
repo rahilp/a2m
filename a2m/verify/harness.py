@@ -236,9 +236,34 @@ def verify_proxy(
     and every run.log line written meanwhile.
     """
     masker = masker or Masker.for_bundle(bundle)
+    return masker.mask_result(
+        verify_proxy_unmasked(
+            bundle, app_dir, runner=runner, backend=backend, golden=golden, config=config, generated=generated,
+            masker=masker,
+        )
+    )
+
+
+def verify_proxy_unmasked(
+    bundle: Bundle,
+    app_dir: Path,
+    *,
+    runner: Runner,
+    masker: Masker,
+    backend: MockBackend | None = None,
+    golden: Path | None = None,
+    config: VerifyConfig | None = None,
+    generated: GeneratedSteps | None = None,
+) -> VerificationResult:
+    """:func:`verify_proxy`'s result before ``masker`` masks its texts (the test diffs are masked all the same, before
+    a long value is cut; run.log lines are masked as they are written).
+
+    Only for the AI fix loop (:func:`a2m.verify.fix_loop.run_with_fixes`): it builds what the AI is told from the
+    unmasked text (every value of the proxy replaced by its placeholder in any spelling, which a value the masker
+    already changed defeats), and masks everything it records, logs or returns. Never write or log this result as
+    it is."""
     with masker.active(), masker.logging():
-        result = _verify(bundle, app_dir, runner, backend, golden, config or VerifyConfig(), generated, masker)
-    return masker.mask_result(result)
+        return _verify(bundle, app_dir, runner, backend, golden, config or VerifyConfig(), generated, masker)
 
 
 def _verify(

@@ -32,6 +32,47 @@ Included scripts (IncludeURL), if any:
 {{includes}}
 ```
 
+## Values shown as placeholders
+
+Every literal value of the code and of the policy configuration above is shown
+as a placeholder. A text placeholder such as `«v1»` stands for text: each
+string literal, comment and regular expression of the code, and each element
+text and attribute value of the policy (the names it declares stay). A number
+placeholder such as `«n2»` stands for a number: each number of the code. The
+code's structure and identifiers, and the names of the proxy's steps and flows
+are shown as they are. The same placeholder always stands for the same value.
+
+- To use a text value in the Mule code, write its placeholder where the value
+  goes: as a plain attribute value or element text (`variableName="«v2»"`),
+  or inside a string literal of DataWeave or JSON text, between its quotes
+  (`#['«v3»']`, `value='{"id": "«v3»"}'`). DataWeave is every `#[...]`
+  expression and the script of every Transform Message part, with or without
+  `%dw 2.0`; JSON text is a value that is a JSON object or array as a whole.
+  a2m puts the exact value back, escaped for that place, before it checks
+  your answer. In DataWeave and JSON text, a text placeholder outside any
+  string literal is refused (written bare in JSON it would become another
+  type, as `true` or a word that is no JSON), and so is one inside a regular
+  expression or after a "/" that could start one.
+- Write a number placeholder where a number goes, without quotes
+  (`#[vars.count + «n4»]`, `responseTimeout="«n4»"`). In an expression a2m
+  puts back the same number in a form DataWeave reads (`5000L` becomes
+  `5000`, `0xFF` becomes `255`, a negative number is put in parentheses); in
+  an attribute value or element text it writes the number in plain digits
+  (`5e3` and `5000.0` become `5000`, `2.5e-3` becomes `0.0025`). a2m refuses
+  the answer when it cannot write that number exactly. Never put a number
+  placeholder inside quotes: to make text of it, write `(«n4» as String)`.
+  A number placeholder stands for the whole literal, its dot and exponent
+  included (`.07` is one placeholder).
+- Write every placeholder outside quotes, and every number placeholder,
+  alone: one joined to a letter, a digit, a ".", "_", "$", a quote or another
+  placeholder (`0.«n4»`, `.«n4»`, `«n4»0`, `«n4»e3`, `«n4»«n5»`) is refused.
+- Inside the `$( )` of a DataWeave string you write code: put a text
+  placeholder there in quotes of its own (`#["Bearer $('«v3»')"]`); one
+  written bare there is refused.
+- A placeholder a2m did not show is refused.
+- In `writes`, give a name shown as a placeholder as its placeholder
+  (`"variables": ["«v2»"]`).
+
 ## How Apigee's JavaScript object model maps to the generated Mule app
 
 - `context.getVariable('request.header.NAME')` on the request side reads

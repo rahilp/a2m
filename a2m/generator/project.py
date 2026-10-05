@@ -65,6 +65,7 @@ from urllib.parse import urlsplit
 
 from a2m import safefs
 from a2m.ai.checks import DeclaredWrites, all_steps, callout_reads, changed_steps, describe_changes
+from a2m.ai.placeholders import condition_number
 from a2m.ai.provider import Confidence, Provider
 from a2m.ai.sources import CalloutSource, callout_kind, callout_source
 from a2m.ai.translate import NONE, CalloutTranslated, NotTranslated, Place, Translator
@@ -85,7 +86,7 @@ from a2m.conditions import (
     translate_condition,
     translate_template,
 )
-from a2m.conditions.lexer import ConditionError, TokenKind, tokenize
+from a2m.conditions.lexer import ConditionError, Token, TokenKind, tokenize
 from a2m.conditions.parser import OPERATORS
 from a2m.conditions.variables import EXACT_PATH_SUFFIX_DW, RESPONSE_FRAMING_HEADERS, accessor, fold
 from a2m.ir import (
@@ -541,6 +542,25 @@ class _TargetPlan:
     url: str | None = None
 
 
+def _comparison(text: str, tokens: Sequence[Token], index: int) -> str:
+    """The comparison of condition ``text`` that holds the number at ``tokens[index]``, as written (``x = 2``); the
+    number alone when no variable and operator stand right before or after it."""
+
+    def end(token: Token) -> int:
+        return token.position + len(token.text) + (2 if token.kind is TokenKind.STRING else 0)
+
+    operand = (TokenKind.WORD, TokenKind.STRING)
+    if index >= 2 and tokens[index - 2].kind in operand and tokens[index - 1].kind in (TokenKind.SYMBOL, TokenKind.WORD):
+        return text[tokens[index - 2].position : end(tokens[index])]
+    if (
+        index + 2 < len(tokens)
+        and tokens[index + 1].kind in (TokenKind.SYMBOL, TokenKind.WORD)
+        and tokens[index + 2].kind in operand
+    ):
+        return text[tokens[index].position : end(tokens[index + 2])]
+    return tokens[index].text
+
+
 class _ProjectBuilder:
     def __init__(self, bundle: Bundle, shared_flows: Sequence[Bundle], ai: Translator | None = None) -> None:
         self.bundle = bundle
@@ -638,6 +658,13 @@ class _ProjectBuilder:
             tokens = tokenize(text)
         except ConditionError as exc:
             return f"a2m cannot tell which values it reads ({exc})"
+        for index, token in enumerate(tokens):
+            if token.kind is TokenKind.WORD and condition_number(token.text):
+                # CP5's rule: a comparison with a number is not translated, so no answer of the AI could be used.
+                return (
+                    f"it compares with a number ({_comparison(text, tokens, index)}), and comparing with a number is "
+                    "not translated, since Apigee converts between numbers and text by its own rules"
+                )
         for token in tokens:
             word = token.text
             if token.kind is not TokenKind.WORD or fold(word) in CONDITION_WORDS or NUMBER.fullmatch(word):
@@ -678,6 +705,11 @@ class _ProjectBuilder:
         outcome = self.ai.expression(
             f"{kind} {name}", name, text, Place(self.bundle.name, where, direction), refusal, self.changes
         )
+        if isinstance(outcome, NotTranslated) and not outcome.sent:
+            # Refused without asking the AI: recorded as not sent, never as an AI result.
+            reason = f"{refusal}; not sent to the AI: {outcome.reason}"
+            self.conditions.append(ConditionRecord(name, kind, where, text, False, None, reason, method=Method.SKIPPED))
+            return Translation(text, ok=False, dw=None, reason=reason)
         if isinstance(outcome, NotTranslated):
             reason = f"{refusal}; {outcome.reason}"
             notes = outcome.notes

@@ -1871,11 +1871,15 @@ def test_CP8_X27_no_literal_value_from_any_position_reaches_any_field_of_a_fix_r
     prompt = provider.requests[0].prompt
     for shown in (
         "policy AM-Creds (", "policy AM-Json (", 'name="X-Partner-Api-Key"', 'name="code"', 'name="sig"',
-        'name="appid"', "<wsse:Password>«v", "&quot;client_secret&quot;", "<Javascript", "var apiKey = \"«v",
+        'name="appid"', "<wsse:Password>«v", "<Javascript", "var apiKey = \"«v",
         "attributes.headers['«v", "- KVM-Init (KeyValueMapOperations)", "- SC-Geo (ServiceCallout)",
         "x-refresh-token", "x-client-token", "x-upstream-auth", "echo",
     ):
         assert shown in prompt or shown in prompt.lower(), shown
+    # A quoted JSON key is a placeholder too (CP10 round 2): the payload's "client_secret" key is absent, and the
+    # payload is shown as placeholders.
+    assert "&quot;client_secret&quot;" not in prompt and '"client_secret"' not in prompt
+    assert re.search(r"&quot;«v\d+»&quot;: &quot;«v\d+»&quot;", prompt), "the JSON payload is not shown"
     # A quoted selector is a placeholder even when it holds a known header name (CP8 round 8).
     assert "attributes.headers['x-api-key']" not in prompt.lower(), "a quoted selector was shown by value"
 
@@ -2062,9 +2066,13 @@ def test_CP8_X29_the_ai_fixes_a_value_mismatch_by_writing_an_existing_placeholde
         assert found is not None, request.prompt
         expected, actual = found.groups()
         shown = shown_flow(request)
-        assert f"'X-Api-Version': '{actual}'" in shown and "'1'" not in shown
+        # The quoted DataWeave key is a placeholder too (CP10 round 2): the header name is absent, its placeholder is
+        # shown.
+        keyed = re.search(r"'(«v\d+»)': '" + re.escape(actual) + "'", shown)
+        assert keyed is not None and "'X-Api-Version'" not in shown and "'1'" not in shown, shown
+        key = keyed.group(1)
         seen.update(expected=expected, actual=actual)
-        return fixed(shown.replace(f"'X-Api-Version': '{actual}'", f"'X-Api-Version': '{expected}'"), confidence="high")
+        return fixed(shown.replace(f"'{key}': '{actual}'", f"'{key}': '{expected}'"), confidence="high")
 
     loop = run(app, ScriptedProvider([answer]), VersionRunner(), golden=golden)
 
@@ -2388,7 +2396,11 @@ def test_CP8_X33_a_diff_value_with_quotes_and_a_backslash_written_into_a_datawea
         assert found is not None, request.prompt
         expected, actual = found.groups()
         shown = shown_flow(request)
-        return fixed(shown.replace(f"'X-Api-Version': '{actual}'", f"'X-Api-Version': '{expected}'"), confidence="high")
+        # The quoted DataWeave key is a placeholder too (CP10 round 2): the header name is absent.
+        keyed = re.search(r"'(«v\d+»)': '" + re.escape(actual) + "'", shown)
+        assert keyed is not None and "'X-Api-Version'" not in shown, shown
+        key = keyed.group(1)
+        return fixed(shown.replace(f"'{key}': '{actual}'", f"'{key}': '{expected}'"), confidence="high")
 
     loop = run(app, ScriptedProvider([answer]), QuotedVersionRunner(), golden=golden)
 
@@ -2783,7 +2795,9 @@ def test_CP8_X40_apigee_names_are_positional_and_data_has_no_names_at_any_depth(
         '<AssignMessage name="AM-J"><Set><Payload contentType="application/json">{"qty": 4321987, "vip": true}'
         "</Payload></Set></AssignMessage>"
     )
-    assert json_body is not None and "4321987" not in json_body and '"qty"' in json_body, json_body
+    # A quoted JSON key is a placeholder too (CP10 round 2): "qty" is absent, a placeholder stands in its place.
+    assert json_body is not None and "4321987" not in json_body and '"qty"' not in json_body, json_body
+    assert re.search(r'\{"«v\d+»": «n\d+», "«v\d+»": «v\d+»\}', json_body), json_body
     schema = (
         '<AssignMessage name="AM-Schema"><AssignVariable><Name>flow.my.var</Name><Ref>request.header.x-in</Ref>'
         '</AssignVariable><Set><Headers><Header name="X-Out">v</Header></Headers><QueryParams><QueryParam '
@@ -2988,7 +3002,8 @@ def test_CP8_X43_a_known_name_as_a_payload_value_never_reaches_a_fix_request_and
 
     prompt = provider.requests[0].prompt
     assert f"<Name>{R8_NAME}</Name>" in prompt, prompt[:4000]  # its own name position stays visible
-    assert '"password": "«v' in prompt, prompt[:4000]
+    # A quoted JSON key is a placeholder too (CP10 round 2): the key "password" is absent, its placeholder is shown.
+    assert '"password"' not in prompt and re.search(r'"«v\d+»": "«v\d+»"', prompt), prompt[:4000]
     for request in provider.requests:
         for field_name, text in request_texts(request).items():
             assert _r8_quoted(text, R8_NAME) == [], (field_name, _r8_quoted(text, R8_NAME))
@@ -3069,7 +3084,10 @@ def test_CP8_X44_a_javascript_regular_expression_in_every_position_never_shows_a
             assert _r8_round_trip(table, shown) == code, (code, shown)
             count += 1
     for division in ("x = a / b / c;", "y = (a + b) / 2 / 3;", "z = f(x) / 2 / n;", "w = a[0] / 2 / k;"):
-        assert Placeholders().code(division, R8_JS) == division
+        # CP10 round 3: every number of custom code is a placeholder; the division itself stays visible.
+        shown = Placeholders().code(division, R8_JS)
+        assert re.sub(r"«n\d+»", "N", shown) == re.sub(r"\d+", "N", division), shown
+        assert not re.search(r"\d", re.sub(r"«n\d+»", "", shown)), shown
 
 
 # DataWeave positions where a "/" starts a regular expression.
@@ -3110,7 +3128,10 @@ def test_CP8_X45_a_dataweave_regular_expression_never_shows_and_restores_byte_ex
     for visible in ("#[vars.total / 2 / vars.n]", "#[output application/json --- payload.a / 2]"):
         original = f"<mule><flow name=\"f\"><set-payload value={_attr(visible)}/></flow></mule>"
         shown = Placeholders().mule({"f.xml": original})["f.xml"]
-        assert shown is not None and f"value={_attr(visible)}" in shown, shown
+        # CP10 round 3: a number of DataWeave arithmetic is a placeholder; the division and the MIME type stay.
+        expected = re.sub(r" 2", " N", f"value={_attr(visible)}")
+        assert shown is not None and expected in re.sub(r"«n\d+»", "N", shown), shown
+        assert " / 2" not in shown, shown
 
 
 def test_CP8_X46_a_bounded_generator_of_ambiguous_slashes_never_leaks_a_canary() -> None:
@@ -3278,7 +3299,7 @@ def test_CP8_X49_a_real_dataweave_header_stays_visible_and_the_script_round_trip
                 '%dw 2.0\noutput application/json indent=false, skipNullOn="cnry49d" // cnry49e note\n---\n'
                 "payload.total / 2 / vars.n\n"
             ),
-            ("output application/json indent=false, skipNullOn=", "payload.total / 2 / vars.n"),
+            ("output application/json indent=false, skipNullOn=", "payload.total / «n"),
         ),
         (
             "output application/json --- payload.output matches /cnry49f/ ++ 'cnry49g'",
@@ -3286,7 +3307,7 @@ def test_CP8_X49_a_real_dataweave_header_stays_visible_and_the_script_round_trip
         ),
         (
             "output application/vnd.api+json\n--- payload.a / 2",
-            ("output application/vnd.api+json\n--- payload.a / 2",),
+            ("output application/vnd.api+json\n--- payload.a / «n",),
         ),
     )
     for code, visible in scripts:
@@ -3295,6 +3316,7 @@ def test_CP8_X49_a_real_dataweave_header_stays_visible_and_the_script_round_trip
         for text in visible:
             assert text in shown, (code, shown)
         assert "cnry49" not in shown, (code, shown)
+        assert " / 2" not in shown, (code, shown)  # CP10 round 3: a number of DataWeave arithmetic is a placeholder
         _r9_check(Placeholders(), code, ("cnry49",))
     # A directive line holding anything outside the directive grammar is not a directive: nothing is shown for it.
     for code in (
