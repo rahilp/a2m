@@ -43,7 +43,7 @@ from pathlib import Path
 
 from a2m import layout, pathid, safefs
 from a2m.ai import Provider, ProviderSetupError, make_provider
-from a2m.ai.prompts import PromptError, load_prompts
+from a2m.ai.prompts import FIX_PROMPT_FILE, PromptError, load_prompt, load_prompts
 from a2m.discovery import (
     BUNDLE_ROOTS,
     PROXY_ROOT,
@@ -432,12 +432,19 @@ def _check_golden(options: RunOptions) -> None:
 
 def _make_provider(options: RunOptions) -> Provider:
     """The AI provider --llm picks, and its prompt files, checked before anything is processed: a missing API key,
-    SDK or prompt file stops the run with one clear line."""
+    SDK or prompt file stops the run with one clear line. The fix prompt is checked when the AI fix loop may run
+    (--max-fix-attempts above 0, and the apps may run: --mock-backends or --golden without --no-runtime)."""
     try:
         load_prompts()
+        if _fix_loop_may_run(options):
+            load_prompt(FIX_PROMPT_FILE, what="fix")
         return make_provider(options.llm.value)
     except (ProviderSetupError, PromptError) as exc:
         raise UsageError(str(exc)) from None
+
+
+def _fix_loop_may_run(options: RunOptions) -> bool:
+    return options.max_fix_attempts > 0 and not options.no_runtime and (options.mock_backends or options.golden is not None)
 
 
 def _check_not_a_bundle(input_dir: Path) -> None:

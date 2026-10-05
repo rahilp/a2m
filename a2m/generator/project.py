@@ -101,7 +101,7 @@ from a2m.ir import (
     TargetEndpoint,
     XmlElement,
 )
-from a2m.layout import collision_key
+from a2m.layout import MULE_CONFIG_DIR, collision_key
 from a2m.policies import registry
 from a2m.policies.common import (
     FAULT_ERROR_TYPE,
@@ -154,7 +154,7 @@ for _prefix, _uri in (
 DOC_NAME = f"{{{DOC}}}name"
 DOC_DESCRIPTION = f"{{{DOC}}}description"
 
-MULE_DIR = ("src", "main", "mule")
+MULE_DIR = MULE_CONFIG_DIR
 RESOURCES_DIR = ("src", "main", "resources")
 PROXY_FILE = "proxy.xml"
 PROPERTIES_FILE = "config.properties"

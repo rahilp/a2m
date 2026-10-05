@@ -17,7 +17,8 @@ password), so a session token a body echoes is masked too. Values shorter than :
 are not replaced: masking a two-letter value would garble unrelated text.
 
 Credential-shaped values are masked even when they were never learned, at any
-length: the token after an ``Authorization`` scheme (``Bearer``, ``Basic``), a
+length: the token after an ``Authorization`` scheme (``Bearer``, ``Basic``; the
+parameters of a challenge such as ``Basic realm="orders"`` are not a token), a
 JSON Web Token, and the value after a credential name (Authorization,
 Proxy-Authorization, Cookie, Set-Cookie, or a header or query parameter a
 VerifyAPIKey reads) written as ``name: value``, ``name=value`` or
@@ -60,8 +61,10 @@ KEY_POLICY_TYPE = "VerifyAPIKey"
 SECRET_SCHEMES: tuple[str, ...] = ("Bearer", "Basic")
 _TOKEN = r"[A-Za-z0-9\-._~+/]"
 # The token of a scheme; it must end where the token ends (not before a '*' of an already masked value).
+# A challenge's parameters (WWW-Authenticate: Basic realm="orders") are not a token.
+_CHALLENGE_PARAMS = r"(?:realm|charset|scope|error|error_description|error_uri|nonce|opaque|qop|stale|algorithm|domain)"
 _SCHEME_RULE = re.compile(
-    rf"(?i)\b(?P<head>(?:{'|'.join(SECRET_SCHEMES)})\s+)"
+    rf"(?i)\b(?P<head>(?:{'|'.join(SECRET_SCHEMES)})\s+)(?!{_CHALLENGE_PARAMS}\s*=)"
     rf"(?P<value>{_TOKEN}{{{MIN_MASKED_CHARS},}}=*)(?![A-Za-z0-9\-._~+/=*])"
 )
 _JWT_RULE = re.compile(r"(?P<value>eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_*-])")

@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
 
-from a2m import safefs
+from a2m import layout, safefs
 from a2m.runlog import get_logger
 from a2m.verify.model import AppUnderTest, HttpRequest, HttpResponse
 from a2m.verify.mule import (
@@ -55,7 +55,7 @@ from a2m.verify.mule import (
 )
 
 HTTP_NS = "http://www.mulesoft.org/schema/mule/http"
-MULE_DIR = ("src", "main", "mule")
+MULE_DIR = layout.MULE_CONFIG_DIR
 PROPERTIES_ENTRY = "config.properties"
 PLACEHOLDER = re.compile(r"\$\{([^${}]+)\}")
 LOOPBACK = "127.0.0.1"

@@ -173,6 +173,20 @@ def write_text_atomic(root: Path, target: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def write_bytes_atomic(root: Path, target: Path, data: bytes) -> None:
+    """:func:`write_text_atomic` for bytes written exactly as given: for putting back a file a2m read before (an
+    undone AI fix restores the project byte for byte), never for new text, which goes through the redacting
+    :func:`write_text_atomic`."""
+    path = _checked(root, target)
+    tmp_target = target.with_name(target.name + ".tmp")
+    remove(root, tmp_target)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o666)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+    os.replace(tmp, path)
+
+
 def move(root: Path, source: Path, target: Path) -> None:
     """Move ``source`` to ``target`` (replacing a file or empty folder there), both strictly inside ``root``.
 

@@ -46,7 +46,12 @@ short test cannot prove a time window.
 :func:`make_verify_stage` is the engine stage: it decides whether the app can
 run at all (--no-runtime, tools installed, --mock-backends or --golden),
 verifies a working copy of the generated project, and writes
-``verification.json`` and one run.log line per proxy.
+``verification.json`` and one run.log line per proxy. With the AI provider
+--llm picked and --max-fix-attempts above 0, a proxy whose tests ran and
+failed goes through the AI fix loop (:mod:`a2m.verify.fix_loop`) on that
+working copy; the Mule configuration files of the version it kept are copied
+back into ``mule-app/``, and ``verification.json`` lists every attempt under
+``"attempts"`` (an empty list when no fix was asked for).
 """
 
 from __future__ import annotations
@@ -62,6 +67,7 @@ from pathlib import Path
 from typing import Protocol
 
 from a2m import layout, safefs
+from a2m.ai.provider import Provider
 from a2m.ir import Bundle
 from a2m.parser import read_bundle
 from a2m.runlog import get_logger
@@ -75,6 +81,7 @@ from a2m.verify.batteries import (
     recorded_key_properties,
     time_window_flags,
 )
+from a2m.verify.fix_loop import FixAttempt, mask_attempts, run_with_fixes
 from a2m.verify.generated import GeneratedSteps
 from a2m.verify.golden import Exchange, RecordingError, load_exchanges, recordings_dir
 from a2m.verify.masking import Masker
@@ -111,6 +118,8 @@ VERIFICATION_FILE = "verification.json"
 MOCK_DEFAULT_HEADERS = {"Content-Type": "application/json"}
 MOCK_DEFAULT_BODY = b'{"a2m":"mock backend"}'
 STAGE_NAME = "verify"
+# The folder of the Mule configuration files, the only files an AI fix may change (see a2m.verify.fix_loop).
+FIXABLE_DIR = layout.MULE_CONFIG_DIR
 # Anything a call to the app can raise when the app answers with no valid HTTP response.
 SEND_ERRORS = (OSError, MuleError, http.client.HTTPException)
 RUNTIME_STOPPED_MESSAGE = "not tested: the Mule runtime stopped during the tests ({problem})"
@@ -184,7 +193,7 @@ def requires_enterprise(app_dir: Path) -> bool:
         artifact = {}
     if isinstance(artifact, dict) and artifact.get("requiredProduct") == "MULE_EE":
         return True
-    for path in sorted((app_dir / "src" / "main" / "mule").glob("*.xml")):
+    for path in sorted(app_dir.joinpath(*layout.MULE_CONFIG_DIR).glob("*.xml")):
         try:
             if EE_NAMESPACE in path.read_text(encoding="utf-8", errors="replace"):
                 return True
@@ -776,6 +785,7 @@ class VerifyStage:
         """Verify one proxy, write its verification.json and log its lines, all masked by ``masker``."""
         log = get_logger()
         name = context.name
+        attempts: tuple[FixAttempt, ...] = ()
         # Absolute, so the Mule runtime's MULE_BASE never depends on the working folder.
         results_root = context.out_dir.absolute().parent
         app_dir = layout.mule_app_dir(context.out_dir.absolute())
@@ -799,15 +809,17 @@ class VerifyStage:
             else:
                 config = self._config.ignoring(tuple(getattr(options, "golden_ignore_headers", ())))
                 generated = _saved_generated_steps(results_root, name)
-                result = self._verify_copy(
-                    bundle, app_dir, runner, results_root, name, options.golden, config, generated, masker
+                fixes = _FixSettings(getattr(options, "provider", None), getattr(options, "max_fix_attempts", 0))
+                result, attempts = self._verify_copy(
+                    bundle, app_dir, runner, results_root, name, options.golden, config, generated, masker, fixes
                 )
                 unavailable = self._real.unavailable_reason if self._real is not None else None
                 if unavailable is not None:
                     self._notice(masker.mask(f"apps not run: {unavailable}; verification type: static"))
         # The one write point: verification.json and the lines below show only masked text.
         result = masker.mask_result(result)
-        self._report(context, result)
+        attempts = mask_attempts(attempts, masker)
+        self._report(context, result, attempts)
         (log.info if result.type in (VerificationType.GOLDEN, VerificationType.BATTERY) else log.warning)(
             "%s: %s; verification type: %s (%d tests ran, %d passed, %d failed)",
             name,
@@ -850,24 +862,42 @@ class VerifyStage:
         config: VerifyConfig,
         generated: GeneratedSteps | None = None,
         masker: Masker | None = None,
-    ) -> VerificationResult:
-        """Verify a working copy of the project, so the build output never lands in the results."""
+        fixes: _FixSettings | None = None,
+    ) -> tuple[VerificationResult, tuple[FixAttempt, ...]]:
+        """Verify a working copy of the project, so the build output never lands in the results.
+
+        With an AI provider and fix attempts allowed (``fixes``), the AI fix loop runs on the working copy
+        (:mod:`a2m.verify.fix_loop`), and the Mule configuration files of the version it kept are copied back
+        into ``app_dir``, so the project in the results is the one the result describes.
+        """
         work = layout.verify_work_dir(results_root, name)
         try:
             safefs.remove(results_root, work)
             safefs.make_dirs(results_root, work.parent)
             _copy_tree(app_dir, work)
-            return verify_proxy(
-                bundle, work, runner=runner, golden=golden, config=config, generated=generated, masker=masker
+            if fixes is None or fixes.provider is None or fixes.max_attempts <= 0:
+                result = verify_proxy(
+                    bundle, work, runner=runner, golden=golden, config=config, generated=generated, masker=masker
+                )
+                return result, ()
+            loop = run_with_fixes(
+                bundle, work, runner=runner, provider=fixes.provider, max_fix_attempts=fixes.max_attempts,
+                golden=golden, config=config, generated=generated, masker=masker,
             )
+            if any(attempt.helped for attempt in loop.attempts):
+                _keep_fixed_files(results_root, work, app_dir, name)
+            return loop.result, loop.attempts
         finally:
             safefs.remove(results_root, work)
             safefs.remove_empty_dir(results_root, work.parent)
             safefs.remove_empty_dir(results_root, work.parent.parent)
 
-    def _report(self, context: StageContext, result: VerificationResult) -> None:
+    def _report(self, context: StageContext, result: VerificationResult, attempts: Sequence[FixAttempt] = ()) -> None:
         out = context.out_dir
-        text = json.dumps(result.to_json_data(), indent=2, ensure_ascii=False) + "\n"
+        data = result.to_json_data()
+        # Every AI fix attempt, for the report (empty when the AI was never asked for a fix).
+        data["attempts"] = [attempt.to_json_data() for attempt in attempts]
+        text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
         safefs.write_text_atomic(out.parent, out / VERIFICATION_FILE, text)
 
     def close(self) -> None:
@@ -892,6 +922,40 @@ def _saved_generated_steps(results_root: Path, name: str) -> GeneratedSteps | No
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         get_logger().warning("%s: the saved generated steps can't be read (%s); a2m's own decisions are used", name, exc)
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class _FixSettings:
+    """What the fix loop of one proxy may do: the AI provider --llm picked (None: no loop) and --max-fix-attempts."""
+
+    provider: Provider | None
+    max_attempts: int
+
+
+def _keep_fixed_files(results_root: Path, work: Path, app_dir: Path, name: str) -> None:
+    """Copy each Mule configuration file the fix loop changed in the working copy ``work`` back into ``app_dir``.
+
+    Only the files an AI fix may change (``src/main/mule/*.xml``, plain files on both sides) are compared and
+    copied, byte for byte, through :mod:`a2m.safefs`."""
+    log = get_logger()
+    source_dir = work.joinpath(*FIXABLE_DIR)
+    if safefs.is_link(source_dir) or not source_dir.is_dir():
+        return
+    for source in sorted(source_dir.glob("*.xml")):
+        target = app_dir.joinpath(*FIXABLE_DIR, source.name)
+        if not (safefs.is_regular_file(results_root, source) and safefs.is_regular_file(results_root, target)):
+            continue
+        data = _read_bytes(results_root, source)
+        if data == _read_bytes(results_root, target):
+            continue
+        safefs.write_bytes_atomic(results_root, target, data)
+        log.info("%s: kept the AI fix of %s in %s/", name, "/".join((*FIXABLE_DIR, source.name)), layout.MULE_APP_DIR_NAME)
+
+
+def _read_bytes(root: Path, path: Path) -> bytes:
+    fd = safefs.open_plain_file(root, path, os.O_RDONLY)
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read()
 
 
 def _copy_tree(source: Path, dest: Path) -> None:

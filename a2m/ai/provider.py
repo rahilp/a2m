@@ -30,18 +30,21 @@ class Confidence(StrEnum):
 
 
 class ItemKind(StrEnum):
-    """What is sent to the AI: a callout's code (by language) or a condition."""
+    """What is sent to the AI: a callout's code (by language), a condition, or a fix for a proxy whose tests failed
+    (:mod:`a2m.verify.fix_loop`)."""
 
     JAVASCRIPT = "javascript"
     PYTHON = "python"
     JAVA = "java"
     EXPRESSION = "expression"
+    FIX = "fix"
 
 
 @dataclass(frozen=True, slots=True)
 class AiRequest:
-    """One item for the AI: ``name`` is the step (policy) name, or the Flow, step or RouteRule holding a condition;
-    ``original`` is the callout's source code or the condition text, verbatim; ``prompt`` is the whole text sent."""
+    """One item for the AI: ``name`` is the step (policy) name, the Flow, step or RouteRule holding a condition, or
+    the proxy's name for a fix; ``original`` is the callout's source code, the condition text, or the Apigee policies
+    a fix is about, verbatim; ``prompt`` is the whole text sent."""
 
     kind: ItemKind
     name: str
@@ -57,6 +60,11 @@ class Provider(Protocol):
 
 class ProviderError(A2mError):
     """An AI call failed (network, API or answer error); only that item is affected."""
+
+
+class ProviderLimitError(ProviderError):
+    """The answer could not be complete: it was cut off at the token limit or the request timed out. Sending the same
+    request again would end the same way, so a caller that would ask again (the fix loop) stops instead."""
 
 
 class ProviderSetupError(A2mError):

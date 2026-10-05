@@ -1,0 +1,4 @@
+{
+  "status": "cannot_fix",
+  "reason": "a2m's fake AI provider (--llm fake) has no canned fix for this proxy, so nothing was changed; fix it by hand, or run a2m with --llm claude."
+}

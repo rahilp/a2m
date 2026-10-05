@@ -24,6 +24,9 @@ FORCE_PENDING_NAME = ".a2m-force-pending"
 FORCE_PENDING_TEXT = "a2m --force run clearing earlier .done markers\n"
 # Each proxy's generated Mule project, inside the proxy's folder.
 MULE_APP_DIR_NAME = "mule-app"
+# Inside a Mule project: the folder of its Mule configuration files (the generator writes them, the runner reads
+# them, and they are the only files an AI fix may change).
+MULE_CONFIG_DIR: tuple[str, ...] = ("src", "main", "mule")
 # Inside the work area: the working copies of shared flow bundles. Proxy names
 # never start with a dot, so this never collides with a proxy's work folder.
 SHARED_FLOWS_WORK_NAME = ".shared-flows"
