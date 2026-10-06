@@ -66,10 +66,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from a2m import layout, safefs
+from a2m import layout, progress, safefs
 from a2m.ai.provider import Provider
 from a2m.ir import Bundle
 from a2m.parser import read_bundle
+from a2m.progress import Step
 from a2m.runlog import get_logger
 from a2m.verify import compare
 from a2m.verify.batteries import (
@@ -337,6 +338,7 @@ def _verify(
                     untested=battery.untested if battery else (),
                 )
             try:
+                progress.step(Step.TESTS)
                 if exchanges is not None:
                     return _replay(
                         exchanges, handle, mock, config, flags, key_notes, header_changes(bundle), runner=runner,
@@ -379,7 +381,10 @@ def _with(
 def _start(runner: Runner, app: AppUnderTest, backend_url: str) -> AppHandle | VerificationResult:
     """The started app, or the failed (or static) result when it could not be built or started."""
     try:
-        return runner.start(app, backend_url=backend_url)
+        progress.step(Step.BUILD)
+        handle = runner.start(app, backend_url=backend_url)
+        progress.step(Step.DEPLOY)  # shown once: a runner that reports its own deploy has shown it already
+        return handle
     except BuildError as exc:
         return VerificationResult(
             VerificationType.FAILED, message=f"{app.name}: build failed: {exc}", log_excerpt=exc.output

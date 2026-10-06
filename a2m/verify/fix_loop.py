@@ -139,7 +139,7 @@ from typing import TYPE_CHECKING, Any
 from defusedxml import DefusedXmlException
 from defusedxml import ElementTree as SafeET
 
-from a2m import layout, redaction, safefs
+from a2m import layout, progress, redaction, safefs
 from a2m.ai import checks
 from a2m.ai.placeholders import (
     DATAWEAVE,
@@ -158,6 +158,7 @@ from a2m.errors import UnsafePathError
 from a2m.generator.project import HTTP
 from a2m.ir import Bundle, Policy, ProxyEndpoint, TargetEndpoint
 from a2m.policies.common import Method
+from a2m.progress import Step
 from a2m.runlog import get_logger
 from a2m.verify.generated import GeneratedSteps
 from a2m.verify.masking import Masker
@@ -377,6 +378,7 @@ class _FixLoop:
                 not_run = str(exc)
                 self.log.warning("%s: no AI fix was asked for: %s", self.bundle.name, not_run)
                 break
+            progress.step(Step.AI_FIX, number, self.max_attempts)
             before = _failing(best, total)
             attempt, kept, stop = self._attempt(number, best, total, before, template, previous)
             attempts.append(attempt)

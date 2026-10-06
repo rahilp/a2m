@@ -41,7 +41,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
 
-from a2m import layout, safefs
+from a2m import layout, progress, safefs
+from a2m.progress import Step
 from a2m.runlog import get_logger
 from a2m.verify.model import AppUnderTest, HttpRequest, HttpResponse
 from a2m.verify.mule import (
@@ -299,6 +300,7 @@ class MuleAppRunner:
         if isinstance(plan, str):
             raise UnsafeAppError(f"{app.name} is not run: {plan}")
         jar = self._build(app.app_dir)
+        progress.step(Step.DEPLOY)
         self._ensure_started()
         port = free_port()
         backend = _backend_address(backend_url)

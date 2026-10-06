@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, NoReturn
 from a2m import __version__
 from a2m.engine import LlmChoice, RunOptions, Stage, interrupted_signal, prepare_run, rerun_advice, run_batch
 from a2m.errors import UnsafePathError, UsageError
+from a2m.progress import ProgressCallback, ProgressEvent, describe
 from a2m.redaction import redact
 from a2m.runlog import one_line
 
@@ -38,6 +39,12 @@ EXIT_PROXY_FAILED = 1
 EXIT_USAGE = 2
 # The shell convention for a run stopped by Ctrl-C (128 + SIGINT).
 EXIT_INTERRUPTED = 130
+
+# --progress: "auto" shows progress lines on stderr only when it is a terminal.
+PROGRESS_AUTO = "auto"
+PROGRESS_LINES = "lines"
+PROGRESS_NONE = "none"
+PROGRESS_CHOICES = (PROGRESS_AUTO, PROGRESS_LINES, PROGRESS_NONE)
 
 
 def _write(stream: SupportsWrite[str] | None, text: str) -> None:
@@ -83,9 +90,22 @@ def _silence(stream: object) -> None:
         os.close(devnull)
 
 
-def _say(message: str, *, err: bool = False) -> None:
-    """Print ``message`` as exactly one line on stdout (or stderr with ``err``)."""
-    _write(sys.stderr if err else sys.stdout, one_line(message))
+def _say(message: str, *, err: bool = False, terminal_only: bool = False) -> None:
+    """Print ``message`` as exactly one line on stdout (or stderr with ``err``).
+
+    With ``terminal_only`` the line is dropped unless that stream is a terminal (``--progress auto``).
+    """
+    stream = sys.stderr if err else sys.stdout
+    if terminal_only and not _is_terminal(stream):
+        return
+    _write(stream, one_line(message))
+
+
+def _is_terminal(stream: object) -> bool:
+    try:
+        return bool(stream.isatty())  # type: ignore[attr-defined]
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 class _Parser(argparse.ArgumentParser):
@@ -186,7 +206,28 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument(
         "--no-runtime", action="store_true", help="skip steps that need Java, Maven or the Mule runtime"
     )
+    migrate.add_argument(
+        "--progress",
+        choices=PROGRESS_CHOICES,
+        default=PROGRESS_AUTO,
+        help="progress lines on stderr: auto (only when stderr is a terminal, the default), lines or none",
+    )
     return parser
+
+
+def _progress_callback(mode: str) -> ProgressCallback | None:
+    """What prints the progress events: each as one line on stderr (escaped and masked like every line a2m
+    prints); with ``auto`` only while stderr is a terminal; with ``none`` nothing."""
+    if mode == PROGRESS_NONE:
+        return None
+    terminal_only = mode == PROGRESS_AUTO
+
+    def show(event: ProgressEvent) -> None:
+        line = describe(event)
+        if line is not None:
+            _say(line, err=True, terminal_only=terminal_only)
+
+    return show
 
 
 def main(argv: list[str] | None = None, *, stages: Sequence[Stage] | None = None) -> int:
@@ -211,7 +252,7 @@ def main(argv: list[str] | None = None, *, stages: Sequence[Stage] | None = None
     )
     try:
         plan = prepare_run(options)
-        result = run_batch(plan, stages)
+        result = run_batch(plan, stages, progress=_progress_callback(args.progress))
     except KeyboardInterrupt as exc:
         signum = interrupted_signal(exc)
         what = "interrupted" if signum is None else f"stopped by {signal.Signals(signum).name}"

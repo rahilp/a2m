@@ -73,6 +73,7 @@ from a2m.ir import Bundle
 from a2m.layout import collision_key, unsafe_name_reason
 from a2m.parser import read_bundle
 from a2m.policies.common import Method
+from a2m.progress import Outcome, Progress, ProgressCallback
 from a2m.report import ReportStage
 from a2m.runlog import get_logger, run_log
 from a2m.verify import make_verify_stage
@@ -650,12 +651,15 @@ def _proxy_dirs(out: Path, name: str, *, flat: bool = True, buckets: bool = True
     return found
 
 
-def run_batch(plan: RunPlan, stages: Sequence[Stage] | None = None) -> BatchResult:
+def run_batch(
+    plan: RunPlan, stages: Sequence[Stage] | None = None, progress: ProgressCallback | None = None
+) -> BatchResult:
     """Create the results folder, log discovery, and process every selected proxy.
 
     ``stages`` defaults to :func:`default_stages`. A stage with a ``close()``
     method (the verification stage, which may have started a Mule runtime) is
-    closed when the batch ends, however it ends.
+    closed when the batch ends, however it ends. ``progress`` receives the
+    batch's progress events (see :mod:`a2m.progress`); it never changes the run.
 
     The whole run holds an exclusive lock on the results folder, so a second
     run on the same folder stops with :class:`UsageError` instead of deleting
@@ -674,7 +678,8 @@ def run_batch(plan: RunPlan, stages: Sequence[Stage] | None = None) -> BatchResu
         with _stop_on_termination(), safefs.exclusive_lock(out, layout.lock_path(out)):
             _check_out_dir(options)
             _check_done_markers(out, plan.discovery.candidate_names())
-            return _run_locked(plan, default_stages() if stages is None else stages)
+            reporter = Progress(progress, len(plan.selected))
+            return _run_locked(plan, default_stages() if stages is None else stages, reporter)
     except LockHeldError:
         raise UsageError(
             f"results folder {out} is in use by another a2m run; wait for it to finish, then run again"
@@ -683,7 +688,7 @@ def run_batch(plan: RunPlan, stages: Sequence[Stage] | None = None) -> BatchResu
         raise UsageError(f"results folder {out}: {exc}; remove it and run again") from exc
 
 
-def _run_locked(plan: RunPlan, stages: Sequence[Stage]) -> BatchResult:
+def _run_locked(plan: RunPlan, stages: Sequence[Stage], progress: Progress) -> BatchResult:
     options = plan.options
     out = options.out_dir
     marker = layout.results_marker_path(out)
@@ -712,7 +717,7 @@ def _run_locked(plan: RunPlan, stages: Sequence[Stage]) -> BatchResult:
         )
         reporter = _reporter(stages)
         try:
-            unlisted = _run_proxies(plan, stages, result, log)
+            unlisted = _run_proxies(plan, stages, result, log, progress)
             if reporter is not None:
                 reporter.finish_batch(out, unlisted, _roots(options))
         finally:
@@ -725,6 +730,11 @@ def _run_locked(plan: RunPlan, stages: Sequence[Stage]) -> BatchResult:
             len(result.skipped),
             len(result.refused),
             len(result.crashed),
+        )
+        # inside the run.log block, so a progress callback that fails on this last event is logged there too
+        progress.run_finished(
+            finished=len(result.finished), skipped=len(result.skipped), refused=len(result.refused),
+            failed=len(result.crashed),
         )
     return result
 
@@ -761,7 +771,7 @@ def _roots(options: RunOptions) -> list[tuple[Path, str]]:
 
 
 def _run_proxies(
-    plan: RunPlan, stages: Sequence[Stage], result: BatchResult, log: logging.Logger
+    plan: RunPlan, stages: Sequence[Stage], result: BatchResult, log: logging.Logger, progress: Progress
 ) -> list[tuple[str, str]]:
     """Process every selected proxy; return the refused items a reporting run could give no folder (name, reason)."""
     options = plan.options
@@ -776,26 +786,13 @@ def _run_proxies(
         not_cleared = _clear_done_markers_for_force(plan) if options.force else set()
         cleared = not not_cleared
         shared_flows = _read_shared_flows(plan) if plan.selected else ()
+        progress.run_started()
 
-        for source in plan.selected:
+        for index, source in enumerate(plan.selected, 1):
             current = source.name
-            if source.name in not_cleared:
-                result.crashed.append(source.name)
-                continue
-            try:
-                already_done = options.resume and any(
-                    safefs.is_regular_file(out, folder / layout.DONE_MARKER_NAME)
-                    for folder in _proxy_dirs(out, source.name)
-                )
-            except (OSError, UnsafePathError) as exc:
-                log.error("failed %s: cannot check its earlier result: %s", source.name, exc)
-                result.crashed.append(source.name)
-                continue
-            if already_done:
-                log.info("skipped %s: already done (resume)", source.name)
-                result.skipped.append(source.name)
-                continue
-            _process(source, options, stages, result, shared_flows, plan.provider)
+            with progress.proxy(index, source.name):
+                outcome, bucket = _run_one(plan, stages, result, log, progress, source, not_cleared, shared_flows)
+                progress.finished(outcome, bucket)
 
         current = None
         selected_names = {source.name for source in plan.selected}
@@ -824,6 +821,48 @@ def _run_proxies(
         else:
             log.error("run interrupted%s before earlier .done markers were cleared; %s", where, advice)
         raise RunInterrupted(advice) from exc
+
+
+def _run_one(
+    plan: RunPlan,
+    stages: Sequence[Stage],
+    result: BatchResult,
+    log: logging.Logger,
+    progress: Progress,
+    source: BundleSource,
+    not_cleared: set[str],
+    shared_flows: tuple[Bundle, ...],
+) -> tuple[Outcome, str | None]:
+    """Skip or process one selected proxy; return how it ended and the bucket it is in (None: not known)."""
+    options = plan.options
+    out = options.out_dir
+    if source.name in not_cleared:
+        result.crashed.append(source.name)
+        return Outcome.FAILED, None
+    try:
+        done_in = (
+            next(
+                (
+                    folder
+                    for folder in _proxy_dirs(out, source.name)
+                    if safefs.is_regular_file(out, folder / layout.DONE_MARKER_NAME)
+                ),
+                None,
+            )
+            if options.resume
+            else None
+        )
+    except (OSError, UnsafePathError) as exc:
+        log.error("failed %s: cannot check its earlier result: %s", source.name, exc)
+        result.crashed.append(source.name)
+        return Outcome.FAILED, None
+    if done_in is not None:
+        log.info("skipped %s: already done (resume)", source.name)
+        result.skipped.append(source.name)
+        # <out>/<bucket>/<name>, or <out>/<name> (custom stage lists): no bucket.
+        return Outcome.SKIPPED, done_in.parent.name if done_in.parent != out else None
+    progress.started()
+    return _process(source, options, stages, result, shared_flows, plan.provider)
 
 
 def _log_discovery(plan: RunPlan) -> None:
@@ -994,9 +1033,11 @@ def _process(
     result: BatchResult,
     shared_flows: tuple[Bundle, ...] = (),
     provider: Provider | None = None,
-) -> None:
+) -> tuple[Outcome, str | None]:
+    """Run ``source`` through the stages; return how it ended and the bucket it is in (None: not known)."""
     log = get_logger()
     out = options.out_dir
+    bucket: str | None = None
     work_dir: Path | None = None
     bundle_dir: Path | None = None
     reporter = _reporter(stages)
@@ -1030,12 +1071,13 @@ def _process(
         if reporter is None:
             _write_done_marker(out, source.name)
         else:
-            _place(out, source.name, proxy_dir, reporter)
+            bucket = _place(out, source.name, proxy_dir, reporter)
     except BundleError as exc:
         log.error("refused %s (%s): %s", source.name, source.path.name, exc)
         result.refused.append(source.name)
         if reporter is not None:
-            _report_unsupported(reporter, options, source, str(exc), refused=True, bundle_dir=bundle_dir)
+            bucket = _report_unsupported(reporter, options, source, str(exc), refused=True, bundle_dir=bundle_dir)
+        return Outcome.REFUSED, bucket
     except Exception as exc:  # proxy boundary: one proxy failing never stops the batch
         # The entry names the error on its own line too, so grepping run.log finds it without the traceback.
         log.exception(
@@ -1048,10 +1090,12 @@ def _process(
         result.crashed.append(source.name)
         if reporter is not None:
             cause = f"stage {current} failed: {type(exc).__name__}: {exc}"
-            _report_unsupported(reporter, options, source, cause, refused=False, bundle_dir=bundle_dir)
+            bucket = _report_unsupported(reporter, options, source, cause, refused=False, bundle_dir=bundle_dir)
+        return Outcome.FAILED, bucket
     else:
         log.info("done %s", source.name)
         result.finished.append(source.name)
+        return Outcome.FINISHED, bucket
     finally:
         try:
             if work_dir is not None:
@@ -1060,8 +1104,9 @@ def _process(
             log.warning("could not remove unpacked copy of %s at %s: %s", source.name, work_dir, exc)
 
 
-def _place(out: Path, name: str, proxy_dir: Path, reporter: Reporter) -> None:
-    """Move the finished proxy's folder into the bucket the reporter chose, then write its ``.done`` there last."""
+def _place(out: Path, name: str, proxy_dir: Path, reporter: Reporter) -> str:
+    """Move the finished proxy's folder into the bucket the reporter chose, then write its ``.done`` there last;
+    return the bucket."""
     bucket = reporter.bucket_for(name)
     if bucket not in layout.BUCKET_DIR_NAMES:
         raise RuntimeError(f"the report stage chose no bucket for {name}")
@@ -1071,6 +1116,7 @@ def _place(out: Path, name: str, proxy_dir: Path, reporter: Reporter) -> None:
     safefs.move(out, proxy_dir, final)
     safefs.write_text_atomic(out, final / layout.DONE_MARKER_NAME, f"a2m finished {name}\n")
     get_logger().info("%s: results in %s/%s/", name, bucket, name)
+    return bucket
 
 
 def _report_unsupported(
@@ -1081,9 +1127,10 @@ def _report_unsupported(
     *,
     refused: bool,
     bundle_dir: Path | None,
-) -> None:
+) -> str | None:
     """Replace whatever the proxy has in the results folder with ``unsupported/<proxy>/REPORT.md`` naming
-    ``cause``; a failure to do so is logged, never raised (the proxy is already counted as refused or failed)."""
+    ``cause``; a failure to do so is logged, never raised (the proxy is already counted as refused or failed).
+    Return the bucket it is in, or None when the report could not be written."""
     out = options.out_dir
     log = get_logger()
     try:
@@ -1095,6 +1142,8 @@ def _report_unsupported(
         log.info("%s: results in %s/%s/", source.name, layout.UNSUPPORTED_DIR_NAME, source.name)
     except (OSError, UnsafePathError) as exc:
         log.error("could not write the unsupported report of %s: %s", source.name, exc)
+        return None
+    return layout.UNSUPPORTED_DIR_NAME
 
 
 def _materialize(source: BundleSource, work_dir: Path) -> None:

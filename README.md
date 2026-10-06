@@ -76,6 +76,7 @@ Maven.
 a2m migrate ./apigee-exports --out ./results [--only NAME] [--resume | --force]
             [--golden ./recordings] [--golden-ignore-header NAME] [--mock-backends]
             [--max-fix-attempts 3] [--llm claude|fake] [--no-runtime]
+            [--progress auto|lines|none]
 ```
 
 Examples:
@@ -104,6 +105,7 @@ mise exec -- a2m migrate ./apigee-exports --out ./results --golden ./recordings
 | `--max-fix-attempts N` | How many times the AI may try to fix an app whose tests fail (default 3; 0 turns the fix loop off). |
 | `--llm claude\|fake` | The AI provider for custom code, untranslatable conditions and fixes (default `claude`). |
 | `--no-runtime` | Skip everything that needs Java, Maven or the Mule runtime. Every proxy is then static at best. |
+| `--progress auto\|lines\|none` | Progress lines on stderr: one as each proxy starts (`[3/12] orders-api: generating`), one per slow step (building, deploying, running tests, `AI fix 1 of 3`) and one as it ends, naming its bucket. `auto` (the default) shows them only when stderr is a terminal, so piped or redirected output is unchanged; `lines` always shows them; `none` never does. They never change the results folder. |
 
 a2m runs the apps only with `--mock-backends` or `--golden`, only without `--no-runtime`, and only when Java,
 Maven and the Mule runtime are found. One proxy failing never stops the batch, and an interrupted run can be
