@@ -53,7 +53,8 @@ Footer FooterKey {
     }
 }
 
-/* ---- Body: surface, 1-cell page gutter ---- */
+/* ---- Body: surface, 1-cell page gutter left/right, none top/bottom (DESIGN.md Layout). Every setup
+   state fits 80x24; only a shorter terminal scrolls the form under the pinned Footer. ---- */
 #body {
     background: $surface;
     padding: 0 1;
@@ -72,29 +73,101 @@ Footer FooterKey {
 }
 
 /* ---- Text roles ---- */
-.field-label, .section-label {
+/* Folder field labels are regular weight as in the prototype; section labels (AI, Command, the
+   resume question) stay bold. */
+.field-label {
+    color: $foreground;
+}
+.section-label {
     text-style: bold;
     color: $foreground;
 }
 
-/* ---- Input: round border in the border token, panel inside ---- */
-#body Input {
+/* ---- Input: a round border in the border token, a heavy success/error border after a check, round accent on focus. The
+   border is the .field box around a borderless one-row Input; the box and the Input share the surface
+   fill, so the inside of the box is one uniform tone as in the prototype. The box stops 2 cells short
+   of the right gutter. ---- */
+#body .field-row {
     height: 3;
+}
+#body .field {
+    width: 1fr;
+    height: 3;
+    margin: 0 1 0 0;
     border: round $border;
-    background: $panel;
-    color: $foreground;
-    padding: 0 1;
-    &:focus {
+    background: $surface;
+    &.-valid {
+        border: heavy $success;
+    }
+    &.-invalid {
+        border: heavy $error;
+    }
+    &:focus-within {
         border: round $accent;
     }
+}
+#body Input {
+    height: 1;
+    border: none;
+    background: $surface;
+    color: $foreground;
+    padding: 0 1;
     & > .input--placeholder {
         color: $foreground-muted;
         text-style: italic;
+    }
+    &:focus {
+        border: none;
+        background-tint: transparent;
+    }
+    &.-invalid, &.-invalid:focus {
+        border: none;
     }
     &:disabled {
         opacity: 1;
         text-opacity: 1;
     }
+}
+
+/* ---- Browse… sits beside its field, on the field's text row, 2 cells short of the right gutter ---- */
+#body .field-row > Button {
+    margin: 1 2 0 0;
+}
+
+/* ---- The absolute folder a relative path names, under its field: dim, muted ---- */
+.resolved {
+    height: auto;
+    color: $foreground-muted;
+    text-style: dim;
+}
+
+/* ---- The line under a folder field: muted while checking, success or error after ---- */
+.hint {
+    height: auto;
+    color: $foreground-muted;
+    text-style: italic;
+    &.-valid {
+        color: $success;
+        text-style: none;
+    }
+    &.-invalid {
+        color: $error;
+        text-style: none;
+    }
+}
+
+/* The setup sections sit row on row (prototype renderSetup); only the Resume/Force prompt has a gap-1,
+   dropped by setup.py when both folder fields show their absolute folder line, so 80x24 still fits. */
+
+/* ---- Resume / Force choice for an earlier results folder ---- */
+#resume-choice {
+    height: 1;
+}
+
+/* ---- The one-line reason under a disabled Start ---- */
+#start-disabled-reason {
+    color: $foreground-muted;
+    text-style: italic;
 }
 
 /* ---- RadioSet (AI choice): compact toggle glyphs, inner dot dimmed when off ---- */
@@ -154,12 +227,15 @@ Footer FooterKey {
     text-overflow: ellipsis;
 }
 
-/* ---- Button: compact, one row, heavy left/right edge glyphs ---- */
-#body Button {
+/* ---- Button: compact, one row, heavy left/right edge glyphs (setup screen and dialogs) ---- */
+#body {
+    scrollbar-size-vertical: 1;
+}
+#body Button, #picker Button {
     height: 1;
     width: auto;
     min-width: 0;
-    /* Textual's Button already pads its label by one cell each side (line-pad). */
+    /* EdgeButton draws the label's one-cell padding itself, inside its fill (its line-pad is 0). */
     padding: 0;
     border: none;
     border-left: heavy $border;
@@ -167,22 +243,113 @@ Footer FooterKey {
     background: $surface;
     color: $foreground;
     text-style: none;
+    & > .edge-button--fill {
+        background: $surface;
+        color: $foreground;
+    }
+    /* Filled variants fill the padded label only; the edge glyphs stay on the surface. */
     &.-primary {
         border-left: heavy $primary;
         border-right: heavy $primary;
-        background: $primary;
-        color: white;
+        & > .edge-button--fill {
+            background: $primary;
+            color: white;
+        }
+    }
+    &.-error {
+        border-left: heavy $error;
+        border-right: heavy $error;
+        & > .edge-button--fill {
+            background: $error;
+            color: white;
+        }
     }
     &:focus {
         border-left: heavy $accent;
         border-right: heavy $accent;
     }
+    /* The edge glyphs stay dim border on the surface; only the padded label takes the background tint. */
     &:disabled {
         border-left: heavy $border;
         border-right: heavy $border;
-        background: $background;
+        background: $surface;
         color: $foreground-muted;
         opacity: 1;
         text-opacity: 1;
+        & > .edge-button--fill {
+            background: $background;
+            color: $foreground-muted;
+        }
+    }
+}
+
+/* ---- Resume and Force sit side by side, a gap-1 apart ---- */
+#resume-choice Button {
+    margin-right: 1;
+}
+
+/* ---- Folder browser dialog: overlay, heavy accent border; fits 80x24 above its Footer ---- */
+FolderPicker {
+    align: center middle;
+    background: $background 60%;
+}
+#picker {
+    width: 76;
+    height: 21;
+    background: $overlay;
+    border: heavy $accent;
+    padding: 0 1;
+}
+#picker-title {
+    text-style: bold;
+    color: $foreground;
+}
+/* The folder the browser is in, in full (wraps rather than cut short). */
+#picker-path {
+    height: auto;
+    background: $panel;
+    color: $foreground;
+}
+#picker-list {
+    height: 1fr;
+    background: $panel;
+    border: round $border;
+    &:focus {
+        border: round $accent;
+    }
+    & > .option-list--option-highlighted {
+        background: $accent;
+        color: $background;
+        text-style: none;
+    }
+    &:focus > .option-list--option-highlighted {
+        background: $accent;
+        color: $background;
+    }
+    & > .option-list--option-disabled {
+        color: $foreground-muted;
+        text-style: italic;
+    }
+}
+/* What a2m makes of the highlighted folder: muted while checking, success or error after. */
+#picker-preview {
+    height: auto;
+    max-height: 3;
+    color: $foreground-muted;
+    text-style: italic;
+    &.-valid {
+        color: $success;
+        text-style: none;
+    }
+    &.-invalid {
+        color: $error;
+        text-style: none;
+    }
+}
+#picker-buttons {
+    height: 1;
+    margin-top: 1;
+    & > Button {
+        margin-right: 1;
     }
 }

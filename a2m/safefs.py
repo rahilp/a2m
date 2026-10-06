@@ -249,3 +249,19 @@ def exclusive_lock(root: Path, target: Path) -> Iterator[None]:
         yield
     finally:
         os.close(fd)
+
+
+def lock_held(root: Path, target: Path) -> bool:
+    """Whether the lock :func:`exclusive_lock` takes on ``target`` is held right now; read-only.
+
+    Never creates ``target``: a missing file is not held. The lock is tried without waiting and released
+    at once. Anything but a plain file raises :class:`NotPlainFileError`, like :func:`exclusive_lock`.
+    """
+    try:
+        fd = open_plain_file(root, target, os.O_RDONLY)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    try:
+        return not _try_lock(fd)
+    finally:
+        os.close(fd)

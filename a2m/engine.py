@@ -430,11 +430,7 @@ def prepare_run(options: RunOptions) -> RunPlan:
 
     _check_done_markers(options.out_dir, names)
     if not names:
-        shared = f" ({len(discovery.shared_flows)} shared flow bundles only)" if discovery.shared_flows else ""
-        raise UsageError(
-            f"no proxies found in {options.input_dir}{shared}; expected folders or .zip files "
-            f"with an {PROXY_ROOT}/ folder at the top, or inside one top folder"
-        )
+        raise UsageError(_no_proxies_message(options.input_dir, discovery))
     if options.only is not None and options.only not in names:
         shown = ", ".join(names[:MAX_NAMES_IN_MESSAGE])
         more = len(names) - MAX_NAMES_IN_MESSAGE
@@ -454,6 +450,139 @@ def prepare_run(options: RunOptions) -> RunPlan:
         selected_rejected=tuple(r for r in discovery.rejected if wanted(r.name)),
         provider=provider,
     )
+
+
+def _no_proxies_message(input_dir: Path, discovery: Discovery) -> str:
+    shared = f" ({len(discovery.shared_flows)} shared flow bundles only)" if discovery.shared_flows else ""
+    return (
+        f"no proxies found in {input_dir}{shared}; expected folders or .zip files "
+        f"with an {PROXY_ROOT}/ folder at the top, or inside one top folder"
+    )
+
+
+class ResultsFolder(StrEnum):
+    """What a usable results folder holds, as far as starting a run in it goes."""
+
+    # Missing, empty, or holding only the lock file: a run starts fresh.
+    NEW = "new"
+    # Output from an earlier run: --resume continues it, --force redoes every proxy.
+    EARLIER_RUN = "earlier-run"
+    # An earlier --force run stopped before it removed every earlier .done marker: only --force can continue.
+    FORCE_PENDING = "force-pending"
+
+
+class ResultsFolderInUse(UsageError):
+    """:func:`check_results_folder`'s refusal of a folder another run holds locked, with what the folder holds.
+
+    The lock is checked last, so ``found`` is what the folder holds (an earlier run, or a force-pending one)
+    and a front end can still offer the Resume or Force choice the folder needs once it is free.
+    """
+
+    def __init__(self, message: str, found: ResultsFolder) -> None:
+        super().__init__(message)
+        self.found = found
+
+
+def check_exports(input_dir: Path) -> Discovery:
+    """The checks :func:`prepare_run` makes of the exports folder alone, with the same messages; read-only.
+
+    For front ends that check each folder as the user picks it (``a2m tui``). Returns what discovery
+    found; raises :class:`UsageError` when the folder is missing, is itself a bundle or holds no proxy.
+    """
+    input_dir = input_dir.absolute()
+    discovery = discover(input_dir)
+    if not discovery.candidate_names():
+        _check_not_a_bundle(input_dir)
+        raise UsageError(_no_proxies_message(input_dir, discovery))
+    return discovery
+
+
+def check_results_folder(
+    out_dir: Path,
+    *,
+    input_dir: Path | None,
+    names: Sequence[str],
+    resume: bool = False,
+    force: bool = False,
+) -> ResultsFolder:
+    """The checks ``a2m migrate`` makes of a results folder, with the same messages; read-only.
+
+    For front ends that check the results folder as the user picks it (``a2m tui``), before the user has
+    chosen --resume or --force: an earlier run's folder is returned as :attr:`ResultsFolder.EARLIER_RUN` or
+    :attr:`ResultsFolder.FORCE_PENDING` instead of being refused. Raises :class:`UsageError` for every
+    folder ``a2m migrate`` would refuse, and for ``resume`` on a force-pending folder. A folder another run
+    holds locked (checked last, without taking the lock) raises :class:`ResultsFolderInUse`, which still
+    carries what the folder holds, so the lock never hides an earlier or force-pending run. ``input_dir`` None skips the input folder
+    check; ``names`` are the proxies found in it (their ``.done`` markers must be plain files).
+    Nothing is created, changed or deleted.
+    """
+    # The checks run in the order a2m migrate makes them (prepare_run, then run_batch's lock), so a folder
+    # that fails more than one gets the message the command line would give.
+    if resume and force:
+        raise UsageError("--resume and --force cannot be used together")
+    out = out_dir.absolute()
+    try:
+        found = _results_folder(out, None if input_dir is None else input_dir.absolute())
+        if found is ResultsFolder.EARLIER_RUN and _force_pending(out):
+            found = ResultsFolder.FORCE_PENDING
+    except (OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop on Python 3.11
+        raise UsageError(_cannot_read_message(out, exc)) from exc
+    if resume and found is ResultsFolder.FORCE_PENDING:
+        raise UsageError(_force_pending_message(out))
+    _check_done_markers(out, names)
+    if out.is_dir() and _in_use(out):
+        raise ResultsFolderInUse(_in_use_message(out), found)
+    return found
+
+
+def done_proxies(out_dir: Path, names: Sequence[str]) -> list[str]:
+    """The proxies among ``names`` that --resume would skip in ``out_dir``: those with a ``.done`` marker.
+
+    Read-only; a name that is not safe, or whose marker cannot be checked, counts as not done.
+    """
+    out = out_dir.absolute()
+    done: list[str] = []
+    for name in names:
+        if unsafe_name_reason(name) is not None:
+            continue
+        try:
+            if _done_folder(out, name) is not None:
+                done.append(name)
+        except (OSError, UnsafePathError):
+            continue
+    return done
+
+
+def _done_folder(out: Path, name: str) -> Path | None:
+    """The folder of proxy ``name`` in ``out`` that holds its ``.done`` marker, or None."""
+    return next(
+        (folder for folder in _proxy_dirs(out, name) if safefs.is_regular_file(out, folder / layout.DONE_MARKER_NAME)),
+        None,
+    )
+
+
+def _in_use(out: Path) -> bool:
+    """Whether another a2m run holds the results folder's lock; never creates the lock file."""
+    try:
+        return safefs.lock_held(out, layout.lock_path(out))
+    except (OSError, UnsafePathError):
+        return False
+
+
+def _in_use_message(out: Path) -> str:
+    return f"results folder {out} is in use by another a2m run; wait for it to finish, then run again"
+
+
+def _force_pending_message(out: Path) -> str:
+    return (
+        f"results folder {out} has a --force run that stopped before it removed every earlier .done "
+        "marker, so --resume cannot tell finished proxies from old ones; rerun with --force to redo every proxy"
+    )
+
+
+def _cannot_read_message(out: Path, exc: OSError | RuntimeError) -> str:
+    text = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+    return f"cannot read results folder {out}: {text}"
 
 
 def _absolute_paths(options: RunOptions) -> RunOptions:
@@ -514,43 +643,57 @@ def _check_out_dir(options: RunOptions) -> None:
     try:
         _check_out_dir_unguarded(options)
     except (OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop on Python 3.11
-        text = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
-        raise UsageError(f"cannot read results folder {options.out_dir}: {text}") from exc
+        raise UsageError(_cannot_read_message(options.out_dir, exc)) from exc
 
 
 def _check_out_dir_unguarded(options: RunOptions) -> None:
     out = options.out_dir
-    if pathid.is_same_or_inside(out, options.input_dir) or pathid.is_same_or_inside(options.input_dir, out):
-        raise UsageError(
-            f"results folder {out} must not be the input folder {options.input_dir}, be inside it, or contain it"
-        )
-    if not out.exists():
-        _check_out_creatable(out)
+    if _results_folder(out, options.input_dir) is ResultsFolder.NEW:
         return
-    if not out.is_dir():
-        raise UsageError(f"results path {out} exists and is not a folder")
-    if not any(out.iterdir()):
-        return
-    _check_owned_entries(out)
-    # The lock file alone does not make a folder used: a run may have stopped
-    # between taking the lock and writing anything else.
-    if not any(entry.name != layout.LOCK_NAME for entry in out.iterdir()):
-        return
-    if not safefs.is_regular_file(out, layout.results_marker_path(out)):
-        raise UsageError(
-            f"results folder {out} is not empty and has no {layout.RESULTS_MARKER_NAME} marker, "
-            "so it is not an a2m results folder; choose a new or empty folder"
-        )
     if not (options.resume or options.force):
         raise UsageError(
             f"results folder {out} already has output from an earlier run; "
             "use --resume to continue it or --force to redo every proxy"
         )
-    if options.resume and safefs.is_regular_file(out, layout.force_pending_path(out)):
+    if options.resume and _force_pending(out):
+        raise UsageError(_force_pending_message(out))
+
+
+def _results_folder(out: Path, input_dir: Path | None) -> ResultsFolder:
+    """NEW or EARLIER_RUN for a usable results folder ``out``; UsageError for one no run may use.
+
+    ``input_dir`` None skips the check against the input folder. Never tells EARLIER_RUN from
+    FORCE_PENDING (see :func:`_force_pending`). May raise OSError or RuntimeError from reading.
+    """
+    if input_dir is not None and (
+        pathid.is_same_or_inside(out, input_dir) or pathid.is_same_or_inside(input_dir, out)
+    ):
         raise UsageError(
-            f"results folder {out} has a --force run that stopped before it removed every earlier .done "
-            "marker, so --resume cannot tell finished proxies from old ones; rerun with --force to redo every proxy"
+            f"results folder {out} must not be the input folder {input_dir}, be inside it, or contain it"
         )
+    if not out.exists():
+        _check_out_creatable(out)
+        return ResultsFolder.NEW
+    if not out.is_dir():
+        raise UsageError(f"results path {out} exists and is not a folder")
+    if not any(out.iterdir()):
+        return ResultsFolder.NEW
+    _check_owned_entries(out)
+    # The lock file alone does not make a folder used: a run may have stopped
+    # between taking the lock and writing anything else.
+    if not any(entry.name != layout.LOCK_NAME for entry in out.iterdir()):
+        return ResultsFolder.NEW
+    if not safefs.is_regular_file(out, layout.results_marker_path(out)):
+        raise UsageError(
+            f"results folder {out} is not empty and has no {layout.RESULTS_MARKER_NAME} marker, "
+            "so it is not an a2m results folder; choose a new or empty folder"
+        )
+    return ResultsFolder.EARLIER_RUN
+
+
+def _force_pending(out: Path) -> bool:
+    """Whether an earlier --force run in ``out`` stopped before it removed every earlier ``.done`` marker."""
+    return safefs.is_regular_file(out, layout.force_pending_path(out))
 
 
 def _check_out_creatable(out: Path) -> None:
@@ -681,9 +824,7 @@ def run_batch(
             reporter = Progress(progress, len(plan.selected))
             return _run_locked(plan, default_stages() if stages is None else stages, reporter)
     except LockHeldError:
-        raise UsageError(
-            f"results folder {out} is in use by another a2m run; wait for it to finish, then run again"
-        ) from None
+        raise UsageError(_in_use_message(out)) from None
     except NotPlainFileError as exc:
         raise UsageError(f"results folder {out}: {exc}; remove it and run again") from exc
 
@@ -840,18 +981,7 @@ def _run_one(
         result.crashed.append(source.name)
         return Outcome.FAILED, None
     try:
-        done_in = (
-            next(
-                (
-                    folder
-                    for folder in _proxy_dirs(out, source.name)
-                    if safefs.is_regular_file(out, folder / layout.DONE_MARKER_NAME)
-                ),
-                None,
-            )
-            if options.resume
-            else None
-        )
+        done_in = _done_folder(out, source.name) if options.resume else None
     except (OSError, UnsafePathError) as exc:
         log.error("failed %s: cannot check its earlier result: %s", source.name, exc)
         result.crashed.append(source.name)

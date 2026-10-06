@@ -77,14 +77,17 @@ class A2MApp(App[int]):
         Binding("question_mark", "toggle_help", "Help", key_display="?"),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, *, exports: str = "", results: str = "") -> None:
+        """``exports`` and ``results`` fill the setup screen's folder fields when it opens (checked as if typed)."""
         super().__init__()
         self.register_theme(DARK)
         self.register_theme(LIGHT)
         self.theme = DARK.name
+        self._exports = exports
+        self._results = results
 
     def on_mount(self) -> None:
-        self.push_screen(SetupScreen())
+        self.push_screen(SetupScreen(exports=self._exports, results=self._results))
 
     def action_toggle_help(self) -> None:
         """Show the key help panel, or hide it when it is already open."""
