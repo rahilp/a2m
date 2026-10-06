@@ -7,6 +7,32 @@ running tests, each AI fix attempt) and ``proxy-finished`` with its outcome and 
 ``run-finished`` with the counts. Events are plain frozen dataclasses with closed vocabularies, so they turn
 into JSON with ``dataclasses.asdict``.
 
+``a2m migrate --progress json`` writes the stream another program (the TUI) reads: one JSON object per
+stdout line (:func:`json_line`), keys sorted, ASCII only, every string escaped to one line and masked like
+terminal output. Each object has ``schema_version`` (:data:`SCHEMA_VERSION`) and ``kind``:
+
+- ``run-started``, ``proxy-started``, ``step``, ``proxy-finished``: every :class:`ProgressEvent` field
+  (``total``, ``index``, ``name``, ``step``, ``attempt``, ``attempts``, ``outcome``, ``bucket``, and the
+  counts, which are 0 here). Where a field does not apply, the int fields (``total``, ``index``,
+  ``attempt``, ``attempts`` and the counts) are ``0``; only ``step``, ``outcome`` and ``bucket`` are
+  ``null``. Read a field only for the kinds it belongs to: ``attempt`` 0 means "not an AI fix attempt".
+- ``run-finished`` (last line of a completed run): the same fields with the counts ``finished``,
+  ``skipped``, ``refused``, ``failed``, plus ``exit_code`` (0, or 1 when a proxy failed), ``log`` (the
+  run.log path) and ``notices`` (batch-wide notices, a list of strings).
+- ``stopped`` (last line of a run stopped by Ctrl-C or a signal): ``exit_code`` (130, or 128 plus the
+  signal), ``signal`` (e.g. ``SIGINT``), ``advice`` (how to finish the job, as the plain CLI prints it) and
+  ``message`` (the CLI's own one-line notice).
+- ``error`` (last line when the results could not be written after the stream began): ``exit_code`` (1)
+  and ``message``.
+
+A stream is not guaranteed to begin with ``run-started``: a Ctrl-C or signal that arrives before the batch
+starts (while the run is being prepared) gives a stream of exactly one ``stopped`` line. A consumer must
+treat a lone ``stopped`` as a valid, complete stream (the run ended before any proxy was processed).
+``error`` is only written after ``run-started``.
+
+Usage errors (bad flags, missing folder, results folder in use) give no JSON at all: one stderr line and
+exit code 2. Human notices and the summary line go to stderr in this mode, never stdout.
+
 Progress never changes a run. :class:`Progress` calls the callback through a guard: a callback that raises
 is logged once in run.log and never called again, and the migration carries on as if it was never there.
 Stages deep in the pipeline report their steps with :func:`step`, which goes to the proxy being processed
@@ -16,12 +42,18 @@ Stages deep in the pipeline report their steps with :func:`step`, which goes to 
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable, Iterator
+import dataclasses
+import json
+from collections.abc import Callable, Iterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
 
-from a2m.runlog import get_logger
+from a2m.redaction import redact
+from a2m.runlog import get_logger, one_line
+
+# The version of the --progress json stream's shape (see the module docstring); bumped on incompatible change.
+SCHEMA_VERSION = 1
 
 
 class EventKind(StrEnum):
@@ -30,6 +62,9 @@ class EventKind(StrEnum):
     STEP = "step"
     PROXY_FINISHED = "proxy-finished"
     RUN_FINISHED = "run-finished"
+    # Written by the command line only, as the last line of a run that did not finish (see the module docstring).
+    STOPPED = "stopped"
+    ERROR = "error"
 
 
 class Step(StrEnum):
@@ -101,6 +136,26 @@ def describe(event: ProgressEvent) -> str | None:
     else:
         return None
     return f"[{event.index}/{event.total}] {event.name}: {text}"
+
+
+def event_fields(event: ProgressEvent) -> dict[str, object]:
+    """``event`` as the plain fields of its JSON object (enums as their values)."""
+    return dataclasses.asdict(event)
+
+
+def _safe(value: object) -> object:
+    if isinstance(value, str):
+        return one_line(redact(str(value)))
+    if isinstance(value, list | tuple):
+        return [_safe(item) for item in value]
+    return value
+
+
+def json_line(fields: Mapping[str, object]) -> str:
+    """One line of the --progress json stream: ``fields`` plus ``schema_version``, strings made safe."""
+    record = {key: _safe(value) for key, value in fields.items()}
+    record["schema_version"] = SCHEMA_VERSION
+    return json.dumps(record, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
 
 
 _current: ContextVar[Progress | None] = ContextVar("a2m_progress", default=None)

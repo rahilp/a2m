@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, NoReturn
 from a2m import __version__
 from a2m.engine import LlmChoice, RunOptions, Stage, interrupted_signal, prepare_run, rerun_advice, run_batch
 from a2m.errors import UnsafePathError, UsageError
-from a2m.progress import ProgressCallback, ProgressEvent, describe
+from a2m.progress import EventKind, ProgressCallback, ProgressEvent, describe, event_fields, json_line
 from a2m.redaction import redact
 from a2m.runlog import one_line
 
@@ -44,7 +44,9 @@ EXIT_INTERRUPTED = 130
 PROGRESS_AUTO = "auto"
 PROGRESS_LINES = "lines"
 PROGRESS_NONE = "none"
-PROGRESS_CHOICES = (PROGRESS_AUTO, PROGRESS_LINES, PROGRESS_NONE)
+# --progress json: one JSON object per stdout line for another program (see a2m.progress); text goes to stderr.
+PROGRESS_JSON = "json"
+PROGRESS_CHOICES = (PROGRESS_AUTO, PROGRESS_LINES, PROGRESS_NONE, PROGRESS_JSON)
 
 
 def _write(stream: SupportsWrite[str] | None, text: str) -> None:
@@ -210,7 +212,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--progress",
         choices=PROGRESS_CHOICES,
         default=PROGRESS_AUTO,
-        help="progress lines on stderr: auto (only when stderr is a terminal, the default), lines or none",
+        help=(
+            "progress lines on stderr: auto (only when stderr is a terminal, the default), lines or none; json "
+            "writes one JSON event per stdout line for another program"
+        ),
     )
     return parser
 
@@ -228,6 +233,27 @@ def _progress_callback(mode: str) -> ProgressCallback | None:
             _say(line, err=True, terminal_only=terminal_only)
 
     return show
+
+
+class _JsonStream:
+    """The --progress json stream on stdout (shape: :mod:`a2m.progress`).
+
+    The engine's run-finished event is held back so the CLI can write it last, with the exit code.
+    """
+
+    def __init__(self) -> None:
+        self.started = False
+        self.run_finished: ProgressEvent | None = None
+
+    def send(self, fields: dict[str, object]) -> None:
+        self.started = True
+        _say(json_line(fields))
+
+    def event(self, event: ProgressEvent) -> None:
+        if event.kind is EventKind.RUN_FINISHED:
+            self.run_finished = event
+        else:
+            self.send(event_fields(event))
 
 
 def main(argv: list[str] | None = None, *, stages: Sequence[Stage] | None = None) -> int:
@@ -250,26 +276,52 @@ def main(argv: list[str] | None = None, *, stages: Sequence[Stage] | None = None
         no_runtime=args.no_runtime,
         golden_ignore_headers=tuple(args.golden_ignore_header),
     )
+    json_stream = _JsonStream() if args.progress == PROGRESS_JSON else None
+    callback = json_stream.event if json_stream is not None else _progress_callback(args.progress)
     try:
         plan = prepare_run(options)
-        result = run_batch(plan, stages, progress=_progress_callback(args.progress))
+        result = run_batch(plan, stages, progress=callback)
     except KeyboardInterrupt as exc:
         signum = interrupted_signal(exc)
         what = "interrupted" if signum is None else f"stopped by {signal.Signals(signum).name}"
-        _say(f"a2m migrate: {what}; {rerun_advice(options, exc)}", err=True)
-        return EXIT_INTERRUPTED if signum is None else 128 + signum
+        advice = rerun_advice(options, exc)
+        message = f"a2m migrate: {what}; {advice}"
+        code = EXIT_INTERRUPTED if signum is None else 128 + signum
+        _say(message, err=True)
+        if json_stream is not None:
+            name = signal.Signals(signum if signum is not None else signal.SIGINT).name
+            json_stream.send(
+                {"kind": EventKind.STOPPED, "exit_code": code, "signal": name, "advice": advice, "message": message}
+            )
+        return code
     except UsageError as exc:
+        # One stderr line and exit 2, never a JSON event: a front end shows the line as it is.
         _say(f"a2m migrate: usage error: {exc}", err=True)
         return EXIT_USAGE
     except (OSError, UnsafePathError) as exc:
-        _say(f"a2m migrate: error: cannot write results to {options.out_dir}: {exc}", err=True)
+        message = f"a2m migrate: error: cannot write results to {options.out_dir}: {exc}"
+        _say(message, err=True)
+        if json_stream is not None and json_stream.started:
+            json_stream.send({"kind": EventKind.ERROR, "exit_code": EXIT_PROXY_FAILED, "message": message})
         return EXIT_PROXY_FAILED
 
+    code = EXIT_PROXY_FAILED if result.crashed else EXIT_OK
     for notice in result.notices:
         _say(f"a2m: {notice}", err=True)
     _say(
         f"a2m: {len(result.finished)} done, {len(result.skipped)} skipped as already done, "
         f"{len(result.refused)} refused, {len(result.crashed)} failed. "
-        f"Log: {result.log_path}"
+        f"Log: {result.log_path}",
+        err=json_stream is not None,  # stdout carries only JSON in json mode
     )
-    return EXIT_PROXY_FAILED if result.crashed else EXIT_OK
+    if json_stream is not None:
+        finished = json_stream.run_finished
+        fields: dict[str, object] = (
+            event_fields(finished) if finished is not None else {"kind": EventKind.RUN_FINISHED}
+        )
+        fields.update(
+            finished=len(result.finished), skipped=len(result.skipped), refused=len(result.refused),
+            failed=len(result.crashed), exit_code=code, log=str(result.log_path), notices=list(result.notices),
+        )
+        json_stream.send(fields)
+    return code
