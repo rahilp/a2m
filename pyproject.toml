@@ -12,9 +12,11 @@ dependencies = ["defusedxml>=0.7.1"]
 
 [project.optional-dependencies]
 # ruff and mypy are the project's static checks; CP1-T55/T61 run them.
-dev = ["pytest>=8", "ruff>=0.16", "mypy>=2.4", "types-defusedxml>=0.7"]
+dev = ["pytest>=8", "ruff>=0.16", "mypy>=2.4", "types-defusedxml>=0.7", "textual>=8.2.8,<9", "textual-dev>=1.8"]
 # The Anthropic SDK for --llm claude (the default); imported lazily, so a2m runs without it with --llm fake.
 claude = ["anthropic>=0.40"]
+# Textual for the terminal UI (`a2m tui`); imported lazily, so the plain command line runs without it.
+tui = ["textual>=8.2.8,<9"]
 
 [project.scripts]
 a2m = "a2m.cli:main"
@@ -28,6 +30,8 @@ include = ["a2m*"]
 # The AI prompts (data, editable without touching code) and the fake provider's built-in answers.
 "a2m" = ["prompts/*.md"]
 "a2m.ai" = ["canned/*.json"]
+# The terminal UI's stylesheet.
+"a2m.tui" = ["*.tcss"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -7,6 +7,13 @@ interrupted (Ctrl-C), 128 plus the signal number when it was stopped by
 SIGTERM (143) or SIGHUP (129). An interrupted or stopped run still stops the
 Mule runtime it started.
 
+``a2m tui``, and a bare ``a2m`` typed in a terminal (stdin and stdout both
+terminals), open the terminal UI. It needs the optional ``tui`` extra; without
+it they print one line naming ``pip install "a2m[tui]"`` and exit 2. Textual
+is imported only for those two, never for any other command.
+``a2m tui`` without an interactive terminal prints one line saying so and
+exits 2 rather than waiting for keys that can never arrive.
+
 Terminal output is best effort and never changes the exit code: when stdout
 or stderr is closed, is a pipe whose reader has gone (``a2m ... | head``) or
 cannot be written (``> /dev/full``), the message is dropped without a
@@ -20,13 +27,13 @@ import argparse
 import os
 import signal
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 from a2m import __version__
 from a2m.engine import LlmChoice, RunOptions, Stage, interrupted_signal, prepare_run, rerun_advice, run_batch
-from a2m.errors import UnsafePathError, UsageError
+from a2m.errors import NoTerminalError, UnsafePathError, UsageError
 from a2m.progress import EventKind, ProgressCallback, ProgressEvent, describe, event_fields, json_line
 from a2m.redaction import redact
 from a2m.runlog import one_line
@@ -47,6 +54,10 @@ PROGRESS_NONE = "none"
 # --progress json: one JSON object per stdout line for another program (see a2m.progress); text goes to stderr.
 PROGRESS_JSON = "json"
 PROGRESS_CHOICES = (PROGRESS_AUTO, PROGRESS_LINES, PROGRESS_NONE, PROGRESS_JSON)
+
+# `a2m tui` (and a bare `a2m` typed in a terminal) opens the terminal UI, which needs the optional tui extra.
+TUI_COMMAND = "tui"
+TUI_INSTALL = 'pip install "a2m[tui]"'
 
 
 def _write(stream: SupportsWrite[str] | None, text: str) -> None:
@@ -92,15 +103,21 @@ def _silence(stream: object) -> None:
         os.close(devnull)
 
 
-def _say(message: str, *, err: bool = False, terminal_only: bool = False) -> None:
+def _say(message: str | None, *, err: bool = False, terminal_only: bool = False) -> bool:
     """Print ``message`` as exactly one line on stdout (or stderr with ``err``).
 
     With ``terminal_only`` the line is dropped unless that stream is a terminal (``--progress auto``).
+    With ``message`` None nothing is written: the call only reports whether that stream is a
+    terminal, so the terminal checks share the one place that picks the stream. Returns whether the
+    stream is a terminal for a ``None`` message, and whether a line was written otherwise.
     """
     stream = sys.stderr if err else sys.stdout
+    if message is None:
+        return _is_terminal(stream)
     if terminal_only and not _is_terminal(stream):
-        return
+        return False
     _write(stream, one_line(message))
+    return True
 
 
 def _is_terminal(stream: object) -> bool:
@@ -110,12 +127,25 @@ def _is_terminal(stream: object) -> bool:
         return False
 
 
+def _at_terminal() -> bool:
+    """True when a person is typing at a terminal: stdin and stdout are both terminals.
+
+    Only asks the streams whether they are terminals and never writes to them. stdout is asked through
+    :func:`_say` (with no message), the helper that owns every stdout and stderr access.
+    """
+    return _is_terminal(sys.stdin) and _say(None)
+
+
+def _usage_error_line(prog: str, message: str) -> str:
+    text = " ".join(message.split())
+    return f"{prog}: usage error: {text} (see '{prog} --help')"
+
+
 class _Parser(argparse.ArgumentParser):
     """An ArgumentParser whose errors are one stderr line and exit code 2."""
 
     def error(self, message: str) -> NoReturn:
-        text = " ".join(message.split())
-        self.exit(EXIT_USAGE, f"{self.prog}: usage error: {text} (see '{self.prog} --help')\n")
+        self.exit(EXIT_USAGE, _usage_error_line(self.prog, message) + "\n")
 
     def _print_message(self, message: str, file: SupportsWrite[str] | None = None) -> None:
         # Help, version and usage errors all reach the terminal through here.
@@ -217,6 +247,11 @@ def build_parser() -> argparse.ArgumentParser:
             "writes one JSON event per stdout line for another program"
         ),
     )
+    commands.add_parser(
+        TUI_COMMAND,
+        help="open the terminal UI (needs the tui extra)",
+        description=f"Open the a2m terminal UI. It needs the tui extra: {TUI_INSTALL}",
+    )
     return parser
 
 
@@ -256,13 +291,50 @@ class _JsonStream:
             self.send(event_fields(event))
 
 
+def _load_tui() -> Callable[..., int] | None:
+    """The TUI's entry point, or None when the tui extra (Textual) is not installed.
+
+    The only place the command line imports :mod:`a2m.tui`, so every other command runs without Textual.
+    """
+    try:
+        from a2m.tui.app import run_app
+    except ModuleNotFoundError as exc:
+        if (exc.name or "").partition(".")[0] != "textual":
+            raise
+        return None
+    return run_app
+
+
+def _open_tui(run_app: Callable[..., int]) -> int:
+    """Open the TUI; without an interactive terminal, one clear stderr line and EXIT_USAGE instead of a hang."""
+    try:
+        return run_app(at_terminal=_at_terminal)
+    except NoTerminalError as exc:
+        _say(str(exc), err=True)
+        return EXIT_USAGE
+
+
 def main(argv: list[str] | None = None, *, stages: Sequence[Stage] | None = None) -> int:
     """Run the a2m command line and return its exit code."""
     parser = build_parser()
+    if not (sys.argv[1:] if argv is None else argv) and _at_terminal():
+        # A bare `a2m` typed in a terminal opens the TUI; piped or scripted, it stays a usage error.
+        run_app = _load_tui()
+        if run_app is None:
+            missing = _usage_error_line(parser.prog, "the following arguments are required: COMMAND")
+            _say(f"{missing}; for the terminal UI (a2m tui), install the tui extra: {TUI_INSTALL}", err=True)
+            return EXIT_USAGE
+        return _open_tui(run_app)
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:  # --help, --version and usage errors
         return exc.code if isinstance(exc.code, int) else EXIT_USAGE
+    if args.command == TUI_COMMAND:
+        run_app = _load_tui()
+        if run_app is None:
+            _say(f"a2m tui: the terminal UI needs the tui extra; install it with: {TUI_INSTALL}", err=True)
+            return EXIT_USAGE
+        return _open_tui(run_app)
     options = RunOptions(
         input_dir=args.exports,
         out_dir=args.out,

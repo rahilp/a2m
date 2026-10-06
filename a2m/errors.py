@@ -43,3 +43,7 @@ class NotPlainFileError(UnsafePathError):
 
 class LockHeldError(A2mError):
     """Another process holds the lock a2m needs (another run uses the results folder)."""
+
+
+class NoTerminalError(UsageError):
+    """The terminal UI was asked to open without an interactive terminal (stdin and stdout not both terminals)."""

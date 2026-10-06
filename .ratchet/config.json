@@ -20,7 +20,7 @@
     ".ratchet/standards.md"
   ],
   "app": {
-    "start_command": "textual serve --host 127.0.0.1 --port 8765 \".venv/bin/python -m a2m.tui\"",
+    "start_command": ".venv/bin/textual serve -c --host 127.0.0.1 --port 8765 \".venv/bin/python tools/tui_states.py --state setup-empty\"",
     "url": "http://127.0.0.1:8765",
     "healthcheck": "curl -sf http://127.0.0.1:8765"
   },

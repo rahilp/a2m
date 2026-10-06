@@ -1,0 +1,188 @@
+/* a2m TUI styles. Every color is a DESIGN.md token (section 2) set by the a2m-dark / a2m-light
+   themes in app.py; spacing uses the gap-0..gap-3 cell scale. */
+
+Screen {
+    background: $background;
+    color: $foreground;
+}
+
+/* ---- Header: row 0, title left (bold), version right (muted) ---- */
+AppHeader {
+    dock: top;
+    height: 1;
+    padding: 0 1;
+    background: $background;
+}
+#hdr-title {
+    width: 1fr;
+    text-style: bold;
+    color: $foreground;
+}
+#hdr-version {
+    width: auto;
+    text-style: bold;
+    color: $foreground-muted;
+}
+
+/* ---- Footer: last row, key (bold, accent) + label (muted), 2 cells apart ---- */
+Footer {
+    background: $background;
+    color: $foreground-muted;
+    padding: 0 1;
+}
+Footer FooterKey {
+    margin-right: 2;
+    background: $background;
+    color: $foreground-muted;
+    & > .footer-key--key {
+        padding: 0;
+        background: $background;
+        color: $accent;
+        text-style: bold;
+    }
+    & > .footer-key--description {
+        padding: 0 0 0 1;
+        background: $background;
+        color: $foreground-muted;
+        text-style: none;
+    }
+    /* No hover band: the strip stays flush with the background, as in the prototype. */
+    &:hover {
+        background: $background;
+        color: $foreground-muted;
+    }
+}
+
+/* ---- Body: surface, 1-cell page gutter ---- */
+#body {
+    background: $surface;
+    padding: 0 1;
+    height: 1fr;
+}
+
+/* ---- Spacing scale (cells) ---- */
+.gap-1 {
+    margin-top: 1;
+}
+.gap-2 {
+    margin-top: 2;
+}
+.gap-3 {
+    margin-top: 3;
+}
+
+/* ---- Text roles ---- */
+.field-label, .section-label {
+    text-style: bold;
+    color: $foreground;
+}
+
+/* ---- Input: round border in the border token, panel inside ---- */
+#body Input {
+    height: 3;
+    border: round $border;
+    background: $panel;
+    color: $foreground;
+    padding: 0 1;
+    &:focus {
+        border: round $accent;
+    }
+    & > .input--placeholder {
+        color: $foreground-muted;
+        text-style: italic;
+    }
+    &:disabled {
+        opacity: 1;
+        text-opacity: 1;
+    }
+}
+
+/* ---- RadioSet (AI choice): compact toggle glyphs, inner dot dimmed when off ---- */
+#body RadioSet {
+    background: $surface;
+    &:disabled {
+        opacity: 1;
+        text-opacity: 1;
+    }
+    & > RadioButton {
+        background: $surface;
+        color: $foreground;
+        & > .toggle--button {
+            color: $foreground-muted;
+            background: $panel;
+        }
+        &.-on > .toggle--button {
+            color: $primary;
+        }
+        &.-on > .toggle--label {
+            text-style: bold;
+        }
+    }
+    /* No cursor highlight unless the set has focus. */
+    &:blur > RadioButton.-selected > .toggle--label {
+        background: $surface;
+    }
+}
+
+/* ---- Collapsible (Advanced options): header row only when closed ---- */
+#body Collapsible {
+    background: $surface;
+    border-top: none;
+    padding: 0;
+    &:disabled {
+        opacity: 1;
+        text-opacity: 1;
+    }
+    CollapsibleTitle {
+        padding: 0;
+        color: $foreground-muted;
+        text-style: none;
+        &:focus {
+            color: $accent;
+            background: $surface;
+        }
+    }
+}
+
+/* ---- Command preview: one borderless line on panel ---- */
+#command-preview {
+    height: 1;
+    width: 100%;
+    background: $panel;
+    color: $foreground;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+/* ---- Button: compact, one row, heavy left/right edge glyphs ---- */
+#body Button {
+    height: 1;
+    width: auto;
+    min-width: 0;
+    /* Textual's Button already pads its label by one cell each side (line-pad). */
+    padding: 0;
+    border: none;
+    border-left: heavy $border;
+    border-right: heavy $border;
+    background: $surface;
+    color: $foreground;
+    text-style: none;
+    &.-primary {
+        border-left: heavy $primary;
+        border-right: heavy $primary;
+        background: $primary;
+        color: white;
+    }
+    &:focus {
+        border-left: heavy $accent;
+        border-right: heavy $accent;
+    }
+    &:disabled {
+        border-left: heavy $border;
+        border-right: heavy $border;
+        background: $background;
+        color: $foreground-muted;
+        opacity: 1;
+        text-opacity: 1;
+    }
+}

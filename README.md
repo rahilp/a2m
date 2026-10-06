@@ -16,7 +16,8 @@ a2m needs Python 3.11 or newer.
 ```sh
 pip install .              # from a checkout of this repository
 pip install ".[claude]"    # with the Anthropic SDK, needed for --llm claude (the default)
-pip install ".[dev]"       # with pytest, ruff and mypy, for development
+pip install ".[tui]"       # with Textual, needed for the terminal UI (a2m tui)
+pip install ".[dev]"       # with pytest, ruff, mypy and the Textual dev tools, for development
 ```
 
 `uv pip install ".[claude]"` works the same way.
@@ -110,6 +111,15 @@ mise exec -- a2m migrate ./apigee-exports --out ./results --golden ./recordings
 a2m runs the apps only with `--mock-backends` or `--golden`, only without `--no-runtime`, and only when Java,
 Maven and the Mule runtime are found. One proxy failing never stops the batch, and an interrupted run can be
 finished with `--resume`.
+
+### Terminal UI
+
+`a2m tui` opens a full-screen terminal UI (so does a bare `a2m` typed in a terminal; piped or in a script, a bare
+`a2m` is still a usage error). `q` or `ctrl+q` quits, `?` lists the keys. It needs the `tui` extra; without it,
+`a2m tui` prints one line naming `pip install "a2m[tui]"` and exits with code 2. Without an interactive terminal
+(stdin or stdout redirected, a script, CI, `ssh` without a pty) `a2m tui` prints one line saying so and exits with
+code 2 instead of waiting for keys. For now it shows the setup
+screen only; choosing folders and starting a run from it come in later releases.
 
 ## The three buckets
 
