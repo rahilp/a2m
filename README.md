@@ -11,7 +11,29 @@ tests fail. Every AI result carries a confidence level and notes, and low confid
 
 ## Install
 
-a2m needs Python 3.11 or newer.
+From a checkout of this repository, on Linux or macOS:
+
+```sh
+./install.sh
+```
+
+It installs the `a2m` command with the terminal UI and the Anthropic SDK, then prints the installed
+`a2m --version`. It uses uv (`uv tool install`) when uv is on your PATH, otherwise pipx, otherwise a private
+virtual environment in `~/.local/share/a2m/venv` with a `~/.local/bin/a2m` link (this needs Python 3.11 or newer).
+It never uses sudo and never edits your shell files: if the folder holding `a2m` is not on your PATH, it prints
+the line to add and the file to add it to. The install is editable, so after a `git pull` `a2m` runs the new
+code; run `./install.sh` again when the dependencies change (it upgrades the same install in place).
+
+```sh
+./install.sh --no-tui      # without the terminal UI (Textual)
+./install.sh --uninstall   # remove what install.sh installed, and nothing else
+```
+
+Java, Maven and the Mule runtime (pinned in `mise.toml`) are only needed to build and run the generated apps;
+see [Local Mule toolchain](#local-mule-toolchain-optional). Without them, or with `--no-runtime`, a2m still
+generates every project.
+
+For development, or to install into an environment of your own, use pip (Python 3.11 or newer):
 
 ```sh
 pip install .              # from a checkout of this repository
@@ -128,7 +150,8 @@ never shown.
 
 #### Using the TUI
 
-1. Install the extra: `pip install ".[tui]"` (or `pip install "a2m[tui]"`).
+1. Install a2m with `./install.sh` (it includes the TUI), or add the extra to a pip install:
+   `pip install ".[tui]"` (or `pip install "a2m[tui]"`).
 2. Run `a2m tui` in a terminal of at least 80 columns by 24 rows.
 3. On the setup screen pick the exports and results folders (type a path, `tab` completes a folder name,
    `ctrl+o` or `Browse…` opens a folder browser), choose the AI, and press `Start`. `Open results…` opens the
