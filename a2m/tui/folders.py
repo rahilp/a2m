@@ -29,6 +29,7 @@ from a2m.engine import (
 )
 from a2m.errors import UsageError
 from a2m.tui.command import RerunChoice, SetupChoices
+from a2m.tui.read import Problem, preview_label
 
 VALID_MARK = "✓"
 INVALID_MARK = "✗"
@@ -217,6 +218,17 @@ def preview_results(folder: Path, *, exports: Path | None) -> FieldCheck:
     if found is ResultsFolder.NEW:
         return FieldCheck.valid(f"{VALID_MARK} No results yet, ready for a new run")
     return FieldCheck.valid(_earlier_run_text(found))
+
+
+def preview_open_results(folder: Path) -> FieldCheck:
+    """Whether ``folder`` holds a2m results the results screen can show (the folder browser's preview when
+    opening results); read-only."""
+    problem, text = preview_label(folder)
+    if problem is None:
+        return FieldCheck.valid(f"{VALID_MARK} {text}")
+    if problem is Problem.NO_SUMMARY:
+        return FieldCheck(Status.NONE, text)
+    return FieldCheck.invalid(text)
 
 
 def _earlier_run_text(found: ResultsFolder) -> str:

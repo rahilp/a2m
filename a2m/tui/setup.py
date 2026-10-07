@@ -38,9 +38,18 @@ from a2m.engine import LlmChoice
 from a2m.errors import A2mError
 from a2m.tui.child import migrate_child_argv
 from a2m.tui.command import RerunChoice, SetupChoices, command_preview, folder_path, resolved_folder
-from a2m.tui.folders import FieldCheck, SetupCheck, Status, check_setup, preview_exports, preview_results
+from a2m.tui.folders import (
+    FieldCheck,
+    SetupCheck,
+    Status,
+    check_setup,
+    preview_exports,
+    preview_open_results,
+    preview_results,
+)
 from a2m.tui.frame import AppFooter, AppHeader, EdgeButton, GlyphCheckbox, GlyphRadioButton, global_keys_first
 from a2m.tui.picker import FolderPicker, FolderSuggester, start_folder
+from a2m.tui.results import ResultsScreen
 from a2m.tui.run import RunScreen
 
 # A check starts this long after the last change, so typing a path does not scan every folder on the way.
@@ -51,6 +60,7 @@ COMMAND_COPIED = "Command copied"
 NO_KEY_REASON = "Set ANTHROPIC_API_KEY to use Claude"
 NO_SDK_REASON = "Install the Anthropic SDK to use Claude"
 ADVANCED_REASON = "An Advanced option needs fixing: open Advanced options"
+OPEN_RESULTS_TITLE = "Choose a results folder to open"
 
 
 class Body(VerticalScroll, can_focus=False):
@@ -179,7 +189,9 @@ class SetupScreen(Screen[None]):
                 yield from self._advanced_fields()
             yield Static("Command", id="label-command", classes="section-label", markup=False)
             yield Static(self._command, id="command-preview", markup=False)
-            yield EdgeButton("Start", id="start", variant="primary", compact=True, disabled=True)
+            with Horizontal(id="start-row"):
+                yield EdgeButton("Start", id="start", variant="primary", compact=True, disabled=True)
+                yield EdgeButton("Open results…", id="open-results", compact=True)
             yield Static(CHOOSE_RERUN_REASON, id="start-disabled-reason", markup=False)
         yield AppFooter(id="ftr", compact=True, show_command_palette=False)
 
@@ -284,14 +296,31 @@ class SetupScreen(Screen[None]):
             self.browse(self.query_one("#input-exports", FolderInput))
         elif event.button.id == "browse-results":
             self.browse(self.query_one("#input-results", FolderInput))
+        elif event.button.id == "open-results":
+            self.open_results()
         elif event.button.id == "start":
-            self.app.push_screen(RunScreen(migrate_child_argv(self.choices())), self._after_run)
+            choices = self.choices()
+            run = RunScreen(migrate_child_argv(choices), results=folder_path(choices.results))
+            self.app.push_screen(run, partial(self._after_run, run))
 
-    def _after_run(self, _result: None) -> None:
-        """Back from a run: the results folder now holds it, so check again and ask Resume or Force anew."""
+    def _after_run(self, run: RunScreen, _result: None) -> None:
+        """Back from a run: the results folder now holds it, so check again and ask Resume or Force anew. A
+        run that finished hands over to its results screen."""
         self._rerun = None
         self._reveal_start = False
         self._check()
+        if run.handed_over is not None:
+            self.app.push_screen(ResultsScreen(run.handed_over))
+
+    def open_results(self) -> None:
+        """Browse to an earlier results folder (starting at the Results field's folder) and show its results."""
+        field = self.query_one("#input-results", FolderInput)
+        picker = FolderPicker(OPEN_RESULTS_TITLE, start_folder(folder_path(field.value)), preview=preview_open_results)
+        self.app.push_screen(picker, self._results_chosen)
+
+    def _results_chosen(self, folder: Path | None) -> None:
+        if folder is not None:
+            self.app.push_screen(ResultsScreen(folder))
 
     def browse(self, field: FolderInput) -> None:
         """Open the folder browser for ``field``, at its folder (or the nearest one above it that exists)."""

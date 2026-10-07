@@ -14,6 +14,8 @@ prototype's ``/home/user/...`` only in their temporary parent folder. The run
 states replay the prototype's progress events through a tiny stand-in child
 process (written to the temporary folder) instead of running a migration, and
 read a clock fixed at the prototype's elapsed time.
+The results states write a finished run's folder with a2m's own summary code,
+then swap in the prototype's SUMMARY.md sample.
 Later steps add their states to ``STATES``. Not shipped with the package.
 """
 
@@ -35,10 +37,13 @@ from a2m import layout
 from a2m.ai.claude import KEY_ENV, SDK_MODULE
 from a2m.engine import LlmChoice
 from a2m.progress import EventKind, Outcome, ProgressEvent, Step, event_fields, json_line
+from a2m.summary import ProxySummary, proxy_facts_json, write_batch_summary
 from a2m.tui import app as app_module
 from a2m.tui.app import A2MApp
 from a2m.tui.command import SetupChoices
-from a2m.tui.run import RunScreen
+from a2m.tui.results import BUCKET_LABELS, ResultsScreen
+from a2m.tui.run import BUCKET_MARKS, RunScreen
+from a2m.verify.model import VerificationType
 
 # The prototype's ALL_PROXIES (name, bucket), in its order, and its SHARED_FLOWS_FOUND = 2.
 PROXIES: tuple[tuple[str, str], ...] = (
@@ -56,6 +61,15 @@ PROXIES: tuple[tuple[str, str], ...] = (
     ("returns-api", layout.UNSUPPORTED_DIR_NAME),
 )
 SHARED_FLOWS: tuple[str, ...] = ("common-auth", "common-logging")
+# The prototype's per-proxy notes (ALL_PROXIES reason), shown in the results states' SUMMARY.md table.
+NOTES: dict[str, str] = {
+    "legacy-auth": "AI is turned off (--llm none); a JavaScript callout could not be translated",
+    "js-transform": "verification failed: 1 of 8 golden tests did not match",
+    "weather-api": "AI was unsure about one policy translation",
+    "loyalty-api": "verification failed: response body mismatch on 2 of 6 tests",
+    "shipping-api": "uses a policy type a2m does not translate (ServiceCallout to a SOAP target)",
+    "returns-api": "proxy bundle is malformed (apiproxy/ missing its root policies folder)",
+}
 # setup-existing-results: "8 of 12 proxies already have a .done marker from an earlier run".
 EARLIER_DONE = 8
 
@@ -361,6 +375,80 @@ def _run_start_failed(root: Path) -> A2MApp:
     return _run_app(root, ["startfail", RUN_START_FAILED_MESSAGE], 0.0)
 
 
+# ---------------------------------------------------------------- results states (CP7)
+
+
+class ResultsStateApp(A2MApp):
+    """The app on the setup screen with the results screen for ``results`` on top."""
+
+    CSS_PATH = str(Path(app_module.__file__).with_name(A2MApp.CSS_PATH))
+
+    def __init__(self, results: Path, *, setup: SetupChoices) -> None:
+        super().__init__(choices=setup)
+        self._results_folder = results
+
+    def on_mount(self) -> None:
+        # As in RunStateApp: A2MApp.on_mount opens the setup screen after this, so push once it is in place.
+        self.call_later(lambda: self.push_screen(ResultsScreen(self._results_folder)))
+
+
+def _prototype_summary_md(proxies: tuple[tuple[str, str], ...]) -> str:
+    """The prototype's SUMMARY.md sample (renderSummaryMarkdown): its title, ``N proxies processed.`` and a
+    proxy/bucket/note table in the prototype's proxy order."""
+    rows = [
+        f"| {name} | {BUCKET_MARKS[bucket][0]} {BUCKET_LABELS[bucket]} | {NOTES.get(name, '')} |"
+        for name, bucket in proxies
+    ]
+    lines = ["# a2m migration summary", "", f"{len(proxies)} proxies processed.", "", "| proxy | bucket | note |"]
+    return "\n".join([*lines, "| --- | --- | --- |", *rows, ""])
+
+
+def _write_results(root: Path, proxies: tuple[tuple[str, str], ...]) -> Path:
+    """A finished run's results folder: the marker, each proxy's REPORT.md (and summary facts) in its bucket,
+    and summary.json written by a2m's own summary code; SUMMARY.md is then replaced with the prototype's
+    sample, so the capture shows the same summary text as the reference."""
+    out = root / RESULTS_NAME
+    out.mkdir()
+    layout.results_marker_path(out).write_text(layout.RESULTS_MARKER_TEXT, encoding="utf-8")
+    for name, bucket in proxies:
+        proxy_dir = layout.bucket_proxy_dir(out, bucket, name)
+        proxy_dir.mkdir(parents=True)
+        (proxy_dir / layout.REPORT_NAME).write_text(f"# {name}\n", encoding="utf-8")
+        (proxy_dir / layout.DONE_MARKER_NAME).write_text(f"a2m finished {name}\n", encoding="utf-8")
+        if bucket != layout.UNSUPPORTED_DIR_NAME:
+            vtype = VerificationType.GOLDEN if bucket == layout.VERIFIED_DIR_NAME else VerificationType.FAILED
+            fact = ProxySummary(name, bucket, vtype.value, {"step": 4, "policy": 3, "condition": 1}, {"SpikeArrest": 1})
+            (proxy_dir / layout.PROXY_SUMMARY_NAME).write_text(proxy_facts_json(fact), encoding="utf-8")
+    write_batch_summary(out)
+    layout.summary_md_path(out).write_text(_prototype_summary_md(proxies), encoding="utf-8")
+    return out
+
+
+def _results_app(root: Path, results: Path) -> A2MApp:
+    exports = _write_exports(root)
+    return ResultsStateApp(results, setup=SetupChoices(exports=str(exports), results=str(results)))
+
+
+def _results_summary(root: Path) -> A2MApp:
+    """CP7 results-summary: a finished run with the prototype's 12 proxies in all three buckets (6 verified,
+    4 needs-review, 2 unsupported)."""
+    return _results_app(root, _write_results(root, PROXIES))
+
+
+def _results_nothing_to_review(root: Path) -> A2MApp:
+    """CP7 results-nothing-to-review: the prototype's proxies without the needs-review ones."""
+    kept = tuple(p for p in PROXIES if p[1] != layout.NEEDS_REVIEW_DIR_NAME)
+    return _results_app(root, _write_results(root, kept))
+
+
+def _results_not_a2m(root: Path) -> A2MApp:
+    """CP7 results-not-a2m: the chosen folder is an ordinary folder, not a2m results."""
+    folder = root / "documents"
+    folder.mkdir()
+    (folder / "notes.txt").write_text("not a2m results\n", encoding="utf-8")
+    return _results_app(root, folder)
+
+
 STATES: dict[str, Callable[[Path], A2MApp]] = {
     "setup-empty": _setup_empty,
     "setup-ready": _setup_ready,
@@ -375,6 +463,9 @@ STATES: dict[str, Callable[[Path], A2MApp]] = {
     "run-stopping": _run_stopping,
     "run-force-stop": _run_force_stop,
     "run-force-resume-confirm": _run_force_resume_confirm,
+    "results-summary": _results_summary,
+    "results-nothing-to-review": _results_nothing_to_review,
+    "results-not-a2m": _results_not_a2m,
 }
 
 

@@ -32,13 +32,14 @@ import asyncio
 import time
 from collections.abc import Callable, Sequence
 from enum import StrEnum
+from pathlib import Path
 from typing import ClassVar
 
 from rich.console import Console, ConsoleOptions
 from rich.console import RenderResult as RichRenderResult
 from rich.style import Style as RichStyle
 from rich.text import Text
-from textual.app import ComposeResult
+from textual.app import ComposeResult, ScreenError
 from textual.binding import ActiveBinding, Binding, BindingType
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
@@ -186,10 +187,14 @@ class RunScreen(Screen[None]):
         *,
         clock: Callable[[], float] | None = None,
         stop_grace: float = STOP_GRACE_SECONDS,
+        results: Path | None = None,
     ) -> None:
         """``stop_grace`` is how long a stop waits after SIGINT before Force stop is offered (default
-        :data:`STOP_GRACE_SECONDS`)."""
+        :data:`STOP_GRACE_SECONDS`). ``results`` is the run's results folder: when given, a run that finishes
+        closes this screen and names that folder in :attr:`handed_over`, for its results screen."""
         super().__init__()
+        self._results = results
+        self._handed_over: Path | None = None
         self._argv = list(argv)
         self._clock = clock or time.monotonic
         self._stop_grace = stop_grace
@@ -224,6 +229,11 @@ class RunScreen(Screen[None]):
     @property
     def phase(self) -> Phase:
         return self._phase
+
+    @property
+    def handed_over(self) -> Path | None:
+        """The results folder of a run that finished and closed this screen to show its results, else None."""
+        return self._handed_over
 
     @property
     def running(self) -> bool:
@@ -415,6 +425,19 @@ class RunScreen(Screen[None]):
             self._end(Phase.ENDED, f"{ended}: {line}" if line else ended)
         if self._quit_after_stop:
             self.app.exit(return_code=self._quit_code())
+        elif self._phase is Phase.FINISHED and self._results is not None:
+            self._hand_over(self._results)
+
+    def _hand_over(self, results: Path) -> None:
+        """The run finished: close this screen (and any dialog over it) so its results screen opens."""
+        if not self.is_attached:
+            return
+        try:
+            self.pop_until_active()
+        except ScreenError:
+            return  # not on the app's screen stack any more; nothing to hand over to
+        self._handed_over = results
+        self.dismiss(None)
 
     def _quit_code(self) -> int:
         """The TUI's exit code when it quits after a stop: 128 + the signal when a signal ended it, else 0."""

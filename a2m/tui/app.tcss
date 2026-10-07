@@ -369,6 +369,14 @@ Footer FooterKey {
     margin-right: 1;
 }
 
+/* ---- Start and Open results… share one row, a gap-1 apart ---- */
+#start-row {
+    height: 1;
+    & > Button {
+        margin-right: 1;
+    }
+}
+
 /* ---- Folder browser dialog: overlay, heavy accent border; fits 80x24 above its Footer ---- */
 FolderPicker {
     align: center middle;
@@ -587,4 +595,109 @@ ConfirmScreen {
 #run-force-note {
     height: auto;
     color: $warning;
+}
+
+/* ---- Results screen (DESIGN.md Layout, Screen anatomy Results): the counts line, the three bucket lists
+   in fixed-height panes that scroll, the Review row, then SUMMARY.md in its own scrolling pane filling the
+   rest, so the screen itself fits 80x24. ---- */
+#results-loading {
+    color: $foreground-muted;
+}
+#results-problem {
+    height: auto;
+    margin-top: 1;
+}
+#results-error {
+    height: auto;
+    color: $foreground-muted;
+    &.-error {
+        color: $error;
+        text-style: bold;
+    }
+}
+#results-problem Button {
+    margin-top: 1;
+}
+#results-content {
+    height: 1fr;
+}
+#results-counts {
+    margin-bottom: 1;
+}
+/* The panes draw no scrollbar, as in the prototype: the panel fill runs to the right gutter. They still
+   scroll by mouse wheel, and by arrow and page keys once focused (Tab). */
+.bucket-pane {
+    background: $panel;
+    scrollbar-size-vertical: 0;
+    overflow-y: auto;
+    &:focus {
+        background-tint: transparent;
+    }
+}
+#bucket-verified-pane, #bucket-needs-review-pane {
+    height: 3;
+}
+#bucket-unsupported-pane {
+    height: 2;
+}
+.bucket-list {
+    height: auto;
+    padding: 0 1;
+    background: $panel;
+    &.-empty {
+        color: $foreground-muted;
+        text-style: italic;
+    }
+}
+#nothing-to-review {
+    margin-top: 1;
+    color: $foreground-muted;
+    text-style: italic;
+}
+#results-buttons {
+    height: 1;
+    & > Button {
+        margin-right: 1;
+    }
+}
+#results-summary-label {
+    margin-top: 1;
+}
+#results-summary-pane {
+    height: 1fr;
+    min-height: 3;
+    background: $surface;
+    scrollbar-size-vertical: 0;
+    overflow-y: auto;
+    &:focus {
+        background-tint: transparent;
+    }
+}
+/* SUMMARY.md as the prototype draws it (DESIGN.md Markdown viewer): blocks flush with the gutter, headings
+   bold foreground with no banner fill (the title as "# title", see results.SummaryH1), the title, the first
+   paragraph and a table directly below one another; later paragraphs and headings keep one blank row above. */
+#results-summary {
+    padding: 0;
+    background: $surface;
+    color: $foreground;
+    MarkdownHeader {
+        margin: 1 0 0 0;
+        color: $foreground;
+        background: $surface;
+        text-style: bold;
+        content-align: left top;
+    }
+    MarkdownH1 {
+        margin: 0;
+    }
+    & > MarkdownParagraph {
+        margin: 1 0 0 0;
+        &:first-of-type {
+            margin: 0;
+        }
+    }
+    MarkdownTable {
+        margin: 0;
+    }
+    /* Tables are drawn as a light box table in the `border` color (results.SummaryTableGrid). */
 }
