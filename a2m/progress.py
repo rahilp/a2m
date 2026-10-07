@@ -122,6 +122,15 @@ def describe(event: ProgressEvent) -> str | None:
     The proxy name is as given; the caller writes the line through the terminal writer, which escapes control
     characters and masks secrets like every other line.
     """
+    text = activity(event)
+    if text is None:
+        return None
+    return f"[{event.index}/{event.total}] {event.name}: {text}"
+
+
+def activity(event: ProgressEvent) -> str | None:
+    """What a proxy event says the proxy is doing or how it ended (``generating``, ``AI fix 1 of 3``,
+    ``done, in verified/``), or None for batch-level events."""
     if event.kind is EventKind.PROXY_STARTED:
         text = "generating"
     elif event.kind is EventKind.STEP and event.step is not None:
@@ -135,7 +144,7 @@ def describe(event: ProgressEvent) -> str | None:
             text += f", in {event.bucket}/"
     else:
         return None
-    return f"[{event.index}/{event.total}] {event.name}: {text}"
+    return text
 
 
 def event_fields(event: ProgressEvent) -> dict[str, object]:

@@ -30,22 +30,23 @@ from textual.binding import ActiveBinding, Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widget import Widget
-from textual.widgets import Button, Checkbox, Collapsible, Footer, Input, RadioButton, RadioSet, Static
+from textual.widgets import Button, Checkbox, Collapsible, Input, RadioButton, RadioSet, Static
 from textual.worker import get_current_worker
 
 from a2m.ai.claude import SetupProblem
 from a2m.engine import LlmChoice
 from a2m.errors import A2mError
+from a2m.tui.child import migrate_child_argv
 from a2m.tui.command import RerunChoice, SetupChoices, command_preview, folder_path, resolved_folder
 from a2m.tui.folders import FieldCheck, SetupCheck, Status, check_setup, preview_exports, preview_results
-from a2m.tui.frame import AppHeader, EdgeButton, GlyphCheckbox, GlyphRadioButton, global_keys_first
+from a2m.tui.frame import AppFooter, AppHeader, EdgeButton, GlyphCheckbox, GlyphRadioButton, global_keys_first
 from a2m.tui.picker import FolderPicker, FolderSuggester, start_folder
+from a2m.tui.run import RunScreen
 
 # A check starts this long after the last change, so typing a path does not scan every folder on the way.
 CHECK_DELAY_SECONDS = 0.15
 CHECKING_TEXT = "Checking…"
 CHOOSE_RERUN_REASON = "Pick Resume or Force to continue"
-START_NOT_BUILT = "Starting a run from here is not built yet; run the command shown in a terminal."
 COMMAND_COPIED = "Command copied"
 NO_KEY_REASON = "Set ANTHROPIC_API_KEY to use Claude"
 NO_SDK_REASON = "Install the Anthropic SDK to use Claude"
@@ -180,7 +181,7 @@ class SetupScreen(Screen[None]):
             yield Static(self._command, id="command-preview", markup=False)
             yield EdgeButton("Start", id="start", variant="primary", compact=True, disabled=True)
             yield Static(CHOOSE_RERUN_REASON, id="start-disabled-reason", markup=False)
-        yield Footer(id="ftr", compact=True, show_command_palette=False)
+        yield AppFooter(id="ftr", compact=True, show_command_palette=False)
 
     def _advanced_fields(self) -> ComposeResult:
         """The Advanced options, short fields two to a row so the open section still fits 80x24."""
@@ -284,7 +285,13 @@ class SetupScreen(Screen[None]):
         elif event.button.id == "browse-results":
             self.browse(self.query_one("#input-results", FolderInput))
         elif event.button.id == "start":
-            self.notify(START_NOT_BUILT, markup=False)
+            self.app.push_screen(RunScreen(migrate_child_argv(self.choices())), self._after_run)
+
+    def _after_run(self, _result: None) -> None:
+        """Back from a run: the results folder now holds it, so check again and ask Resume or Force anew."""
+        self._rerun = None
+        self._reveal_start = False
+        self._check()
 
     def browse(self, field: FolderInput) -> None:
         """Open the folder browser for ``field``, at its folder (or the nearest one above it that exists)."""

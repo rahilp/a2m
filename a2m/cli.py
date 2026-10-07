@@ -314,12 +314,23 @@ def _load_tui() -> Callable[..., int] | None:
 
 
 def _open_tui(run_app: Callable[..., int]) -> int:
-    """Open the TUI; without an interactive terminal, one clear stderr line and EXIT_USAGE instead of a hang."""
+    """Open the TUI; without an interactive terminal, one clear stderr line and EXIT_USAGE instead of a hang.
+
+    A signal that ended the TUI ends it with one stderr line and 128 + the signal, never a traceback: the app
+    stops a run going first and returns that exit code (a2m.tui.signals); a signal the app could not take (it
+    was not up yet, or already closing) arrives as KeyboardInterrupt (SIGINT) or engine.Terminated."""
     try:
-        return run_app(at_terminal=_at_terminal)
+        code = run_app(at_terminal=_at_terminal)
     except NoTerminalError as exc:
         _say(str(exc), err=True)
         return EXIT_USAGE
+    except KeyboardInterrupt as exc:
+        signum = interrupted_signal(exc)
+        code = EXIT_INTERRUPTED if signum is None else 128 + signum
+    names ={sig.value: sig.name for sig in signal.Signals}
+    if code > 128 and (code - 128) in names:
+        _say(f"a2m tui: stopped by {names[code - 128]}", err=True)
+    return code
 
 
 def main(argv: list[str] | None = None, *, stages: Sequence[Stage] | None = None) -> int:

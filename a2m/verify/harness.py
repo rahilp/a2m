@@ -931,15 +931,18 @@ class VerifyStage:
         safefs.write_text_atomic(out.parent, out / VERIFICATION_FILE, text)
 
     def close(self) -> None:
-        """Stop the Mule runtime this stage started (if any) and remove its private MULE_BASE."""
+        """Stop the Mule runtime this stage started (if any) and remove its private MULE_BASE.
+
+        The base is removed only once the stop has completed. A stop cut short (a further signal raised
+        mid-stop) leaves the base, and the PID file in it, in place: the runtime may still be running from it,
+        the exit hook in :mod:`a2m.verify.mule` still stops it, and the next run ends any leftover from that
+        PID file before reusing the base."""
         real, self._real = self._real, None
         if real is None:
             return
-        try:
-            real.close()
-        finally:
-            if self._results_root is not None:
-                safefs.remove(self._results_root, real.mule_base)
+        real.close()
+        if self._results_root is not None:
+            safefs.remove(self._results_root, real.mule_base)
 
 
 def _saved_generated_steps(results_root: Path, name: str) -> GeneratedSteps | None:

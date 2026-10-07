@@ -24,14 +24,14 @@ from textual.containers import Horizontal, Vertical
 from textual.content import Content
 from textual.screen import ModalScreen
 from textual.suggester import Suggester
-from textual.widgets import Button, Footer, OptionList, Static
+from textual.widgets import Button, OptionList, Static
 from textual.widgets.option_list import Option
 from textual.worker import get_current_worker
 
 from a2m.errors import A2mError
 from a2m.layout import collision_key
 from a2m.tui.folders import FieldCheck, Status
-from a2m.tui.frame import EdgeButton, global_keys_first
+from a2m.tui.frame import AppFooter, EdgeButton, global_keys_first
 
 # At most this many sub-folders are listed (or looked at when completing a path), so a huge folder
 # cannot stall the app.
@@ -247,7 +247,7 @@ class FolderPicker(ModalScreen[Path | None]):
             with Horizontal(id="picker-buttons"):
                 yield EdgeButton("Use this folder", id="picker-use", variant="primary", compact=True)
                 yield EdgeButton("Cancel", id="picker-cancel", compact=True)
-        yield Footer(compact=True, show_command_palette=False)
+        yield AppFooter(compact=True, show_command_palette=False)
 
     def on_mount(self) -> None:
         self._open(self._current)

@@ -312,7 +312,7 @@ Footer FooterKey {
 #body {
     scrollbar-size-vertical: 1;
 }
-#body Button, #picker Button {
+#body Button, #picker Button, #confirm Button {
     height: 1;
     width: auto;
     min-width: 0;
@@ -433,4 +433,158 @@ FolderPicker {
     & > Button {
         margin-right: 1;
     }
+}
+
+/* ---- Run screen (DESIGN.md Layout, Screen anatomy Run): bar row, current step, finished list, Stop ---- */
+#run-bar-row {
+    height: 1;
+}
+#run-progress {
+    width: auto;
+    height: 1;
+}
+#run-progress Bar {
+    width: 40;
+    /* accent fill over a solid border-colored track (DESIGN.md Components, ProgressBar); BlockBar paints
+       both as full cells, the fill from `color`, the track from `background` */
+    & > .bar--bar {
+        color: $accent;
+        background: $border;
+    }
+    & > .bar--complete {
+        color: $success;
+        background: $border;
+    }
+}
+#run-progress.-stopped Bar > .bar--bar {
+    color: $warning;
+}
+/* The count and the elapsed time follow the bar with no gap, as in the prototype. */
+#run-counts {
+    width: auto;
+    color: $foreground;
+}
+#run-elapsed {
+    width: auto;
+    color: $foreground-muted;
+}
+#run-current {
+    height: auto;
+    color: $foreground;
+}
+/* The outcome line: a2m's own message for a run that could not start, or how the run ended. */
+#run-message {
+    height: auto;
+    color: $foreground;
+    &.-warning {
+        color: $warning;
+        text-style: bold;
+    }
+    &.-error {
+        color: $error;
+        text-style: bold;
+    }
+    &.-success {
+        color: $success;
+        text-style: bold;
+    }
+}
+#run-finished-empty {
+    height: 1;
+    padding: 0 1;
+    background: $panel;
+    color: $foreground-muted;
+    text-style: italic;
+}
+/* Finished proxies, newest first: dense panel rows (bucket symbol + name), scrolling inside a pane of at
+   most 12 rows so the screen itself never scrolls at 80x24. */
+#run-finished {
+    height: auto;
+    max-height: 12;
+    background: $surface;
+    scrollbar-size-vertical: 1;
+    & > ListItem {
+        padding: 0 1;
+        background: $panel;
+        &.-highlight {
+            background: $panel;
+            color: $foreground;
+            text-style: none;
+        }
+    }
+    &:focus {
+        background-tint: transparent;
+        & > ListItem.-highlight {
+            background: $accent;
+            color: $background;
+            & > Static {
+                color: $background;
+            }
+        }
+    }
+}
+.bucket-verified {
+    color: $success;
+}
+.bucket-needs-review {
+    color: $warning;
+}
+.bucket-unsupported, .bucket-failed {
+    color: $error;
+}
+#run-buttons {
+    height: 1;
+    & > Button {
+        margin-right: 1;
+    }
+}
+
+/* ---- Modal confirm (Stop, quit while a run is going): overlay, heavy warning or error border, Cancel
+   focused (DESIGN.md Components, Modal confirm) ---- */
+ConfirmScreen {
+    align: center middle;
+    background: $background 60%;
+}
+/* Centered with a one-row margin above, so an odd leftover row goes above the dialog, as in the
+   prototype. Title, lines and buttons start in the first cell inside the heavy border. */
+#confirm {
+    width: 50;
+    height: auto;
+    margin-top: 1;
+    background: $overlay;
+    border: heavy $warning;
+    padding: 0;
+    &.-error {
+        border: heavy $error;
+    }
+}
+#confirm-title {
+    text-style: bold;
+    color: $foreground;
+}
+.confirm-line {
+    color: $foreground;
+}
+#confirm-buttons {
+    height: 1;
+    margin-top: 1;
+    & > Button {
+        margin-right: 1;
+    }
+    /* The buttons sit on the dialog's overlay: Cancel's label too (the filled Stop keeps its fill), and
+       focus shows only in the edge glyphs. */
+    & > Button {
+        background: $overlay;
+        & > .edge-button--fill {
+            background: $overlay;
+        }
+        &:focus {
+            background-tint: transparent;
+        }
+    }
+}
+/* The warning shown with Force stop once a stop has outlasted a2m's clean-up budget. */
+#run-force-note {
+    height: auto;
+    color: $warning;
 }

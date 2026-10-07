@@ -10,8 +10,9 @@ from textual.binding import ActiveBinding
 from textual.containers import Horizontal
 from textual.content import Content
 from textual.geometry import Size
+from textual.screen import Screen
 from textual.style import Style
-from textual.widgets import Button, Checkbox, RadioButton, Static
+from textual.widgets import Button, Checkbox, Footer, RadioButton, Static
 from textual.widgets._toggle_button import ToggleButton
 
 from a2m import __version__
@@ -34,6 +35,20 @@ class AppHeader(Horizontal):
     def compose(self) -> ComposeResult:
         yield Static(APP_TITLE, id="hdr-title", markup=False)
         yield Static(f"{APP_TITLE} · v{__version__}", id="hdr-version", markup=False)
+
+
+class AppFooter(Footer):
+    """The footer key strip, redrawn whenever the screen's keys change, even while the app is unfocused.
+
+    Textual's Footer skips that redraw while the terminal window does not have focus, so a run that stops
+    or fails to start while the user is in another window would keep showing keys that no longer apply
+    (Stop) and miss the ones that now do (Resume). DESIGN.md: footer hints always match the keys in reach.
+    """
+
+    def bindings_changed(self, screen: Screen[Any]) -> None:
+        self._bindings_ready = True
+        if self.is_attached and screen is self.screen:
+            self.call_after_refresh(self.recompose)
 
 
 class EdgeButton(Button):

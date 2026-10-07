@@ -25,7 +25,10 @@ running when Python exits, and the PIDs are written to ``a2m-mule.pids`` in the
 MULE_BASE so a later start under the same base first ends the processes an
 a2m that was killed outright left behind (only recorded PIDs and their
 children whose environment names this MULE_BASE; never anything found by
-name). :meth:`MuleRunner.health_problem` says when a started runtime is no
+name). Every process a2m signals is pinned by identity when it is chosen (a
+pidfd where the OS has them, else its start time, checked again before each
+signal), so a process that later took a recorded PID is never signalled.
+:meth:`MuleRunner.health_problem` says when a started runtime is no
 longer usable (the launcher or the JVM exited, or the wrapper reported the
 JVM gone), so a caller can restart it instead of blaming the next app.
 """
@@ -36,6 +39,7 @@ import atexit
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import socket
@@ -161,6 +165,8 @@ class MuleRunner:
         self._process: subprocess.Popen[bytes] | None = None
         self._pids: list[int] = []
         self._jvm_pids: list[int] = []
+        # The wrapper and the JVM, pinned by identity when recorded (they are not a2m's children, so not reaped).
+        self._held: list[_Held] = []
         self._console: LogWatch | None = None
 
     @property
@@ -199,6 +205,7 @@ class MuleRunner:
         )
         self._console = LogWatch(self.mule_base.joinpath(*CONSOLE_LOG))
         self._jvm_pids = []
+        self._held = []
         try:
             self._process = subprocess.Popen(
                 [str(self.mule_home / "bin" / "mule"), "console"],
@@ -234,26 +241,39 @@ class MuleRunner:
         raise MuleError(f"Mule {why} under {self.mule_base}:\n{console}")
 
     def stop(self, timeout: float = 60.0) -> None:
-        """Stop Mule and every process it started; safe to call again."""
+        """Stop Mule and every process it started; safe to call again.
+
+        When this runner never started its runtime, a leftover an earlier a2m recorded in the base's PID file
+        is ended instead (see :meth:`_stop_leftovers`), so a caller that then removes the base never deletes
+        the only record of a runtime that is still running."""
         process = self._process
         if process is None:
+            self._stop_leftovers()
             return
         self._signal_group(signal.SIGTERM)
-        for pid in self._pids[1:]:
-            _kill(pid, signal.SIGTERM)
+        for held in self._held:
+            held.send(signal.SIGTERM)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and self._alive():
             process.poll()
             time.sleep(POLL_SECONDS)
         if self._alive():
             self._signal_group(signal.SIGKILL)
-            for pid in [*self._pids, *self._descendants()]:
-                _kill(pid, signal.SIGKILL)
+            # Popen.kill signals the launcher only while it is not reaped, so its PID is still a2m's child.
+            process.kill()
+            for held in self._held:
+                held.send(signal.SIGKILL)
+            for held in self._pinned_descendants():
+                held.send(signal.SIGKILL)
+                held.close()
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+        for held in self._held:
+            held.close()
+        self._held = []
         self._process = None
         self._console = None
         _LIVE.discard(self)
@@ -267,7 +287,9 @@ class MuleRunner:
         code = process.poll()
         if code is not None:
             return f"the Mule runtime exited with code {code}"
-        if self._jvm_pids and not any(_running(pid) for pid in self._jvm_pids):
+        # Through the pinned handles: a process that later took a dead JVM's PID is never mistaken for it.
+        jvms = [held for held in self._held if held.pid in self._jvm_pids]
+        if self._jvm_pids and not any(held.alive() for held in jvms):
             return "the Mule runtime's JVM stopped"
         console = self._console.text() if self._console is not None else ""
         trouble = next((line for line in JVM_TROUBLE if line in console), None)
@@ -285,7 +307,9 @@ class MuleRunner:
         """End what an earlier runtime under this MULE_BASE left running (its a2m was killed outright).
 
         Only PIDs recorded in the base's PID file, and their children, are considered, and only those
-        whose environment names this MULE_BASE are signalled; nothing is ever found by name.
+        whose environment names this MULE_BASE are signalled; nothing is ever found by name. Each one is
+        pinned by identity when it is chosen, so one that ends while the others stop and whose PID is taken
+        by an unrelated process is treated as gone: that process is never waited on or signalled.
         """
         path = self.mule_base / PID_FILE
         try:
@@ -295,20 +319,31 @@ class MuleRunner:
         recorded = [p for p in (data.get("pids", []) if isinstance(data, dict) else []) if isinstance(p, int)]
         group = data.get("pgid") if isinstance(data, dict) else None
         candidates = [*recorded, *_tree(recorded)]
-        mine = sorted({pid for pid in candidates if pid > 1 and _runs_under(pid, self.mule_base)})
-        if isinstance(group, int) and group > 1 and group in mine:
-            try:
-                os.killpg(group, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
-        for pid in mine:
-            _kill(pid, signal.SIGTERM)
-        deadline = time.monotonic() + LEFTOVER_STOP_SECONDS
-        while time.monotonic() < deadline and any(_running(pid) for pid in mine):
-            time.sleep(POLL_SECONDS)
-        for pid in mine:
-            if _running(pid):
-                _kill(pid, signal.SIGKILL)
+        base = self.mule_base
+
+        def owned(pid: int) -> bool:
+            return _runs_under(pid, base)
+
+        pinned = (_pin(pid, owned, recheck=owned) for pid in sorted({p for p in candidates if p > 1}))
+        mine = [held for held in pinned if held is not None]
+        try:
+            leader = [held for held in mine if held.pid == group]
+            if isinstance(group, int) and group > 1 and _group_held_by(group, leader):
+                try:
+                    os.killpg(group, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            for held in mine:
+                held.send(signal.SIGTERM)
+            deadline = time.monotonic() + LEFTOVER_STOP_SECONDS
+            while time.monotonic() < deadline and any(held.alive() for held in mine):
+                time.sleep(POLL_SECONDS)
+            for held in mine:
+                if held.alive():
+                    held.send(signal.SIGKILL)
+        finally:
+            for held in mine:
+                held.close()
         safefs.remove(self.mule_base, path)
 
     def _prepare_base(self) -> None:
@@ -335,7 +370,8 @@ class MuleRunner:
 
     def _descendants(self) -> list[int]:
         """PIDs of the running processes started from the launcher (its whole process tree)."""
-        if self._process is None:
+        # Once the launcher is reaped its PID may belong to an unrelated process (and its children are reparented).
+        if self._process is None or self._process.returncode is not None:
             return []
         children: dict[int, list[int]] = {}
         for entry in Path("/proc").iterdir():
@@ -360,18 +396,35 @@ class MuleRunner:
         """Record the long-lived processes once Mule is up: the wrapper and the JVM."""
         for pid in self._descendants():
             if pid not in self._pids and _long_lived(pid):
+                held = _pin(pid, lambda p: _long_lived(p) and p in self._descendants())
+                if held is None:
+                    continue
                 self._pids.append(pid)
+                self._held.append(held)
                 if _executable_name(pid) == "java":
                     self._jvm_pids.append(pid)
 
+    def _pinned_descendants(self) -> list[_Held]:
+        """The launcher's live descendants, each pinned and confirmed still in its tree after pinning."""
+        pinned = (_pin(pid, lambda p: p in self._descendants()) for pid in self._descendants())
+        return [held for held in pinned if held is not None]
+
     def _alive(self) -> bool:
-        return bool(self._descendants()) or any(_exists(pid) for pid in self._pids)
+        process = self._process
+        if process is None:
+            return False
+        return process.poll() is None or any(held.alive() for held in self._held) or bool(self._descendants())
 
     def _signal_group(self, sig: signal.Signals) -> None:
         if self._process is None:
             return
+        group = self._process.pid
+        # The group ID stays this runtime's while the launcher (its leader) is not reaped, or while a pinned
+        # member is still in the group; otherwise it may name an unrelated process's group, so it is not signalled.
+        if self._process.returncode is not None and not _group_held_by(group, self._held):
+            return
         try:
-            os.killpg(self._process.pid, sig)
+            os.killpg(group, sig)
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -670,16 +723,6 @@ def _needs_body(head: bytes, body: bytes) -> bool:
     return len(body) < len(CONTAINER_UNAVAILABLE)
 
 
-def _exists(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def _executable_name(pid: int) -> str | None:
     try:
         return Path(os.readlink(f"/proc/{pid}/exe")).name
@@ -710,6 +753,103 @@ def _runs_under(pid: int, mule_base: Path) -> bool:
     except OSError:
         return False
     return f"MULE_BASE={mule_base}".encode() in environ.split(b"\0")
+
+
+def _stat_fields(pid: int) -> list[str] | None:
+    """The fields of /proc/<pid>/stat after the command name (state first), or None when it is gone."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+
+
+def _start_time(pid: int) -> int | None:
+    """When ``pid`` started (clock ticks after boot, stat field 22), or None when it is gone."""
+    fields = _stat_fields(pid)
+    try:
+        return int(fields[19]) if fields is not None else None
+    except (IndexError, ValueError):
+        return None
+
+
+def _process_group(pid: int) -> int | None:
+    """The process group of ``pid`` (stat field 5), or None when it is gone."""
+    fields = _stat_fields(pid)
+    try:
+        return int(fields[2]) if fields is not None else None
+    except (IndexError, ValueError):
+        return None
+
+
+# os.pidfd_open where the OS has it (Linux 5.3+); a module attribute so the start-time fallback can be tested.
+_pidfd_open: Callable[[int], int] | None = getattr(os, "pidfd_open", None)
+
+
+class _Held:
+    """One process pinned by identity, so a signal never reaches an unrelated process that later took its PID.
+
+    With a pidfd the process itself is held: it is signalled and watched through the pidfd, which can never
+    refer to another process. Without one, its start time (and the ``recheck`` it was pinned with, if any) is
+    checked again right before every signal and on every liveness check.
+    """
+
+    def __init__(self, pid: int, fd: int | None, start: int | None, recheck: Callable[[int], bool] | None) -> None:
+        self.pid = pid
+        self._fd = fd
+        self._start = start
+        self._recheck = recheck
+
+    def alive(self) -> bool:
+        """True while the pinned process runs (a zombie counts as ended)."""
+        if self._fd is not None:
+            # A pidfd becomes readable once its process has exited.
+            return not select.select([self._fd], [], [], 0)[0]
+        if self._start is None or _start_time(self.pid) != self._start or not _running(self.pid):
+            return False
+        return self._recheck is None or self._recheck(self.pid)
+
+    def send(self, sig: signal.Signals) -> None:
+        """Send ``sig`` to the pinned process, never to another one that took its PID."""
+        if self._fd is not None:
+            try:
+                signal.pidfd_send_signal(self._fd, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+        elif self.alive():
+            _kill(self.pid, sig)
+
+    def close(self) -> None:
+        """Release the pidfd; the process then counts as gone and is never signalled again."""
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+        self._start = None
+
+
+def _pin(pid: int, owned: Callable[[int], bool], *, recheck: Callable[[int], bool] | None = None) -> _Held | None:
+    """Pin live process ``pid`` when ``owned(pid)`` holds for it, or None when it is gone or not owned.
+
+    The pidfd is opened before ``owned`` is checked and the process is confirmed still running after, so the
+    check was made on the pinned process and not on one that took its PID in between.
+    """
+    fd: int | None = None
+    if _pidfd_open is not None:
+        try:
+            fd = _pidfd_open(pid)
+        except ProcessLookupError:
+            return None
+        except OSError:
+            fd = None  # no pidfd here (old kernel, sandbox): fall back to the start time
+    held = _Held(pid, fd, _start_time(pid), recheck)
+    if held._start is None or not owned(pid) or not held.alive():
+        held.close()
+        return None
+    return held
+
+
+def _group_held_by(group: int, members: Sequence[_Held]) -> bool:
+    """True when a live pinned member is in process group ``group``, so that group ID cannot be anyone else's."""
+    return any(held.alive() and _process_group(held.pid) == group and held.alive() for held in members)
 
 
 def _tree(roots: Sequence[int]) -> list[int]:

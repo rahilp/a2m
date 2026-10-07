@@ -1,0 +1,14 @@
+{"attempt":0,"attempts":0,"bucket":null,"failed":0,"finished":0,"index":0,"kind":"run-started","name":"","outcome":null,"refused":0,"schema_version":1,"skipped":0,"step":null,"total":12}
+{"attempt":0,"attempts":0,"bucket":null,"failed":0,"finished":0,"index":1,"kind":"proxy-started","name":"alpha","outcome":null,"refused":0,"schema_version":1,"skipped":0,"step":null,"total":12}
+{"attempt":0,"attempts":0,"bucket":null,"failed":0,"finished":0,"index":1,"kind":"step","name":"alpha","outcome":null,"refused":0,"schema_version":1,"skipped":0,"step":"build","total":12}
+{"attempt":0,"attempts":0,"bucket":"verified","failed":0,"finished":0,"index":1,"kind":"proxy-finished","name":"alpha","outcome":"finished","refused":0,"schema_version":1,"skipped":0,"step":null,"total":12}
+{"attempt":0,"attempts":0,"bucket":null,"failed":0,"finished":0,"index":2,"kind":"proxy-started","name":"beta","outcome":null,"refused":0,"schema_version":1,"skipped":0,"step":null,"total":12}
+{"attempt":0,"attempts":0,"bucket":null,"failed":0,"finished":0,"index":2,"kind":"step","name":"beta","outcome":null,"refused":0,"schema_version":1,"skipped":0,"step":"deploy","total":12}
+{"attempt":0,"attempts":0,"bucket":"needs-review","failed":0,"finished":0,"index":2,"kind":"proxy-finished","name":"beta","outcome":"finished","refused":0,"schema_version":1,"skipped":0,"step":null,"total":12}
+{"attempt":0,"attempts":0,"bucket":"verified","failed":0,"finished":0,"index":3,"kind":"proxy-finished","name":"gamma","outcome":"skipped","refused":0,"schema_version":1,"skipped":0,"step":null,"total":12}
+{"attempt":0,"attempts":0,"bucket":null,"failed":0,"finished":0,"index":4,"kind":"proxy-started","name":"delta","outcome":null,"refused":0,"schema_version":1,"skipped":0,"step":null,"total":12}
+{"attempt":1,"attempts":2,"bucket":null,"failed":0,"finished":0,"index":4,"kind":"step","name":"delta","outcome":null,"refused":0,"schema_version":1,"skipped":0,"step":"ai-fix","total":12}
+{"attempt":0,"attempts":0,"bucket":"verified","failed":0,"finished":0,"index":4,"kind":"proxy-finished","name":"delta","outcome":"finished","refused":0,"schema_version":1,"skipped":0,"step":null,"total":12}
+{"attempt":0,"attempts":0,"bucket":null,"failed":0,"finished":0,"index":5,"kind":"proxy-started","name":"echo","outcome":null,"refused":0,"schema_version":1,"skipped":0,"step":null,"total":12}
+{"attempt":0,"attempts":0,"bucket":null,"failed":0,"finished":0,"index":5,"kind":"step","name":"echo","outcome":null,"refused":0,"schema_version":1,"skipped":0,"step":"build","total":12}
+{"attempt":0,"attempts":0,"bucket":"unsupported","failed":0,"finished":0,"index":5,"kind":"proxy-finished","name":"echo","outcome":"refused","refused":0,"schema_version":1,"skipped":0,"step":null,"total":12}
