@@ -64,6 +64,7 @@ from typing import cast
 from urllib.parse import urlsplit
 
 from a2m import safefs
+from a2m.ai import AI_TURNED_OFF
 from a2m.ai.checks import DeclaredWrites, all_steps, callout_reads, changed_steps, describe_changes
 from a2m.ai.placeholders import condition_number
 from a2m.ai.provider import Confidence, Provider
@@ -313,6 +314,7 @@ def generate_project(
     shared_flows: Sequence[Bundle] = (),
     results_root: Path | None = None,
     provider: Provider | None = None,
+    ai_turned_off: bool = False,
 ) -> GenerateResult:
     """Write the Mule project for proxy ``bundle`` into ``dest``, replacing any older project there.
 
@@ -330,11 +332,14 @@ def generate_project(
     translated but flagged for review. An AI-translated step is a faithful
     writer only of what its checked ``writes`` declaration names; otherwise it
     may change anything. With None nothing is sent anywhere and those stay
-    skipped or can't translate.
+    skipped or can't translate; with ``ai_turned_off`` (``--llm none``) as well,
+    each of them says it was skipped because AI is turned off.
     """
     if bundle.kind is not BundleKind.PROXY:
         raise GeneratorError(f"{bundle.name} is a {bundle.kind.value} bundle, not a proxy")
-    builder = _ProjectBuilder(bundle, shared_flows, Translator(provider) if provider is not None else None)
+    builder = _ProjectBuilder(
+        bundle, shared_flows, Translator(provider) if provider is not None else None, ai_turned_off=ai_turned_off
+    )
     files = builder.build()
     _write_tree(dest, files, results_root)
     return _result(builder, files)
@@ -562,9 +567,13 @@ def _comparison(text: str, tokens: Sequence[Token], index: int) -> str:
 
 
 class _ProjectBuilder:
-    def __init__(self, bundle: Bundle, shared_flows: Sequence[Bundle], ai: Translator | None = None) -> None:
+    def __init__(
+        self, bundle: Bundle, shared_flows: Sequence[Bundle], ai: Translator | None = None, *, ai_turned_off: bool = False
+    ) -> None:
         self.bundle = bundle
         self.ai = ai
+        # --llm none: what only the AI could translate says so (only meaningful without a translator).
+        self.ai_turned_off = ai_turned_off and ai is None
         self.policies = {policy.name: policy for policy in bundle.policies}
         self.shared: dict[str, list[Bundle]] = {}
         for shared in shared_flows:
@@ -638,9 +647,12 @@ class _ProjectBuilder:
         if translation.ok:
             record = ConditionRecord(name, kind, where, text, True, translation.dw, translation.reason)
         else:
-            refusal = self._ai_refusal(text, direction) if ask_ai and self.ai is not None else None
+            may_ask = ask_ai and (self.ai is not None or self.ai_turned_off)
+            refusal = self._ai_refusal(text, direction) if may_ask else None
             if ask_ai and self.ai is not None and refusal is None:
                 return self._ai_condition(name, kind, where, text, direction, translation)
+            if may_ask and refusal is None:
+                refusal = AI_TURNED_OFF
             if refusal is not None and refusal not in (reason or ""):
                 reason = f"{reason}; not sent to the AI: {refusal}"
             record = ConditionRecord(name, kind, where, text, False, None, reason, method=Method.SKIPPED)
@@ -1329,6 +1341,12 @@ class _ProjectBuilder:
                     steps[index + 1].name if index + 1 < len(steps) else NONE,
                 )
                 found.append(self._ai_step(step, policy, where, direction, resources, neighbours))
+            elif self.ai_turned_off and callout_kind(policy) is not None:
+                reason = (
+                    f"{policy.type} policy {policy.name} is custom code only the AI can translate; "
+                    f"skipped because {AI_TURNED_OFF}"
+                )
+                found.append(self._skipped_step(step, policy.type, reason, where, direction))
             else:
                 output = registry.translate(policy, direction=direction, changes=self.changes)
                 found.extend(_untranslated_settings(step.name, output.result.unsupported_options))

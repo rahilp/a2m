@@ -17,8 +17,11 @@ Later steps add their states to ``STATES``. Not shipped with the package.
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import os
 import sys
 import tempfile
+import types
 from collections.abc import Callable
 from pathlib import Path
 
@@ -26,7 +29,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from a2m import layout
+from a2m.ai.claude import KEY_ENV, SDK_MODULE
+from a2m.engine import LlmChoice
 from a2m.tui.app import A2MApp
+from a2m.tui.command import SetupChoices
 
 # The prototype's ALL_PROXIES (name, bucket), in its order, and its SHARED_FLOWS_FOUND = 2.
 PROXIES: tuple[tuple[str, str], ...] = (
@@ -49,6 +55,13 @@ EARLIER_DONE = 8
 
 EXPORTS_NAME = "apigee-exports"
 RESULTS_NAME = "a2m-out"
+GOLDEN_NAME = "golden-recordings"
+# setup-advanced: the prototype's Advanced values (mock backends on, 5 fix attempts, one ignored header).
+ADVANCED_IGNORED_HEADER = "Authorization"
+ADVANCED_FIX_ATTEMPTS = "5"
+# setup-advanced has Claude usable: a stand-in key for this process only (never shown by the app), and a bare
+# stand-in for the Anthropic SDK when it is not installed (the app only checks that it can be imported).
+STAND_IN_KEY = "stand-in-key-for-tui-states"
 
 
 def _write_exports(root: Path) -> Path:
@@ -89,7 +102,8 @@ def _setup_empty(root: Path) -> A2MApp:
 
 
 def _setup_ready(root: Path) -> A2MApp:
-    """CP4 setup-ready: both folders valid (12 proxies, 2 shared flows; a new empty results folder)."""
+    """CP4/CP5 setup-ready: both folders valid (12 proxies, 2 shared flows; a new empty results folder), No AI
+    chosen, Advanced closed."""
     exports = _write_exports(root)
     results = root / RESULTS_NAME
     results.mkdir()
@@ -109,11 +123,45 @@ def _setup_existing_results(root: Path) -> A2MApp:
     return A2MApp(exports=str(exports), results=str(results))
 
 
+def _setup_no_key(root: Path) -> A2MApp:
+    """CP5 setup-no-key: both folders valid, Claude chosen without ANTHROPIC_API_KEY; message shown, Start disabled."""
+    os.environ.pop(KEY_ENV, None)
+    exports = _write_exports(root)
+    results = root / RESULTS_NAME
+    results.mkdir()
+    return A2MApp(choices=SetupChoices(exports=str(exports), results=str(results), llm=LlmChoice.CLAUDE))
+
+
+def _setup_advanced(root: Path) -> A2MApp:
+    """CP5 setup-advanced: Claude usable, Advanced open with mock backends, a golden recordings folder, one
+    ignored header and 5 AI fix attempts."""
+    os.environ[KEY_ENV] = STAND_IN_KEY
+    if SDK_MODULE not in sys.modules and importlib.util.find_spec(SDK_MODULE) is None:
+        sys.modules[SDK_MODULE] = types.ModuleType(SDK_MODULE)
+    exports = _write_exports(root)
+    results = root / RESULTS_NAME
+    results.mkdir()
+    golden = root / GOLDEN_NAME
+    golden.mkdir()
+    choices = SetupChoices(
+        exports=str(exports),
+        results=str(results),
+        llm=LlmChoice.CLAUDE,
+        mock_backends=True,
+        golden=str(golden),
+        ignore_headers=ADVANCED_IGNORED_HEADER,
+        max_fix_attempts=ADVANCED_FIX_ATTEMPTS,
+    )
+    return A2MApp(choices=choices, advanced_open=True)
+
+
 STATES: dict[str, Callable[[Path], A2MApp]] = {
     "setup-empty": _setup_empty,
     "setup-ready": _setup_ready,
     "setup-invalid": _setup_invalid,
     "setup-existing-results": _setup_existing_results,
+    "setup-no-key": _setup_no_key,
+    "setup-advanced": _setup_advanced,
 }
 
 

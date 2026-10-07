@@ -14,9 +14,12 @@ unset or blank.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import os
+import sys
 import time
 from collections.abc import Callable, Mapping
+from enum import StrEnum
 from typing import Any
 
 from a2m.ai.provider import AiRequest, ItemKind, ProviderError, ProviderLimitError, ProviderSetupError
@@ -46,6 +49,55 @@ BACKOFF_SECONDS = 2.0
 MAX_BACKOFF_SECONDS = 60.0
 RETRY_STATUSES = frozenset({408, 409, 429})
 MAX_ERROR_CHARS = 300
+SDK_MODULE = "anthropic"
+# The one-line messages for a Claude run that cannot start; the TUI shows them as they are (see setup_problem).
+WITHOUT_AI = "or run with --llm none to migrate without AI (--llm fake gives canned test answers)"
+MISSING_KEY = f"{KEY_ENV} is not set (or is empty); set it to use --llm claude (the default), {WITHOUT_AI}"
+MISSING_SDK = (
+    f"the Anthropic SDK (Python package {SDK_MODULE}) is not installed; install it with "
+    f"pip install 'a2m[claude]', {WITHOUT_AI}"
+)
+
+
+class SetupProblem(StrEnum):
+    """Why ``--llm claude`` cannot start, as a code callers switch on (never by parsing the message)."""
+
+    NO_KEY = "no-key"
+    NO_SDK = "no-sdk"
+
+    @property
+    def message(self) -> str:
+        """The one-line message a2m stops with for this problem."""
+        return MISSING_KEY if self is SetupProblem.NO_KEY else MISSING_SDK
+
+
+def setup_problem_kind(environ: Mapping[str, str] | None = None) -> SetupProblem | None:
+    """Why ``--llm claude`` could not start with ``environ`` (default: the process environment), or None when it
+    could.
+
+    Reads only whether the key is set, never its value, and only whether the SDK can be imported: nothing is
+    imported, no client is built and nothing is sent anywhere.
+    """
+    env = os.environ if environ is None else environ
+    if not env.get(KEY_ENV, "").strip():
+        return SetupProblem.NO_KEY
+    return None if _sdk_importable() else SetupProblem.NO_SDK
+
+
+def setup_problem(environ: Mapping[str, str] | None = None) -> str | None:
+    """The message for :func:`setup_problem_kind`, or None when ``--llm claude`` could start: the same messages
+    :meth:`ClaudeProvider.from_environment` stops with."""
+    problem = setup_problem_kind(environ)
+    return None if problem is None else problem.message
+
+
+def _sdk_importable() -> bool:
+    if SDK_MODULE in sys.modules:  # already imported, or marked unimportable (None)
+        return sys.modules[SDK_MODULE] is not None
+    try:
+        return importlib.util.find_spec(SDK_MODULE) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 class ClaudeProvider:
@@ -83,17 +135,11 @@ class ClaudeProvider:
         env = os.environ if environ is None else environ
         key = env.get(KEY_ENV, "").strip()
         if not key:
-            raise ProviderSetupError(
-                f"{KEY_ENV} is not set (or is empty); set it to use --llm claude (the default), "
-                "or run with --llm fake to migrate without an AI provider"
-            )
+            raise ProviderSetupError(MISSING_KEY)
         try:
-            sdk = importlib.import_module("anthropic")
+            sdk = importlib.import_module(SDK_MODULE)
         except ImportError:
-            raise ProviderSetupError(
-                "the Anthropic SDK (Python package anthropic) is not installed; install it with "
-                "pip install 'a2m[claude]', or run with --llm fake to migrate without an AI provider"
-            ) from None
+            raise ProviderSetupError(MISSING_SDK) from None
         model = env.get(MODEL_ENV, "").strip() or DEFAULT_MODEL
         client = sdk.Anthropic(api_key=key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=MAX_RETRIES)
         api_error = getattr(sdk, "APIError", None)

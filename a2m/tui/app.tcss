@@ -180,12 +180,14 @@ Footer FooterKey {
     & > RadioButton {
         background: $surface;
         color: $foreground;
+        /* background colors the outer brackets, color the inner dot (frame.bracket_glyph). */
         & > .toggle--button {
             color: $foreground-muted;
-            background: $panel;
+            background: $foreground-muted;
         }
         &.-on > .toggle--button {
             color: $primary;
+            background: $primary;
         }
         &.-on > .toggle--label {
             text-style: bold;
@@ -214,6 +216,85 @@ Footer FooterKey {
             color: $accent;
             background: $surface;
         }
+    }
+}
+
+/* ---- Advanced options body: panel, 1-cell padding left/right only (no blank rows, so the open section
+   fits 80x24), short fields two to a row: label, gap-2, field; gap-3 before the row's second label ---- */
+#body Collapsible {
+    &:focus-within {
+        background-tint: transparent;
+    }
+    Contents {
+        padding: 0 1;
+        background: $panel;
+    }
+}
+#body .adv-row {
+    height: 1;
+}
+.adv-label {
+    width: auto;
+    margin: 0 2 0 0;
+    color: $foreground;
+    &.adv-second {
+        margin: 0 2 0 3;
+    }
+}
+#body .adv-row Input {
+    width: 13;
+    padding: 0;
+    background: $panel;
+    /* Placeholder text is regular weight, dim and muted (DESIGN.md Typography), as in the prototype. */
+    & > .input--placeholder {
+        color: $foreground-muted;
+        text-style: dim;
+    }
+    &:focus {
+        background: $surface;
+    }
+    /* Fixed width: a long path scrolls inside the field, so the row keeps the prototype's columns. */
+    &.adv-golden {
+        width: 12;
+    }
+    &.adv-header {
+        width: 14;
+    }
+    &.adv-attempts {
+        width: 3;
+    }
+}
+/* The line under the AI choice or in Advanced: a2m's own message, error color. */
+#ai-hint, #advanced-hint {
+    height: auto;
+}
+
+/* ---- Checkbox (Advanced): compact glyph, inner X dimmed when off, primary when on, accent brackets on focus ---- */
+#body Checkbox {
+    background: $panel;
+    color: $foreground;
+    /* background colors the outer brackets, color the inner X (frame.bracket_glyph). */
+    & > .toggle--button {
+        color: $foreground-muted;
+        background: $foreground-muted;
+    }
+    &.-on > .toggle--button {
+        color: $primary;
+        background: $primary;
+    }
+    &:focus {
+        background-tint: transparent;
+        & > .toggle--button {
+            background: $accent;
+        }
+        & > .toggle--label {
+            color: $foreground;
+            background: $panel;
+            text-style: none;
+        }
+    }
+    &:blur:hover > .toggle--label {
+        background: $panel;
     }
 }
 

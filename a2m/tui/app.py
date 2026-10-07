@@ -15,6 +15,7 @@ from textual.theme import Theme
 from textual.widgets import HelpPanel
 
 from a2m.errors import NoTerminalError
+from a2m.tui.command import SetupChoices
 from a2m.tui.frame import APP_TITLE
 from a2m.tui.setup import SetupScreen
 
@@ -77,17 +78,25 @@ class A2MApp(App[int]):
         Binding("question_mark", "toggle_help", "Help", key_display="?"),
     ]
 
-    def __init__(self, *, exports: str = "", results: str = "") -> None:
-        """``exports`` and ``results`` fill the setup screen's folder fields when it opens (checked as if typed)."""
+    def __init__(
+        self,
+        *,
+        exports: str = "",
+        results: str = "",
+        choices: SetupChoices | None = None,
+        advanced_open: bool = False,
+    ) -> None:
+        """``exports`` and ``results`` fill the setup screen's folder fields when it opens (checked as if typed);
+        ``choices``, when given, fill every setup choice instead, and ``advanced_open`` opens Advanced options."""
         super().__init__()
         self.register_theme(DARK)
         self.register_theme(LIGHT)
         self.theme = DARK.name
-        self._exports = exports
-        self._results = results
+        self._choices = choices or SetupChoices(exports=exports, results=results)
+        self._advanced_open = advanced_open
 
     def on_mount(self) -> None:
-        self.push_screen(SetupScreen(exports=self._exports, results=self._results))
+        self.push_screen(SetupScreen(self._choices, advanced_open=self._advanced_open))
 
     def action_toggle_help(self) -> None:
         """Show the key help panel, or hide it when it is already open."""

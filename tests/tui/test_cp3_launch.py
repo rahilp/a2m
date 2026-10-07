@@ -27,38 +27,14 @@ function, and the CLI wiring tests are fully synchronous.
 
 from __future__ import annotations
 
-import asyncio
-import html
 import io
-import re
 import sys
-from collections.abc import Awaitable, Callable
 
 import pytest
 
 from a2m import __version__
 from a2m.cli import main as a2m_main
-
-_TEXT_RE = re.compile(
-    r'<text[^>]*\sx="([\d.]+)"[^>]*clip-path="url\(#[\w-]+-line-(\d+)\)"[^>]*>(.*?)</text>',
-    re.DOTALL,
-)
-
-
-def _screen_rows(app: object) -> dict[int, str]:
-    """Plain text per terminal row of ``app``'s current screenshot (no widget-class assumptions)."""
-    svg = app.export_screenshot(simplify=True)  # type: ignore[attr-defined]
-    cells: dict[int, list[tuple[float, str]]] = {}
-    for x, line_no, text in _TEXT_RE.findall(svg):
-        clean = html.unescape(text).replace("\xa0", " ")
-        cells.setdefault(int(line_no), []).append((float(x), clean))
-    return {line_no: "".join(text for _x, text in sorted(entries)) for line_no, entries in cells.items()}
-
-
-def _run(coro_factory: Callable[[], Awaitable[None]]) -> None:
-    """Run one async Textual test body to completion (no pytest-asyncio plugin installed)."""
-    asyncio.run(coro_factory())
-
+from tui.screen import _run, _screen_rows
 
 # ---------------------------------------------------------------- TUI-CP3-T01
 

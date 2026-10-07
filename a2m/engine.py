@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Protocol
 
 from a2m import layout, pathid, safefs
-from a2m.ai import Provider, ProviderSetupError, make_provider
+from a2m.ai import NO_AI, Provider, ProviderSetupError, make_provider
 from a2m.ai.prompts import FIX_PROMPT_FILE, PromptError, load_prompt, load_prompts
 from a2m.discovery import (
     BUNDLE_ROOTS,
@@ -79,6 +79,8 @@ from a2m.runlog import get_logger, run_log
 from a2m.verify import make_verify_stage
 from a2m.verify.generated import GeneratedSteps
 
+# --max-fix-attempts when it is not given.
+DEFAULT_MAX_FIX_ATTEMPTS = 3
 # Names shown when --only does not match; longer lists are cut short.
 MAX_NAMES_IN_MESSAGE = 20
 
@@ -86,6 +88,8 @@ MAX_NAMES_IN_MESSAGE = 20
 class LlmChoice(StrEnum):
     CLAUDE = "claude"
     FAKE = "fake"
+    # No AI at all: nothing is sent anywhere, and what only the AI could translate is skipped with that reason.
+    NONE = NO_AI
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +101,7 @@ class RunOptions:
     force: bool = False
     golden: Path | None = None
     mock_backends: bool = False
-    max_fix_attempts: int = 3
+    max_fix_attempts: int = DEFAULT_MAX_FIX_ATTEMPTS
     llm: LlmChoice = LlmChoice.CLAUDE
     no_runtime: bool = False
     # Extra header names a golden replay does not compare (--golden-ignore-header), on top of the defaults.
@@ -110,7 +114,7 @@ class StageOptions:
 
     golden: Path | None = None
     mock_backends: bool = False
-    max_fix_attempts: int = 3
+    max_fix_attempts: int = DEFAULT_MAX_FIX_ATTEMPTS
     llm: LlmChoice = LlmChoice.CLAUDE
     no_runtime: bool = False
     golden_ignore_headers: tuple[str, ...] = ()
@@ -178,6 +182,7 @@ def generate(context: ProxyContext) -> None:
         shared_flows=context.shared_flows,
         results_root=context.out_dir,
         provider=context.options.provider,
+        ai_turned_off=context.options.llm is LlmChoice.NONE,
     )
     log.info("%s: wrote Mule project %s/ (%d files)", context.name, layout.MULE_APP_DIR_NAME, len(result.files))
     _save_generated_steps(context, result)
@@ -420,7 +425,7 @@ def prepare_run(options: RunOptions) -> RunPlan:
         raise UsageError("--resume and --force cannot be used together")
     if options.max_fix_attempts < 0:
         raise UsageError("--max-fix-attempts must be 0 or greater")
-    _check_golden(options)
+    check_golden(options.golden)
     provider = _make_provider(options)
     discovery = discover(options.input_dir)
     names = discovery.candidate_names()
@@ -431,14 +436,7 @@ def prepare_run(options: RunOptions) -> RunPlan:
     _check_done_markers(options.out_dir, names)
     if not names:
         raise UsageError(_no_proxies_message(options.input_dir, discovery))
-    if options.only is not None and options.only not in names:
-        shown = ", ".join(names[:MAX_NAMES_IN_MESSAGE])
-        more = len(names) - MAX_NAMES_IN_MESSAGE
-        if more > 0:
-            shown += f" and {more} more"
-        raise UsageError(
-            f"no proxy named {options.only} was found in {options.input_dir}; proxies found: {shown}"
-        )
+    check_only(options.only, names, options.input_dir)
 
     def wanted(name: str) -> bool:
         return options.only is None or name == options.only
@@ -593,9 +591,41 @@ def _absolute_paths(options: RunOptions) -> RunOptions:
     )
 
 
-def _check_golden(options: RunOptions) -> None:
-    """UsageError unless --golden (when given) names an existing folder."""
-    golden = options.golden
+HEADER_NAME_CHARS = frozenset("!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def parse_whole_number(value: str) -> int:
+    """``value`` as a whole number 0 or greater (--max-fix-attempts); ValueError with the message to show."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise ValueError(f"expected a whole number 0 or greater, got {value!r}") from None
+    if number < 0:
+        raise ValueError(f"expected a whole number 0 or greater, got {value!r}")
+    return number
+
+
+def parse_header_name(value: str) -> str:
+    """``value`` as one HTTP header name (--golden-ignore-header); ValueError with the message to show."""
+    name = value.strip()
+    if not name or any(ch not in HEADER_NAME_CHARS for ch in name):
+        raise ValueError(f"expected an HTTP header name, got {value!r}")
+    return name
+
+
+def check_only(only: str | None, names: Sequence[str], input_dir: Path) -> None:
+    """UsageError unless --only (when given) names one of the proxies found in ``input_dir`` (``names``)."""
+    if only is None or only in names:
+        return
+    shown = ", ".join(names[:MAX_NAMES_IN_MESSAGE])
+    more = len(names) - MAX_NAMES_IN_MESSAGE
+    if more > 0:
+        shown += f" and {more} more"
+    raise UsageError(f"no proxy named {only} was found in {input_dir}; proxies found: {shown}")
+
+
+def check_golden(golden: Path | None) -> None:
+    """UsageError unless --golden (when given) names an existing folder; read-only."""
     if golden is None:
         return
     if not golden.exists():
@@ -604,10 +634,13 @@ def _check_golden(options: RunOptions) -> None:
         raise UsageError(f"golden recordings path {golden} is not a folder")
 
 
-def _make_provider(options: RunOptions) -> Provider:
+def _make_provider(options: RunOptions) -> Provider | None:
     """The AI provider --llm picks, and its prompt files, checked before anything is processed: a missing API key,
     SDK or prompt file stops the run with one clear line. The fix prompt is checked when the AI fix loop may run
-    (--max-fix-attempts above 0, and the apps may run: --mock-backends or --golden without --no-runtime)."""
+    (--max-fix-attempts above 0, and the apps may run: --mock-backends or --golden without --no-runtime).
+    ``--llm none`` has no provider and needs no key, SDK or prompt file."""
+    if options.llm is LlmChoice.NONE:
+        return None
     try:
         load_prompts()
         if _fix_loop_may_run(options):

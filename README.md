@@ -24,8 +24,10 @@ pip install ".[dev]"       # with pytest, ruff, mypy and the Textual dev tools, 
 
 `--llm claude` reads the API key from the `ANTHROPIC_API_KEY` environment variable and nothing else; a missing key
 stops the run before any proxy is processed, with one clear line. The model is `A2M_MODEL`, or a2m's default
-model when that is not set. `--llm fake` uses canned answers, needs no key and never opens a network connection
-(the folder named by `A2M_FAKE_LLM_DIR` can hold your own canned answers).
+model when that is not set. `--llm none` turns AI off: nothing is sent anywhere and no key or SDK is needed;
+custom code and conditions only the AI could translate are listed as skipped with the reason "AI is turned off
+(--llm none)", so those proxies land in needs-review. `--llm fake` uses canned answers, needs no key and never
+opens a network connection (the folder named by `A2M_FAKE_LLM_DIR` can hold your own canned answers).
 
 ```sh
 export ANTHROPIC_API_KEY=...   # only for --llm claude
@@ -76,7 +78,7 @@ Maven.
 ```sh
 a2m migrate ./apigee-exports --out ./results [--only NAME] [--resume | --force]
             [--golden ./recordings] [--golden-ignore-header NAME] [--mock-backends]
-            [--max-fix-attempts 3] [--llm claude|fake] [--no-runtime]
+            [--max-fix-attempts 3] [--llm claude|none|fake] [--no-runtime]
             [--progress auto|lines|none|json]
 ```
 
@@ -104,7 +106,7 @@ mise exec -- a2m migrate ./apigee-exports --out ./results --golden ./recordings
 | `--golden-ignore-header NAME` | A header that differs on every call (for example `X-Apigee-Message-ID`) and is not compared in a golden replay. Repeat it for more headers. |
 | `--mock-backends` | Run each app against a local mock backend that records the calls it gets. a2m never calls a proxy's real backends. |
 | `--max-fix-attempts N` | How many times the AI may try to fix an app whose tests fail (default 3; 0 turns the fix loop off). |
-| `--llm claude\|fake` | The AI provider for custom code, untranslatable conditions and fixes (default `claude`). |
+| `--llm claude\|none\|fake` | The AI provider for custom code, untranslatable conditions and fixes (default `claude`); `none` runs without AI. |
 | `--no-runtime` | Skip everything that needs Java, Maven or the Mule runtime. Every proxy is then static at best. |
 | `--progress auto\|lines\|none\|json` | Progress lines on stderr: one as each proxy starts (`[3/12] orders-api: generating`), one per slow step (building, deploying, running tests, `AI fix 1 of 3`) and one as it ends, naming its bucket. `auto` (the default) shows them only when stderr is a terminal, so piped or redirected output is unchanged; `lines` always shows them; `none` never does. They never change the results folder. `json` is for another program: stdout carries one JSON object per line (`run-started`, `proxy-started`, `step`, `proxy-finished`, then a final `run-finished` with the counts and `exit_code`, or `stopped` with the rerun advice after Ctrl-C), with the summary on stderr; usage errors are still one stderr line and exit code 2. The event fields are documented in `a2m/progress.py`. |
 
@@ -118,8 +120,11 @@ finished with `--resume`.
 `a2m` is still a usage error). `q` or `ctrl+q` quits, `?` lists the keys. It needs the `tui` extra; without it,
 `a2m tui` prints one line naming `pip install "a2m[tui]"` and exits with code 2. Without an interactive terminal
 (stdin or stdout redirected, a script, CI, `ssh` without a pty) `a2m tui` prints one line saying so and exits with
-code 2 instead of waiting for keys. For now it shows the setup
-screen only; choosing folders and starting a run from it come in later releases.
+code 2 instead of waiting for keys. Its setup screen picks the exports and results folders, the AI choice
+(Claude, which needs `ANTHROPIC_API_KEY`, or No AI) and, under Advanced options, `--only`, `--mock-backends`,
+`--golden`, `--golden-ignore-header`, `--max-fix-attempts` and `--no-runtime`, checking each with the same
+messages `a2m migrate` gives, and shows the matching `a2m migrate` command (`ctrl+y` copies it). The key's value is
+never shown. Starting the run from the screen comes in a later release; for now run the command shown.
 
 ## The three buckets
 

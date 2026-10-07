@@ -1,4 +1,5 @@
-"""The frame every screen shares: the header row (title left, version right) and the compact button."""
+"""The frame every screen shares: the header row (title left, version right), the compact button and the
+compact toggle glyphs."""
 
 from __future__ import annotations
 
@@ -8,7 +9,10 @@ from textual.app import App, ComposeResult, RenderResult
 from textual.binding import ActiveBinding
 from textual.containers import Horizontal
 from textual.content import Content
-from textual.widgets import Button, Static
+from textual.geometry import Size
+from textual.style import Style
+from textual.widgets import Button, Checkbox, RadioButton, Static
+from textual.widgets._toggle_button import ToggleButton
 
 from a2m import __version__
 
@@ -49,3 +53,49 @@ class EdgeButton(Button):
     def render(self) -> RenderResult:
         label = self.label if isinstance(self.label, Content) else Content(str(self.label))
         return label.pad(1, 1).stylize_before(self.get_visual_style("edge-button--fill"))
+
+
+def bracket_glyph(toggle: ToggleButton) -> Content:
+    """``▐`` + inner glyph + ``▌`` drawn as separate glyphs on the toggle's own background (DESIGN.md
+    Components, RadioSet and Checkbox).
+
+    The ``toggle--button`` style's background colors the outer brackets and its color the inner glyph, so
+    off reads as a muted pill, on as a primary one, and focus can recolor the brackets alone. Textual's own
+    glyph fills the inner cell with the bracket color, which hides an inner glyph of that same color.
+    """
+    button_style = toggle.get_visual_style("toggle--button")
+    behind = toggle.background_colors[1]
+    side_style = Style(foreground=button_style.background, background=behind)
+    inner_style = button_style + Style(background=behind)
+    return Content.assemble(
+        (toggle.BUTTON_LEFT, side_style),
+        (toggle.BUTTON_INNER, inner_style),
+        (toggle.BUTTON_RIGHT, side_style),
+    )
+
+
+class GlyphRadioButton(RadioButton):
+    """A RadioButton whose ``▐●▌`` glyph keeps its brackets and dot visible (see :func:`bracket_glyph`)."""
+
+    @property
+    def _button(self) -> Content:
+        return bracket_glyph(self)
+
+
+class GlyphCheckbox(Checkbox):
+    """A Checkbox whose ``▐X▌`` glyph keeps its brackets and X visible (see :func:`bracket_glyph`).
+
+    The label follows the glyph with no gap (``▐X▌mock-backends``), as in the prototype; one trailing cell
+    keeps the focus highlight off the next widget.
+    """
+
+    @property
+    def _button(self) -> Content:
+        return bracket_glyph(self)
+
+    def render(self) -> Content:
+        label = self._label.pad(0, 1).stylize_before(self.get_visual_style("toggle--label"))
+        return Content.assemble(self._button, label)
+
+    def get_content_width(self, container: Size, viewport: Size) -> int:
+        return self._button.cell_length + (1 if self._label else 0) + self._label.cell_length

@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from a2m import layout, safefs
+from a2m.ai import AI_TURNED_OFF, NO_AI
 from a2m.buckets import Bucket, decide
 from a2m.errors import BundleError
 from a2m.inventory import GenerateRecords, Inventory, OtherItem, Row, RowKind, build_inventory
@@ -547,7 +548,7 @@ def render_report(report: ProxyReport, text: _Text, *, no_fix_reason: str) -> st
     return "\n".join(lines) + "\n"
 
 
-def _no_fix_reason(result: VerificationResult, max_attempts: int, provider: object) -> str:
+def _no_fix_reason(result: VerificationResult, max_attempts: int, provider: object, *, ai_off: bool = False) -> str:
     if result.type in (VerificationType.GOLDEN, VerificationType.BATTERY):
         return "every test passed, so there was nothing to fix"
     if result.type is VerificationType.STATIC:
@@ -555,7 +556,7 @@ def _no_fix_reason(result: VerificationResult, max_attempts: int, provider: obje
     if max_attempts <= 0:
         return "--max-fix-attempts is 0"
     if provider is None:
-        return "no AI provider was given"
+        return AI_TURNED_OFF if ai_off else "no AI provider was given"
     return "no fix was asked for this result"
 
 
@@ -625,7 +626,10 @@ class ReportStage:
             roots.append((golden, "<golden>"))
         text = _Text(Masker.for_bundle(bundle), roots)
         no_fix = _no_fix_reason(
-            result, int(getattr(options, "max_fix_attempts", 0) or 0), getattr(options, "provider", None)
+            result,
+            int(getattr(options, "max_fix_attempts", 0) or 0),
+            getattr(options, "provider", None),
+            ai_off=str(getattr(options, "llm", "")) == NO_AI,
         )
         safefs.write_text_atomic(
             results_root, proxy_dir / layout.REPORT_NAME, render_report(report, text, no_fix_reason=no_fix)

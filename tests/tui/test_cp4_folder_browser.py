@@ -7,47 +7,15 @@ folder under ``tmp_path`` so ``~`` never reads the real home folder.
 
 from __future__ import annotations
 
-import asyncio
-import html
 import os
 import re
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
 from conftest import write_bundle_dir
 
 from a2m import layout
-
-_TEXT_RE = re.compile(
-    r'<text[^>]*\sx="([\d.]+)"[^>]*clip-path="url\(#[\w-]+-line-(\d+)\)"[^>]*>(.*?)</text>',
-    re.DOTALL,
-)
-
-
-def _screen_text(app: object) -> str:
-    """Every row of ``app``'s current screenshot as plain text, newline-joined."""
-    svg = app.export_screenshot(simplify=True)  # type: ignore[attr-defined]
-    cells: dict[int, list[tuple[float, str]]] = {}
-    for x, line_no, text in _TEXT_RE.findall(svg):
-        cells.setdefault(int(line_no), []).append((float(x), html.unescape(text).replace("\xa0", " ")))
-    rows = {line: "".join(text for _x, text in sorted(entries)) for line, entries in cells.items()}
-    return "\n".join(rows.get(y, "") for y in range(app.size.height))  # type: ignore[attr-defined]
-
-
-def _flat(text: str) -> str:
-    """``text`` without whitespace or border glyphs, so a path wrapped across rows still matches."""
-    return re.sub(r"[\s─-▟]", "", text)
-
-
-def _run(coro_factory: Callable[[], Awaitable[None]]) -> None:
-    asyncio.run(coro_factory())
-
-
-async def _settle(pilot: object) -> None:
-    await pilot.pause()  # type: ignore[attr-defined]
-    await asyncio.wait_for(pilot.app.workers.wait_for_complete(), timeout=10)  # type: ignore[attr-defined]
-    await pilot.pause()  # type: ignore[attr-defined]
+from tui.screen import _flat, _run, _screen_text, _set_input, _settle
 
 
 def _exports(parent: Path, name: str = "exports") -> Path:
@@ -75,13 +43,6 @@ async def _open_browser(pilot: object, field: str) -> object:
     await _settle(pilot)
     assert isinstance(app.screen, FolderPicker), app.screen
     return app.screen
-
-
-async def _set_input(pilot: object, widget_id: str, value: str) -> None:
-    from textual.widgets import Input
-
-    pilot.app.screen.query_one(widget_id, Input).value = value  # type: ignore[attr-defined]
-    await _settle(pilot)
 
 
 def test_TUI_CP4_B01_browse_opens_at_the_fields_folder_and_shows_its_full_path(tmp_path: Path) -> None:

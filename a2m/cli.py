@@ -32,7 +32,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 from a2m import __version__
-from a2m.engine import LlmChoice, RunOptions, Stage, interrupted_signal, prepare_run, rerun_advice, run_batch
+from a2m.engine import (
+    DEFAULT_MAX_FIX_ATTEMPTS,
+    LlmChoice,
+    RunOptions,
+    Stage,
+    interrupted_signal,
+    parse_header_name,
+    parse_whole_number,
+    prepare_run,
+    rerun_advice,
+    run_batch,
+)
 from a2m.errors import NoTerminalError, UnsafePathError, UsageError
 from a2m.progress import EventKind, ProgressCallback, ProgressEvent, describe, event_fields, json_line
 from a2m.redaction import redact
@@ -155,12 +166,9 @@ class _Parser(argparse.ArgumentParser):
 
 def _non_negative_int(value: str) -> int:
     try:
-        number = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"expected a whole number 0 or greater, got {value!r}") from None
-    if number < 0:
-        raise argparse.ArgumentTypeError(f"expected a whole number 0 or greater, got {value!r}")
-    return number
+        return parse_whole_number(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def _path_arg(value: str) -> Path:
@@ -176,15 +184,12 @@ def _path_arg(value: str) -> Path:
     return Path(value)
 
 
-HEADER_NAME_CHARS = frozenset("!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
-
 def _header_name(value: str) -> str:
     """The argparse type for --golden-ignore-header: one HTTP header name."""
-    name = value.strip()
-    if not name or any(ch not in HEADER_NAME_CHARS for ch in name):
-        raise argparse.ArgumentTypeError(f"expected an HTTP header name, got {value!r}")
-    return name
+    try:
+        return parse_header_name(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -225,15 +230,18 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument(
         "--max-fix-attempts",
         type=_non_negative_int,
-        default=3,
+        default=DEFAULT_MAX_FIX_ATTEMPTS,
         metavar="N",
-        help="how many times the AI may try to fix a failing app (default: 3)",
+        help=f"how many times the AI may try to fix a failing app (default: {DEFAULT_MAX_FIX_ATTEMPTS})",
     )
     migrate.add_argument(
         "--llm",
         choices=[choice.value for choice in LlmChoice],
         default=LlmChoice.CLAUDE.value,
-        help="AI provider for steps templates cannot handle (default: claude)",
+        help=(
+            "AI provider for steps templates cannot handle (default: claude); none turns AI off, and steps only the AI "
+            "could translate are skipped with that reason"
+        ),
     )
     migrate.add_argument(
         "--no-runtime", action="store_true", help="skip steps that need Java, Maven or the Mule runtime"

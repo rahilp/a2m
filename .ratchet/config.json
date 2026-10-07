@@ -136,5 +136,15 @@
       "added": "2026-10-05",
       "from": "a2m-python-cli-that-migrates-apigee-proxy-bundle/CP10"
     }
+  ],
+  "providers": [
+    {
+      "id": "gemini",
+      "preset": "gemini"
+    },
+    {
+      "id": "claude",
+      "preset": "claude"
+    }
   ]
 }

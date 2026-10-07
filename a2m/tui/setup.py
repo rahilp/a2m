@@ -5,9 +5,12 @@ absolute folder a relative path names) or picked in the folder browser (the Brow
 in a folder field). Every change is
 checked in a worker thread with the engine's own read-only checks (:mod:`a2m.tui.folders`), so the
 lines under the fields carry the same messages ``a2m migrate`` gives, and Start is enabled only when a
-run could start. A results folder from an earlier run asks for Resume or Force. The command preview
-always shows the ``a2m migrate`` line for the current choices. The AI choice and the Advanced options
-are drawn but not built yet, so they stay disabled; nothing here pretends to work.
+run could start. A results folder from an earlier run asks for Resume or Force. The AI choice is Claude
+or No AI (the default): Claude without ANTHROPIC_API_KEY (or its SDK) shows a2m's own message and keeps
+Start disabled; only whether the key is set is ever read, never its value, so no widget, preview or
+copied command can show it. The Advanced options (closed by default) set the other ``a2m migrate``
+options, checked with the same messages the command line gives. The command preview always shows the
+``a2m migrate`` line for the current choices.
 
 Folder names and paths are user data: every widget that shows them renders plain text, never markup.
 """
@@ -27,13 +30,15 @@ from textual.binding import ActiveBinding, Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widget import Widget
-from textual.widgets import Button, Collapsible, Footer, Input, RadioButton, RadioSet, Static
+from textual.widgets import Button, Checkbox, Collapsible, Footer, Input, RadioButton, RadioSet, Static
 from textual.worker import get_current_worker
 
+from a2m.ai.claude import SetupProblem
+from a2m.engine import LlmChoice
 from a2m.errors import A2mError
 from a2m.tui.command import RerunChoice, SetupChoices, command_preview, folder_path, resolved_folder
 from a2m.tui.folders import FieldCheck, SetupCheck, Status, check_setup, preview_exports, preview_results
-from a2m.tui.frame import AppHeader, EdgeButton, global_keys_first
+from a2m.tui.frame import AppHeader, EdgeButton, GlyphCheckbox, GlyphRadioButton, global_keys_first
 from a2m.tui.picker import FolderPicker, FolderSuggester, start_folder
 
 # A check starts this long after the last change, so typing a path does not scan every folder on the way.
@@ -42,6 +47,9 @@ CHECKING_TEXT = "Checking…"
 CHOOSE_RERUN_REASON = "Pick Resume or Force to continue"
 START_NOT_BUILT = "Starting a run from here is not built yet; run the command shown in a terminal."
 COMMAND_COPIED = "Command copied"
+NO_KEY_REASON = "Set ANTHROPIC_API_KEY to use Claude"
+NO_SDK_REASON = "Install the Anthropic SDK to use Claude"
+ADVANCED_REASON = "An Advanced option needs fixing: open Advanced options"
 
 
 class Body(VerticalScroll, can_focus=False):
@@ -88,6 +96,13 @@ class FolderInput(Input):
         self.focus()
 
 
+class OptionInput(Input):
+    """A one-row Advanced option field (no border; the section's panel shows through)."""
+
+    # In a field q types a q, so the footer shows ctrl+q for Quit (the app's own binding does the quitting).
+    BINDINGS: ClassVar[list[BindingType]] = [Binding("ctrl+q", "app.quit", "Quit", priority=True)]
+
+
 class SetupScreen(Screen[None]):
     """Pick the exports folder, the results folder and the AI choice, then start a run."""
 
@@ -100,9 +115,12 @@ class SetupScreen(Screen[None]):
     # Nothing is focused when the screen opens (Tab moves into the first field), so q still quits.
     AUTO_FOCUS = ""  # "" focuses nothing (None would inherit the app's "*")
 
-    def __init__(self, *, exports: str = "", results: str = "") -> None:
+    def __init__(self, choices: SetupChoices | None = None, *, advanced_open: bool = False) -> None:
+        """``choices`` fill the screen when it opens (checked as if typed or picked); ``advanced_open`` opens the
+        Advanced options."""
         super().__init__()
-        self._initial = SetupChoices(exports=exports, results=results)
+        self._initial = choices or SetupChoices()
+        self._advanced_open = advanced_open
         self._rerun: RerunChoice | None = None
         # Set by a Resume or Force pick: once that pick makes the run ready, Start comes into view.
         self._reveal_start = False
@@ -145,22 +163,46 @@ class SetupScreen(Screen[None]):
                 yield EdgeButton("Resume", id="btn-resume", compact=True)
                 yield EdgeButton("Force (redo all)", id="btn-force", compact=True)
             yield Static("AI", id="label-ai", classes="section-label", markup=False)
-            with RadioSet(id="radio-ai", compact=True, disabled=True):
-                yield RadioButton("Claude (uses ANTHROPIC_API_KEY)", id="radio-ai-claude", compact=True)
-                yield RadioButton("No AI", id="radio-ai-none", compact=True)
-            yield Collapsible(
+            claude = self._initial.llm is LlmChoice.CLAUDE
+            with RadioSet(id="radio-ai", compact=True):
+                yield GlyphRadioButton("Claude (uses ANTHROPIC_API_KEY)", claude, id="radio-ai-claude", compact=True)
+                yield GlyphRadioButton("No AI", not claude, id="radio-ai-none", compact=True)
+            yield Static("", id="ai-hint", classes="hint", markup=False)
+            with Collapsible(
                 title="Advanced options",
-                collapsed=True,
+                collapsed=not self._advanced_open,
                 collapsed_symbol="▸",
                 expanded_symbol="▾",
                 id="collapsible-advanced",
-                disabled=True,
-            )
+            ):
+                yield from self._advanced_fields()
             yield Static("Command", id="label-command", classes="section-label", markup=False)
             yield Static(self._command, id="command-preview", markup=False)
             yield EdgeButton("Start", id="start", variant="primary", compact=True, disabled=True)
             yield Static(CHOOSE_RERUN_REASON, id="start-disabled-reason", markup=False)
         yield Footer(id="ftr", compact=True, show_command_palette=False)
+
+    def _advanced_fields(self) -> ComposeResult:
+        """The Advanced options, short fields two to a row so the open section still fits 80x24."""
+        initial = self._initial
+        with Horizontal(classes="adv-row"):
+            yield Static("Only this proxy", classes="adv-label", markup=False)
+            yield OptionInput(initial.only, placeholder="(all)", id="input-only", classes="adv-only")
+            yield Static("Mock backends", classes="adv-label adv-second", markup=False)
+            yield GlyphCheckbox("mock-backends", initial.mock_backends, id="checkbox-mock-backends", compact=True)
+        with Horizontal(classes="adv-row"):
+            yield Static("Golden recordings", classes="adv-label", markup=False)
+            yield OptionInput(initial.golden, placeholder="(none)", id="input-golden", classes="adv-golden")
+            yield Static("Ignored header", classes="adv-label adv-second", markup=False)
+            yield OptionInput(
+                initial.ignore_headers, placeholder="(none)", id="input-golden-ignore-header", classes="adv-header"
+            )
+        with Horizontal(classes="adv-row"):
+            yield Static("AI fix attempts", classes="adv-label", markup=False)
+            yield OptionInput(initial.max_fix_attempts, id="input-max-fix-attempts", classes="adv-attempts")
+            yield Static("Skip Mule runtime", classes="adv-label adv-second", markup=False)
+            yield GlyphCheckbox("no-runtime", initial.no_runtime, id="checkbox-no-runtime", compact=True)
+        yield Static("", id="advanced-hint", classes="hint", markup=False)
 
     def on_mount(self) -> None:
         self._show_rerun_choice(False)
@@ -168,6 +210,8 @@ class SetupScreen(Screen[None]):
         self._show_hint("#input-results-hint", FieldCheck())
         self._show_resolved("#input-exports-resolved", "")
         self._show_resolved("#input-results-resolved", "")
+        self._show_line("#ai-hint", FieldCheck())
+        self._show_line("#advanced-hint", FieldCheck())
         self.query_one("#start-disabled-reason").display = False
         exports = self.query_one("#input-exports", Input)
         results = self.query_one("#input-results", Input)
@@ -175,21 +219,34 @@ class SetupScreen(Screen[None]):
             # Setting a value posts Input.Changed, which starts the check.
             exports.value = self._initial.exports
             results.value = self._initial.results
+        else:
+            self._check()
 
     # ------------------------------------------------------------------ current choices
 
     def choices(self) -> SetupChoices:
         """What is typed or picked right now."""
+        claude = self.query_one("#radio-ai-claude", RadioButton).value
         return SetupChoices(
             exports=self.query_one("#input-exports", Input).value,
             results=self.query_one("#input-results", Input).value,
             rerun=self._rerun,
+            llm=LlmChoice.CLAUDE if claude else LlmChoice.NONE,
+            only=self.query_one("#input-only", Input).value,
+            mock_backends=self.query_one("#checkbox-mock-backends", Checkbox).value,
+            golden=self.query_one("#input-golden", Input).value,
+            ignore_headers=self.query_one("#input-golden-ignore-header", Input).value,
+            max_fix_attempts=self.query_one("#input-max-fix-attempts", Input).value,
+            no_runtime=self.query_one("#checkbox-no-runtime", Checkbox).value,
         )
 
     # ------------------------------------------------------------------ events
 
     def on_input_changed(self, event: Input.Changed) -> None:
         event.stop()
+        if not isinstance(event.input, FolderInput):
+            self._check()  # an Advanced option
+            return
         if event.input.id == "input-results":
             # A different results folder: an earlier Resume or Force pick no longer applies.
             self._rerun = None
@@ -197,6 +254,19 @@ class SetupScreen(Screen[None]):
         self._show_resolved(f"#{event.input.id}-resolved", event.value)
         hint = f"#{event.input.id}-hint"
         self._show_hint(hint, FieldCheck(Status.NONE, CHECKING_TEXT if event.value.strip() else ""))
+        self._check()
+
+    def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
+        event.stop()
+        self._check()
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        event.stop()
+        self._check()
+
+    def on_collapsible_toggled(self, event: Collapsible.Toggled) -> None:
+        """Opening or closing Advanced moves the reason under Start (see :meth:`_start_reason`)."""
+        event.stop()
         self._check()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -264,15 +334,36 @@ class SetupScreen(Screen[None]):
         self._show_hint("#input-exports-hint", result.exports)
         self._show_hint("#input-results-hint", result.results)
         self._show_rerun_choice(result.needs_rerun_choice)
-        reason = CHOOSE_RERUN_REASON if result.needs_rerun_choice and result.choices.rerun is None else None
-        self._set_start(result.ready, reason)
+        self._show_line("#ai-hint", result.ai)
+        self._show_line("#advanced-hint", result.advanced)
+        self._set_start(result.ready, self._start_reason(result))
         if self._reveal_start and result.choices.rerun is not None:
             self._reveal_start = False
             if result.ready:
                 # The pick completed the form: keep Start in view (only a terminal under 24 rows scrolls).
                 self.call_after_refresh(self.query_one("#start").scroll_visible, animate=False)
 
+    def _start_reason(self, result: SetupCheck) -> str | None:
+        """The one line under a disabled Start, when the reason is not already shown by a field."""
+        if result.needs_rerun_choice and result.choices.rerun is None:
+            return CHOOSE_RERUN_REASON
+        if result.ai_problem is SetupProblem.NO_KEY:
+            return NO_KEY_REASON
+        if result.ai_problem is SetupProblem.NO_SDK:
+            return NO_SDK_REASON
+        if result.advanced.status is Status.INVALID and self.query_one("#collapsible-advanced", Collapsible).collapsed:
+            return ADVANCED_REASON
+        return None
+
     # ------------------------------------------------------------------ drawing
+
+    def _show_line(self, selector: str, check: FieldCheck) -> None:
+        """A message line under the AI choice or in Advanced: shown only when there is something to say."""
+        line = self.query_one(selector, Static)
+        line.update(check.text)
+        line.display = bool(check.text)
+        line.set_class(check.status is Status.VALID, "-valid")
+        line.set_class(check.status is Status.INVALID, "-invalid")
 
     def _show_hint(self, selector: str, check: FieldCheck) -> None:
         hint = self.query_one(selector, Static)

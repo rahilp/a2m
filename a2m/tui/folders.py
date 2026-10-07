@@ -1,17 +1,32 @@
-"""Check the setup screen's folder choices with the engine's own checks; read-only, imports no Textual.
+"""Check the setup screen's choices with the engine's own checks; read-only, imports no Textual.
 
-Every message shown for a folder that cannot be used is the one ``a2m migrate`` gives for it
-(:func:`a2m.engine.check_exports` and :func:`a2m.engine.check_results_folder`), so the screen and the
-command line never disagree. Nothing here creates, changes or deletes anything.
+Every message shown for a folder or option that cannot be used is the one ``a2m migrate`` gives for it
+(:func:`a2m.engine.check_exports`, :func:`a2m.engine.check_results_folder`, the Advanced options' checks and,
+for Claude, :func:`a2m.ai.claude.setup_problem`), so the screen and the command line never disagree. Nothing
+here creates, changes or deletes anything. The Claude check reads only whether ANTHROPIC_API_KEY is set,
+never its value.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 
-from a2m.engine import ResultsFolder, ResultsFolderInUse, check_exports, check_results_folder, done_proxies
+from a2m.ai.claude import SetupProblem, setup_problem_kind
+from a2m.engine import (
+    LlmChoice,
+    ResultsFolder,
+    ResultsFolderInUse,
+    check_exports,
+    check_golden,
+    check_only,
+    check_results_folder,
+    done_proxies,
+    parse_header_name,
+    parse_whole_number,
+)
 from a2m.errors import UsageError
 from a2m.tui.command import RerunChoice, SetupChoices
 
@@ -54,6 +69,11 @@ class SetupCheck:
     results_folder: ResultsFolder | None = None
     # The refusal of the user's Resume or Force pick for that folder, e.g. --resume on a force-pending folder.
     rerun_error: str | None = None
+    # Why the AI choice cannot run (Claude without its key or SDK), and the first Advanced option that cannot.
+    ai: FieldCheck = FieldCheck()
+    advanced: FieldCheck = FieldCheck()
+    # Which of the AI problems ``ai`` shows (None: the AI choice can run), so callers never parse its text.
+    ai_problem: SetupProblem | None = None
 
     @property
     def needs_rerun_choice(self) -> bool:
@@ -65,19 +85,74 @@ class SetupCheck:
         """Both folders are usable and nothing is left to choose: a run could start."""
         if self.exports.status is not Status.VALID or self.results.status is not Status.VALID:
             return False
+        if Status.INVALID in (self.ai.status, self.advanced.status):
+            return False
         if self.needs_rerun_choice:
             return self.choices.rerun is not None and self.rerun_error is None
         return True
 
 
 def check_setup(choices: SetupChoices) -> SetupCheck:
-    """Check the exports and results folders of ``choices`` as ``a2m migrate`` would; read-only."""
+    """Check the folders, the AI choice and the Advanced options of ``choices`` as ``a2m migrate`` would; read-only."""
     exports = choices.exports_path
-    results = choices.results_path
     names: list[str] = []
     exports_check = FieldCheck()
     if exports is not None:
         exports_check, names = _check_exports(exports)
+    found = _check_folders(choices, exports_check, names)
+    checked = exports if exports_check.status is Status.VALID else None
+    problem = ai_problem(choices.llm)
+    return replace(
+        found,
+        ai=_ai_field(problem),
+        ai_problem=problem,
+        advanced=check_advanced(choices, names, checked),
+    )
+
+
+def ai_problem(llm: LlmChoice) -> SetupProblem | None:
+    """Why the AI choice could not run (Claude without ANTHROPIC_API_KEY or its SDK), or None when it could."""
+    return setup_problem_kind() if llm is LlmChoice.CLAUDE else None
+
+
+def check_ai(llm: LlmChoice) -> FieldCheck:
+    """Why the AI choice could not run, in a2m's own words (Claude without ANTHROPIC_API_KEY or its SDK)."""
+    return _ai_field(ai_problem(llm))
+
+
+def _ai_field(problem: SetupProblem | None) -> FieldCheck:
+    return FieldCheck.invalid(problem.message) if problem is not None else FieldCheck()
+
+
+def check_advanced(choices: SetupChoices, names: Sequence[str] = (), exports: Path | None = None) -> FieldCheck:
+    """The first Advanced option ``a2m migrate`` would refuse, with its message; ``names`` (the proxies found in
+    ``exports``) check the one proxy to process, when given."""
+    try:
+        check_golden(None if choices.golden_path is None else choices.golden_path.absolute())
+    except UsageError as exc:
+        return FieldCheck.invalid(str(exc))
+    for name in choices.header_names:
+        try:
+            parse_header_name(name)
+        except ValueError as exc:
+            return FieldCheck.invalid(f"argument --golden-ignore-header: {exc}")
+    if choices.fix_attempts_text:
+        try:
+            parse_whole_number(choices.fix_attempts_text)
+        except ValueError as exc:
+            return FieldCheck.invalid(f"argument --max-fix-attempts: {exc}")
+    if exports is not None and names:
+        try:
+            check_only(choices.only_name, names, exports.absolute())
+        except UsageError as exc:
+            return FieldCheck.invalid(str(exc))
+    return FieldCheck()
+
+
+def _check_folders(choices: SetupChoices, exports_check: FieldCheck, names: list[str]) -> SetupCheck:
+    """Check the results folder of ``choices`` (the exports folder was checked already, finding ``names``)."""
+    exports = choices.exports_path
+    results = choices.results_path
     if results is None:
         return SetupCheck(choices, exports_check, FieldCheck())
 
