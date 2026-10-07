@@ -349,6 +349,11 @@ Footer FooterKey {
         border-left: heavy $accent;
         border-right: heavy $accent;
     }
+    /* Focus also bolds the label (DESIGN.md: hover stays regular, lighter than true focus), a non-colour cue
+       that keeps focused and unfocused apart even where a button keeps its role-colored edges. */
+    &:focus > .edge-button--fill {
+        text-style: bold;
+    }
     /* The edge glyphs stay dim border on the surface; only the padded label takes the background tint. */
     &:disabled {
         border-left: heavy $border;
@@ -700,4 +705,97 @@ ConfirmScreen {
         margin: 0;
     }
     /* Tables are drawn as a light box table in the `border` color (results.SummaryTableGrid). */
+}
+
+/* ---- Review screen (DESIGN.md Layout, Screen anatomy Review): the "proxy N of M" line, the Report/Diffs tab
+   bar, the content in its own fixed-height pane (REPORT.md, or the diffs/ file list and the chosen file),
+   the folder path with its copy hint, and the Previous / Next / Back to summary row, so the screen itself
+   fits 80x24. REPORT.md and diffs are literal text on panel (DESIGN.md Typography, Mono). ---- */
+#review-tabs {
+    height: 1;
+}
+/* The label carries its own one-cell padding (review.py), so the active underline spans the padded tab. */
+.review-tab {
+    width: auto;
+    padding: 0;
+    color: $foreground-muted;
+    &.-active {
+        color: $accent;
+        text-style: underline;
+    }
+}
+/* Fixed-height panes (the prototype's 11 rows for REPORT.md, 7 for a diff below the file list) that scroll
+   inside, so the path and buttons sit directly below with free rows above the Footer. */
+.review-pane {
+    height: 11;
+    background: $panel;
+    color: $foreground;
+    scrollbar-size-vertical: 1;
+    &:focus {
+        background-tint: transparent;
+    }
+}
+#review-diffs-view {
+    height: auto;
+}
+/* The diff pane draws no scrollbar, as in the prototype (and like the results panes): the panel fill runs to
+   the right gutter. It still scrolls by mouse wheel, and by arrow and page keys once focused (Tab). */
+#review-diff-pane {
+    height: 7;
+    scrollbar-size-vertical: 0;
+    overflow-y: auto;
+}
+#review-no-diffs {
+    height: 1;
+    padding: 0 1;
+    background: $panel;
+    color: $foreground-muted;
+    text-style: italic;
+}
+#review-diffs-list {
+    height: auto;
+    max-height: 4;
+    border: none;
+    padding: 0;
+    background: $panel;
+    scrollbar-size-vertical: 1;
+    &:focus {
+        border: none;
+        background-tint: transparent;
+    }
+    & > .option-list--option {
+        padding: 0 1;
+    }
+    & > .option-list--option-highlighted {
+        background: $panel;
+        color: $foreground;
+        text-style: none;
+    }
+    &:focus > .option-list--option-highlighted {
+        background: $accent;
+        color: $background;
+    }
+    & > .option-list--option-disabled {
+        color: $foreground-muted;
+        text-style: italic;
+    }
+}
+#review-path {
+    height: auto;
+    color: $foreground;
+}
+#review-done {
+    height: auto;
+}
+#review-buttons {
+    height: 1;
+    & > Button {
+        margin-right: 1;
+    }
+    /* A focused primary button (Back to summary when the walkthrough is finished) keeps its primary edges;
+       its bold label (the shared Button focus rule) is what marks it as focused. */
+    & > Button.-primary:focus {
+        border-left: heavy $primary;
+        border-right: heavy $primary;
+    }
 }

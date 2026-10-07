@@ -15,7 +15,10 @@ states replay the prototype's progress events through a tiny stand-in child
 process (written to the temporary folder) instead of running a migration, and
 read a clock fixed at the prototype's elapsed time.
 The results states write a finished run's folder with a2m's own summary code,
-then swap in the prototype's SUMMARY.md sample.
+then swap in the prototype's SUMMARY.md sample. The review states add the
+prototype's seven needs-review proxies (REVIEW_SET: each REPORT.md and diffs/
+file holds the prototype's text) and list them in summary.json in the
+prototype's order, so "proxy 3 of 7" is the same proxy as in the reference.
 Later steps add their states to ``STATES``. Not shipped with the package.
 """
 
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -41,7 +45,9 @@ from a2m.summary import ProxySummary, proxy_facts_json, write_batch_summary
 from a2m.tui import app as app_module
 from a2m.tui.app import A2MApp
 from a2m.tui.command import SetupChoices
+from a2m.tui.read import Results, load_results
 from a2m.tui.results import BUCKET_LABELS, ResultsScreen
+from a2m.tui.review import ReviewScreen, View
 from a2m.tui.run import BUCKET_MARKS, RunScreen
 from a2m.verify.model import VerificationType
 
@@ -352,9 +358,7 @@ def _run_force_stop(root: Path) -> A2MApp:
     """CP6 run-force-stop: a stop has outlasted its clean-up budget; Force stop is offered with its warning."""
     lines = _run_events(RUN_FINISHED, RUN_CURRENT)
     argv = _replay(root, lines, "slowstop")
-    return _run_app(
-        root, argv, RUN_PROGRESS_ELAPSED, then=lambda screen: screen.stop_run(), stop_grace=RUN_FORCE_GRACE
-    )
+    return _run_app(root, argv, RUN_PROGRESS_ELAPSED, then=lambda screen: screen.stop_run(), stop_grace=RUN_FORCE_GRACE)
 
 
 def _stop_then_resume(screen: RunScreen) -> None:
@@ -449,6 +453,160 @@ def _results_not_a2m(root: Path) -> A2MApp:
     return _results_app(root, folder)
 
 
+# ---------------------------------------------------------------- review states (CP8)
+
+# The prototype's REVIEW_SET (name, REPORT.md text, diffs/ files) in its order, and its DIFF_CONTENTS.
+REVIEW_SET: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "auth-gateway",
+        (
+            "Policy translation: 11 of 12 policies mapped.\nOne JavaScript callout left as a manual TODO.\n\n"
+            "Verification: 5 of 6 golden tests passed."
+        ),
+        ("test-login-check.diff",),
+    ),
+    (
+        "rates-api",
+        (
+            "Policy translation: complete.\n\nVerification: 4 of 4 golden tests passed.\n"
+            "AI fix loop: resolved a header-casing mismatch on attempt 1 of 3."
+        ),
+        (),
+    ),
+    (
+        "js-transform",
+        (
+            "Policy translation: 9 of 10 policies mapped.\n\nVerification: 7 of 8 golden tests passed.\n"
+            "1 of 8 golden tests did not match (see Diffs)."
+        ),
+        ("test-orders-check.diff", "verification-log.txt"),
+    ),
+    (
+        "weather-api",
+        (
+            "Policy translation: complete.\nAI was unsure about one policy translation (ServiceCallout timeout "
+            "handling) and flagged it for human review."
+        ),
+        ("ai-note.txt",),
+    ),
+    (
+        "loyalty-api",
+        (
+            "Policy translation: complete.\n\nVerification: 4 of 6 golden tests passed.\n"
+            "2 of 6 golden tests did not match (see Diffs)."
+        ),
+        ("test-points-check.diff", "test-tier-check.diff"),
+    ),
+    (
+        "legacy-auth",
+        (
+            "Policy translation: 6 of 7 policies mapped.\nAI is turned off (--llm none): a JavaScript callout could "
+            "not be translated and was skipped for that reason."
+        ),
+        (),
+    ),
+    (
+        "notify-webhook",
+        (
+            "Policy translation: complete.\n\nVerification: 3 of 4 golden tests passed.\n"
+            "1 of 4 golden tests did not match (see Diffs)."
+        ),
+        ("test-webhook-check.diff",),
+    ),
+)
+DIFF_CONTENTS: dict[str, str] = {
+    "test-orders-check.diff": "--- expected/orders-check.json\n+++ actual/orders-check.json\n@@ -2,7 +2,7 @@\n"
+    '   "status": "ok",\n-  "total": 42.50,\n+  "total": 42.00,\n   "currency": "USD",\n',
+    "verification-log.txt": "[verify] running golden test 8 of 8: orders-check\n"
+    '[verify] response body mismatch on field "total"\n[verify] test failed',
+    "test-login-check.diff": "--- expected/login-check.json\n+++ actual/login-check.json\n@@ -1,4 +1,4 @@\n"
+    '-{"session": "abc123"}\n+{"session": "abc123", "expiresIn": 3600}\n',
+    "ai-note.txt": "AI was unsure whether the ServiceCallout timeout of 30s should carry over.\n"
+    "Left as a manual TODO for a human to confirm against the target system.",
+    "test-points-check.diff": "--- expected/points-check.json\n+++ actual/points-check.json\n@@ -1,3 +1,3 @@\n"
+    '-{"points": 120}\n+{"points": 100}\n',
+    "test-tier-check.diff": "--- expected/tier-check.json\n+++ actual/tier-check.json\n@@ -1,3 +1,3 @@\n"
+    '-{"tier": "gold"}\n+{"tier": "silver"}\n',
+    "test-webhook-check.diff": "--- expected/webhook-check.json\n+++ actual/webhook-check.json\n@@ -1,3 +1,3 @@\n"
+    '-{"delivered": true}\n+{"delivered": false}\n',
+}
+# review-report and review-diffs: proxy 3 of 7 (js-transform); review-no-diffs: proxy 6 of 7 (legacy-auth).
+REVIEW_REPORT_INDEX = 2
+REVIEW_NO_DIFFS_INDEX = 5
+
+
+def _write_review_results(root: Path) -> Path:
+    """A finished run with the prototype's verified and unsupported proxies plus its seven needs-review ones,
+    each with the prototype's REPORT.md and diffs/ files; summary.json lists them in the prototype's order."""
+    proxies = tuple(p for p in PROXIES if p[1] != layout.NEEDS_REVIEW_DIR_NAME) + tuple(
+        (name, layout.NEEDS_REVIEW_DIR_NAME) for name, _report, _diffs in REVIEW_SET
+    )
+    out = _write_results(root, proxies)
+    for name, report, diffs in REVIEW_SET:
+        proxy_dir = layout.bucket_proxy_dir(out, layout.NEEDS_REVIEW_DIR_NAME, name)
+        (proxy_dir / layout.REPORT_NAME).write_text(report + "\n", encoding="utf-8")
+        diffs_dir = proxy_dir / layout.DIFFS_DIR_NAME
+        diffs_dir.mkdir()
+        for file_name in diffs:
+            (diffs_dir / file_name).write_text(DIFF_CONTENTS[file_name], encoding="utf-8")
+    summary_json = layout.summary_json_path(out)
+    data = json.loads(summary_json.read_text(encoding="utf-8"))
+    order = {name: rank for rank, (name, _bucket) in enumerate(proxies)}
+    data["proxies"].sort(key=lambda entry: order[entry["name"]])
+    summary_json.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return out
+
+
+class ReviewStateApp(A2MApp):
+    """The app on the setup screen, the results screen for ``results`` above it, and the review walkthrough
+    on top at ``index`` (``len`` = finished) in ``view``."""
+
+    CSS_PATH = str(Path(app_module.__file__).with_name(A2MApp.CSS_PATH))
+
+    def __init__(self, results: Path, *, setup: SetupChoices, index: int, view: View) -> None:
+        super().__init__(choices=setup)
+        self._results_folder = results
+        self._index = index
+        self._view = view
+
+    def on_mount(self) -> None:
+        self.call_later(self._open_review)
+
+    def _open_review(self) -> None:
+        loaded = load_results(self._results_folder)
+        if not isinstance(loaded, Results):
+            raise SystemExit(f"review states: cannot load {self._results_folder}: {loaded.message}")
+        self.push_screen(ResultsScreen(self._results_folder))
+        self.push_screen(ReviewScreen(loaded, index=self._index, view=self._view))
+
+
+def _review_app(root: Path, index: int, view: View) -> A2MApp:
+    results = _write_review_results(root)
+    exports = _write_exports(root)
+    setup = SetupChoices(exports=str(exports), results=str(results))
+    return ReviewStateApp(results, setup=setup, index=index, view=view)
+
+
+def _review_report(root: Path) -> A2MApp:
+    """CP8 review-report: proxy 3 of 7 (js-transform) with its REPORT.md shown."""
+    return _review_app(root, REVIEW_REPORT_INDEX, View.REPORT)
+
+
+def _review_diffs(root: Path) -> A2MApp:
+    """CP8 review-diffs: proxy 3 of 7 with the Diffs view open, its failing-test diff shown."""
+    return _review_app(root, REVIEW_REPORT_INDEX, View.DIFFS)
+
+
+def _review_no_diffs(root: Path) -> A2MApp:
+    """CP8 review-no-diffs: the Diffs view for proxy 6 of 7 (legacy-auth), which has no diffs."""
+    return _review_app(root, REVIEW_NO_DIFFS_INDEX, View.DIFFS)
+
+
+def _review_done(root: Path) -> A2MApp:
+    """CP8 review-done: moved past the last of the 7 needs-review proxies."""
+    return _review_app(root, len(REVIEW_SET), View.REPORT)
+
+
 STATES: dict[str, Callable[[Path], A2MApp]] = {
     "setup-empty": _setup_empty,
     "setup-ready": _setup_ready,
@@ -466,6 +624,10 @@ STATES: dict[str, Callable[[Path], A2MApp]] = {
     "results-summary": _results_summary,
     "results-nothing-to-review": _results_nothing_to_review,
     "results-not-a2m": _results_not_a2m,
+    "review-report": _review_report,
+    "review-diffs": _review_diffs,
+    "review-no-diffs": _review_no_diffs,
+    "review-done": _review_done,
 }
 
 

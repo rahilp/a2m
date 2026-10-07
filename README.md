@@ -124,7 +124,33 @@ code 2 instead of waiting for keys. Its setup screen picks the exports and resul
 (Claude, which needs `ANTHROPIC_API_KEY`, or No AI) and, under Advanced options, `--only`, `--mock-backends`,
 `--golden`, `--golden-ignore-header`, `--max-fix-attempts` and `--no-runtime`, checking each with the same
 messages `a2m migrate` gives, and shows the matching `a2m migrate` command (`ctrl+y` copies it). The key's value is
-never shown. Starting the run from the screen comes in a later release; for now run the command shown.
+never shown.
+
+#### Using the TUI
+
+1. Install the extra: `pip install ".[tui]"` (or `pip install "a2m[tui]"`).
+2. Run `a2m tui` in a terminal of at least 80 columns by 24 rows.
+3. On the setup screen pick the exports and results folders (type a path, `tab` completes a folder name,
+   `ctrl+o` or `Browse…` opens a folder browser), choose the AI, and press `Start`. `Open results…` opens the
+   results of an earlier run instead.
+
+`Start` runs exactly the `a2m migrate` command the setup screen shows, as a separate process, so the results
+folder, `SUMMARY.md` and every `REPORT.md` are the same as from the command line. The run screen shows the
+progress and the finished proxies. `s` stops the run after asking: a2m stops cleanly, finished proxies keep their
+results, and the screen waits while a2m cleans up (offering `Force stop` only if that takes longer than a2m's
+own clean-up budget). `r` resumes a stopped run with `--resume`, so finished proxies are not redone (when a2m's own message
+says only `--force` can continue, Resume asks first, since that redoes every proxy). Quitting
+while a run is going asks first and stops the run the same way before the TUI exits.
+
+When the run ends, the results screen shows `SUMMARY.md` and the proxies in each bucket. `r` (Review) walks
+through the needs-review proxies one at a time: `n` next, `p` previous, `tab` (or `d`) switches between the
+proxy's `REPORT.md` and its `diffs/` files (`enter` opens a file), `c` copies the proxy's folder path (also shown
+on screen, for terminals that ignore clipboard requests), and `escape` goes back to the summary. The TUI only
+reads the results folder: it never changes a file, does not open anything reached through a symbolic link, and
+shows reports and diffs as plain text (long files show their first 2000 lines and say so).
+
+Every screen works with the keyboard alone. `q` quits (`ctrl+q` inside a text field) and `?` lists the keys on
+the current screen.
 
 ## The three buckets
 

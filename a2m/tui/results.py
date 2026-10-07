@@ -36,6 +36,7 @@ from a2m.layout import BUCKET_DIR_NAMES, NEEDS_REVIEW_DIR_NAME, UNSUPPORTED_DIR_
 from a2m.tui.frame import AppFooter, AppHeader, EdgeButton, global_keys_first
 from a2m.tui.picker import printable
 from a2m.tui.read import Problem, Results, ResultsProblem, load_results
+from a2m.tui.review import ReviewScreen
 from a2m.tui.run import BUCKET_MARKS
 
 # The label each bucket goes by on screen (DESIGN.md Color, Bucket colors).
@@ -47,7 +48,6 @@ BUCKET_LABELS: dict[str, str] = {
 LOADING_TEXT = "Loading results…"
 EMPTY_BUCKET = "None"
 NOTHING_TO_REVIEW = "Nothing needs review. Every proxy is verified or unsupported."
-REVIEW_NOT_BUILT = "The review walkthrough is not available in this version yet."
 SUMMARY_LABEL = "SUMMARY.md"
 # Each bucket's theme color (the same colors as app.tcss's .bucket-* classes).
 BUCKET_THEME_COLORS: dict[str, str] = {
@@ -318,9 +318,9 @@ class ResultsScreen(Screen[None]):
     # ------------------------------------------------------------------ actions
 
     def action_review(self) -> None:
-        """The needs-review walkthrough is not part of this version yet: say so rather than pretend."""
-        if self._needs_review:
-            self.notify(REVIEW_NOT_BUILT, markup=False)
+        """Open the walkthrough of the needs-review proxies, on the first one (see :mod:`a2m.tui.review`)."""
+        if self._results is not None and self._needs_review:
+            self.app.push_screen(ReviewScreen(self._results))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()

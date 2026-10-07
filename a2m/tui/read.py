@@ -209,13 +209,154 @@ def preview_label(folder: Path) -> tuple[Problem | None, str]:
     return None, "a2m results with a SUMMARY.md"
 
 
+# ---------------------------------------------------------------- one needs-review proxy (the review walkthrough)
+
+# A REPORT.md or diffs/ file beyond this many lines (or bytes) is cut, with a line saying so.
+REVIEW_MAX_LINES = 2000
+REVIEW_MAX_BYTES = 1024 * 1024
+# diffs/ beyond this many entries lists only the first ones (by name), with a line saying so.
+DIFFS_MAX_FILES = 500
+NO_REPORT_TEXT = "This proxy has no REPORT.md."
+NO_DIFFS_TEXT = "This proxy has no diffs."
+MISSING_FOLDER_TEXT = "{path} is missing or is a link, so it is not opened."
+NOT_PLAIN_ENTRY = "not a plain file, not opened"
+MORE_DIFFS_NOTE = "Showing the first {count} files of diffs/ by name."
+
+
+def truncated_note(lines: int) -> str:
+    """The honest line under a cut file: how many lines are shown."""
+    return f"Showing the first {lines} lines of a larger file."
+
+
+@dataclass(frozen=True, slots=True)
+class ShownFile:
+    """A text file as the review screen shows it: its (possibly cut) text, or why it is not shown."""
+
+    text: str = ""
+    # When the file was cut: how many lines ``text`` holds.
+    truncated_at: int | None = None
+    # Set instead of ``text`` when the file is missing (an expected state) or cannot be read (an error).
+    missing: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiffEntry:
+    name: str
+    # Why the entry is not opened (a link, a folder, anything but a plain file); None for a plain file.
+    refused: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiffListing:
+    entries: tuple[DiffEntry, ...] = ()
+    # Why diffs/ itself could not be listed (it is a link, or unreadable); None when it was listed or is absent.
+    error: str | None = None
+    # True when diffs/ held more than :data:`DIFFS_MAX_FILES` entries and only the first are listed.
+    more: bool = False
+
+    @property
+    def files(self) -> tuple[str, ...]:
+        return tuple(entry.name for entry in self.entries if entry.refused is None)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewProxy:
+    """What the review screen shows for one needs-review proxy: its REPORT.md, its diffs/ and the first file."""
+
+    report: ShownFile
+    diffs: DiffListing
+    first_diff: ShownFile | None = None
+
+
+def _reason(exc: BaseException) -> str:
+    return exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc) or type(exc).__name__
+
+
+def _plain_folder(root: Path, target: Path) -> bool:
+    """True when ``target`` is a folder inside ``root`` reached without a link at any step (root included)."""
+    try:
+        parts = target.relative_to(root).parts
+    except ValueError:
+        return False
+    current = root
+    for part in parts:
+        current = current / part
+        if part in ("", ".", "..") or safefs.is_link(current):
+            return False
+    try:
+        return target.is_dir()
+    except OSError:
+        return False
+
+
+def read_shown_file(root: Path, target: Path) -> ShownFile:
+    """The plain file ``target`` inside ``root``, read without following a link, capped at
+    :data:`REVIEW_MAX_LINES` lines and :data:`REVIEW_MAX_BYTES` bytes; never writes, never raises for a bad file."""
+    try:
+        if not os.path.lexists(target):
+            return ShownFile(missing=target.name)
+        data, more = _read_capped(root, target, REVIEW_MAX_BYTES)
+    except (OSError, RuntimeError, A2mError) as exc:  # RuntimeError: a symlink loop on Python 3.11
+        return ShownFile(error=f"cannot read {target.name}: {_reason(exc)}")
+    if more and b"\n" in data:  # cut by size: drop the partial last line, so every line shown is whole
+        data = data[: data.rindex(b"\n") + 1]
+    text, cut = _first_lines(data.decode("utf-8", errors="replace"), REVIEW_MAX_LINES)
+    if cut or more:
+        return ShownFile(text, truncated_at=len(text.splitlines()))
+    return ShownFile(text)
+
+
+def list_diffs(root: Path, proxy_folder: Path) -> DiffListing:
+    """The entries of ``proxy_folder``'s diffs/, sorted by name: plain files to open, anything else (a link, a
+    folder) listed as refused; empty when diffs/ is absent. Never follows a link, never writes."""
+    diffs = proxy_folder / layout.DIFFS_DIR_NAME
+    try:
+        if not os.path.lexists(diffs):
+            return DiffListing()
+        if not _plain_folder(root, diffs):
+            return DiffListing(error=f"{layout.DIFFS_DIR_NAME}/ is a link or not a folder, so it is not opened")
+        with os.scandir(diffs) as scan:
+            found = sorted(scan, key=lambda entry: entry.name)
+    except (OSError, RuntimeError) as exc:
+        return DiffListing(error=f"cannot read {layout.DIFFS_DIR_NAME}/: {_reason(exc)}")
+    entries = []
+    for entry in found[:DIFFS_MAX_FILES]:
+        try:
+            plain = not safefs.is_link(Path(entry.path)) and entry.is_file(follow_symlinks=False)
+        except OSError:
+            plain = False
+        entries.append(DiffEntry(entry.name, None if plain else NOT_PLAIN_ENTRY))
+    return DiffListing(tuple(entries), more=len(found) > DIFFS_MAX_FILES)
+
+
+def load_review_proxy(root: Path, proxy_folder: Path | None, folder_text: str) -> ReviewProxy:
+    """REPORT.md, the diffs/ listing and the first diffs/ file of the proxy in ``proxy_folder`` (None when the
+    results screen refused it); ``folder_text`` names it in the message when it cannot be opened."""
+    if proxy_folder is None or not _plain_folder(root, proxy_folder):
+        refused = MISSING_FOLDER_TEXT.format(path=folder_text)
+        return ReviewProxy(ShownFile(error=refused), DiffListing(error=refused))
+    report = read_shown_file(root, proxy_folder / layout.REPORT_NAME)
+    diffs = list_diffs(root, proxy_folder)
+    first = diffs.files[0] if diffs.files else None
+    shown = read_shown_file(root, proxy_folder / layout.DIFFS_DIR_NAME / first) if first is not None else None
+    return ReviewProxy(report, diffs, shown)
+
+
 __all__ = [
     "NOT_RESULTS_TEXT",
     "NO_SUMMARY_TEXT",
+    "DiffEntry",
+    "DiffListing",
     "Problem",
     "Results",
     "ResultsProblem",
     "ResultsProxy",
+    "ReviewProxy",
+    "ShownFile",
+    "list_diffs",
     "load_results",
+    "load_review_proxy",
     "preview_label",
+    "read_shown_file",
 ]
