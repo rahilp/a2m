@@ -434,7 +434,7 @@ def test_TUI_CP4_T04_validating_never_writes_and_markup_like_names_render_litera
 
             await _set_input(pilot, "#input-exports", str(bracket_exports))
             text = _screen_text(app)
-            assert re.search(r"\b1 proxies\b", text), text
+            assert re.search(r"\b1 proxy\b", text), text
 
             await _set_input(pilot, "#input-results", str(bracket_results))
             assert start.disabled is False, _screen_text(app)

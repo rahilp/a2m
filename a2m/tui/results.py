@@ -47,6 +47,8 @@ BUCKET_LABELS: dict[str, str] = {
 }
 LOADING_TEXT = "Loading results…"
 EMPTY_BUCKET = "None"
+# Added to a bucket header when its pane holds more rows than it shows (the panes draw no scrollbar).
+MORE_HINT = " · scroll to see all"
 NOTHING_TO_REVIEW = "Nothing needs review. Every proxy is verified or unsupported."
 SUMMARY_LABEL = "SUMMARY.md"
 # Each bucket's theme color (the same colors as app.tcss's .bucket-* classes).
@@ -314,6 +316,22 @@ class ResultsScreen(Screen[None]):
         self.query_one("#review", Button).disabled = nothing
         self.query_one("#results-content").display = True
         await self.query_one("#results-summary", Markdown).update(results.summary_md)
+        self.call_after_refresh(self._mark_overflowing_panes)
+
+    def on_resize(self) -> None:
+        self.call_after_refresh(self._mark_overflowing_panes)
+
+    def _mark_overflowing_panes(self) -> None:
+        """Name a hidden row in its bucket header: a pane with more rows than it shows says to scroll."""
+        if self._results is None or not self.is_attached:
+            return
+        for bucket in BUCKET_DIR_NAMES:
+            count = len(self._results.by_bucket[bucket])
+            pane = self.query_one(f"#bucket-{bucket}-pane", VerticalScroll)
+            label = f"{BUCKET_LABELS[bucket]} ({count})"
+            self.query_one(f"#bucket-{bucket}-header", Static).update(
+                label + MORE_HINT if pane.max_scroll_y > 0 else label
+            )
 
     # ------------------------------------------------------------------ actions
 

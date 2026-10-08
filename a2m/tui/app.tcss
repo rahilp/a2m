@@ -726,8 +726,10 @@ ConfirmScreen {
 }
 /* Fixed-height panes (the prototype's 11 rows for REPORT.md, 7 for a diff below the file list) that scroll
    inside, so the path and buttons sit directly below with free rows above the Footer. */
+/* The report fills the rows a taller terminal has; 11 is what fits 80x24 with the path and buttons below. */
 .review-pane {
-    height: 11;
+    height: 1fr;
+    min-height: 11;
     background: $panel;
     color: $foreground;
     scrollbar-size-vertical: 1;

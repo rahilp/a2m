@@ -97,6 +97,7 @@ FORCE_RESUME_LINES = (
 )
 FORCE_RESUME_ACTION = "Redo all"
 FORCE_RESUME_PURPOSE = "force-resume"
+RESUME_NOTE = "Resume skips the done ones and checks the rest again."
 STOPPING_TEXT = "Stopping: waiting for a2m to finish cleaning up…"
 STOPPING_QUIT_TEXT = "Stopping: waiting for a2m to finish cleaning up; the TUI quits once it has stopped…"
 STILL_STOPPING_TEXT = "Stopping: a2m is still cleaning up after {elapsed}. Keep waiting, or press Force stop."
@@ -125,10 +126,6 @@ def format_elapsed(seconds: float) -> str:
 def _exit_is_a_stop(returncode: int) -> bool:
     """True for the exit a stop ends in: killed by a signal, or a2m's own 128 + signal exit."""
     return returncode < 0 or returncode > 128
-
-
-def _plural(count: int) -> str:
-    return f"{count} proxy" if count == 1 else f"{count} proxies"
 
 
 class BlockBar(BarRenderable):
@@ -216,6 +213,8 @@ class RunScreen(Screen[None]):
         self._position = 0
         self._processed = 0
         self._kept = 0
+        self._refused = 0
+        self._failed = 0
         self._stopped: StreamEvent | None = None
         self._finished: StreamEvent | None = None
         self._error: StreamEvent | None = None
@@ -382,6 +381,10 @@ class RunScreen(Screen[None]):
             self._processed += 1
             if event.outcome in (Outcome.FINISHED, Outcome.SKIPPED):
                 self._kept += 1
+            elif event.outcome is Outcome.REFUSED:
+                self._refused += 1
+            else:
+                self._failed += 1
             self._add_finished_row(event.name, event.bucket, event.outcome)
             if self._phase is Phase.RUNNING:
                 self._show_current("", event.name, activity(event))
@@ -446,10 +449,13 @@ class RunScreen(Screen[None]):
     def _stopped_text(self) -> str:
         if not self._seen_start:
             return "Stopped before any proxy ran. Nothing was kept."
-        return (
-            f"Stopped at {self._processed} of {self._total}. "
-            f"{_plural(self._kept)} finished and kept."
-        )
+        # Only done proxies are kept for Resume: a refused or failed one leaves no .done marker, so Resume
+        # checks it again. Saying "0 kept" next to a finished row read as a lost result.
+        counts = ((self._kept, "done"), (self._refused, "unsupported"), (self._failed, "failed"))
+        parts = ", ".join(f"{count} {label}" for count, label in counts if count)
+        line = f"Stopped at {self._processed} of {self._total} proxies"
+        line += f": {parts}." if parts else "."
+        return f"{line} {RESUME_NOTE}"
 
     @staticmethod
     def _finished_text(item: StreamEvent) -> str:

@@ -249,7 +249,9 @@ def _check_exports(exports: Path) -> tuple[FieldCheck, list[str]]:
 
 
 def _found_line(proxies: int, shared_flows: int, refused: int) -> str:
-    line = f"{VALID_MARK} {proxies} proxies, {shared_flows} shared flows found"
+    proxy_word = "proxy" if proxies == 1 else "proxies"
+    flow_word = "shared flow" if shared_flows == 1 else "shared flows"
+    line = f"{VALID_MARK} {proxies} {proxy_word}, {shared_flows} {flow_word} found"
     if refused:
         line += f"; {refused} of them will be refused (see run.log after the run)"
     return line
