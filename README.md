@@ -264,7 +264,7 @@ mise exec -- a2m migrate ./apigee-exports --out ./results --mock-backends
 Download the Mule Kernel CE 4.9.0 standalone distribution (`org.mule.distributions:mule-standalone:4.9.0`, a
 `.tar.gz` in the MuleSoft releases repository https://repository.mulesoft.org/nexus/content/repositories/releases/
 under `org/mule/distributions/mule-standalone/4.9.0/`), unpack it, and point `MULE_HOME` at the unpacked folder (the
-one holding `bin/mule`). `mise.toml` sets `MULE_HOME` to `~/.local/share/mule/mule-standalone-4.9.0`.
+one holding `lib/boot`; a2m starts Mule's JVM itself and does not use `bin/mule`). `mise.toml` sets `MULE_HOME` to `~/.local/share/mule/mule-standalone-4.9.0`.
 `A2M_MULE_HOME` overrides `MULE_HOME` (and the runtime `--with-mule` installed) when set, so you can point a2m at
 another runtime without changing `MULE_HOME`.
 
