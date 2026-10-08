@@ -99,6 +99,12 @@ python_ok() {
     "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1
 }
 
+# True when the given interpreter can make a virtual environment with pip in it. Debian and Ubuntu
+# ship python3 without its venv/ensurepip part (the python3-venv package), so `-m venv` fails there.
+python_can_venv() {
+    "$1" -c 'import ensurepip, venv' >/dev/null 2>&1
+}
+
 # The first Python 3.11 or newer on PATH, or nothing.
 find_python() {
     local candidate
@@ -353,6 +359,11 @@ check_platform() {
         aarch64 | arm64) arch=aarch64 ;;
         *) die "--with-mule supports x86-64 and ARM64 machines, not $arch." ;;
     esac
+    # A terminal running under Rosetta on Apple silicon reports x86_64; the Mac is ARM64, and an x64 JDK
+    # would not run there once Rosetta is gone.
+    if [ "$os" = mac ] && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || true)" = 1 ]; then
+        arch=aarch64
+    fi
     JDK_PLATFORM="${arch}_$os"
     have curl || have wget || missing="$missing curl"
     have tar || missing="$missing tar"
@@ -408,15 +419,17 @@ piece_ok() {
 }
 
 # Installs one piece into $TOOLCHAIN/<name> unless it is already there at this version:
-#   install_piece NAME LABEL VERSION ARCHIVE_URL CHECKSUM_URL BITS PROGRAM
+#   install_piece NAME LABEL VERSION ARCHIVE_URL CHECKSUM_URL BITS PROGRAM [PLATFORM]
+# PLATFORM, when given, is recorded in the marker with the version, so a piece built for another
+# platform (an x64 JDK installed from a Rosetta shell on Apple silicon) is replaced, not kept.
 # The archive and its checksum file are downloaded into $WORK (inside the toolchain folder, so the
 # final move is a rename), the checksum is compared before anything is unpacked, and the marker is
 # written last. A download, check or unpack that fails part way leaves no piece that counts as
 # installed, and the next run starts that piece again.
 install_piece() {
-    local name="$1" label="$2" version="$3" url="$4" sums_url="$5" bits="$6" program="$7"
+    local name="$1" label="$2" version="$3" url="$4" sums_url="$5" bits="$6" program="$7" mark="$3${8:+ $8}"
     local dest="$TOOLCHAIN/$1" archive="$WORK/$1.tar.gz" unpack="$WORK/$1.unpack" expected="" rest actual top
-    if piece_ok "$name" "$version" "$program"; then
+    if piece_ok "$name" "$mark" "$program"; then
         printf '%s %s is already installed in %s\n' "$label" "$version" "$dest"
         return 0
     fi
@@ -449,7 +462,7 @@ install_piece() {
         rm -rf "$dest" || die "could not remove the incomplete or older $dest; remove it by hand and run ./install.sh --with-mule again."
     fi
     mv "$top" "$dest" || die "could not move $label into $dest."
-    printf '%s\n' "$version" >"$dest/$INSTALLED_MARK" || die "could not write $dest/$INSTALLED_MARK."
+    printf '%s\n' "$mark" >"$dest/$INSTALLED_MARK" || die "could not write $dest/$INSTALLED_MARK."
     rm -rf "$unpack"
     printf 'Installed %s %s in %s\n' "$label" "$version" "$dest"
 }
@@ -484,7 +497,7 @@ install_toolchain() {
     trap 'exit 143' TERM
     WORK="$(mktemp -d "$TOOLCHAIN/.download.XXXXXX")" || die "could not create a download folder in $TOOLCHAIN."
     install_piece jdk "Java (Temurin JDK)" "$JDK_VERSION" \
-        "$JDK_BASE_URL/$jdk_file" "$JDK_BASE_URL/$jdk_file.sha256.txt" 256 bin/java
+        "$JDK_BASE_URL/$jdk_file" "$JDK_BASE_URL/$jdk_file.sha256.txt" 256 bin/java "$JDK_PLATFORM"
     install_piece maven "Maven" "$MAVEN_VERSION" \
         "$MAVEN_BASE_URL/$maven_file" "$MAVEN_BASE_URL/$maven_file.sha512" 512 bin/mvn
     install_piece mule "Mule Kernel CE" "$MULE_VERSION" \
@@ -527,7 +540,9 @@ self_check() {
     printf '\nChecking the install: migrating the sample proxy catalog-api and verifying it on the local Mule runtime.\n'
     printf 'The first run takes about 2 to 3 minutes while Maven downloads its plugins...\n'
     rm -rf "$SELF_CHECK_DIR" || die "could not clear the old self-check results in $SELF_CHECK_DIR."
-    if "$BIN/a2m" migrate "$input" --only catalog-api --llm none --mock-backends --out "$SELF_CHECK_DIR" &&
+    # The toolchain just installed, even when the shell sets A2M_MULE_HOME or A2M_NO_TOOLCHAIN.
+    if env -u A2M_NO_TOOLCHAIN A2M_MULE_HOME="$TOOLCHAIN/mule" \
+        "$BIN/a2m" migrate "$input" --only catalog-api --llm none --mock-backends --out "$SELF_CHECK_DIR" &&
         [ -d "$SELF_CHECK_DIR/verified/catalog-api" ]; then
         rm -rf "$SELF_CHECK_DIR"
         printf 'Self-check passed: catalog-api was built with Maven, deployed on Mule %s and passed its tests (verified).\n' "$MULE_VERSION"
@@ -553,9 +568,14 @@ RECORD_UV="$(record_get uv_installed)"
 if [ "$WITH_MULE" = 1 ]; then
     check_platform
     RECORD_TOOLCHAIN="$TOOLCHAIN"
-    if ! have uv && [ -z "$(find_python)" ]; then
-        install_uv
-        RECORD_UV=1
+    # uv when nothing else here can install a2m: no uv, no pipx, and no Python 3.11 or newer that can
+    # make a virtual environment (a fresh Ubuntu or Debian has python3 but not python3-venv).
+    if ! have uv && ! have pipx; then
+        FOUND_PY="$(find_python)"
+        if [ -z "$FOUND_PY" ] || ! python_can_venv "$FOUND_PY"; then
+            install_uv
+            RECORD_UV=1
+        fi
     fi
 fi
 
@@ -622,9 +642,13 @@ case "$METHOD" in
             link_is_ours || die "$LOCAL_BIN/a2m already exists and was not made by this script; remove it or install uv or pipx, then run ./install.sh again."
         fi
         mkdir -p "$STATE_DIR" || die "could not create $STATE_DIR."
-        if [ ! -x "$VENV/bin/python" ]; then
-            "$PY" -m venv "$VENV" ||
-                die "could not create a virtual environment with $PY (on Debian or Ubuntu install python3-venv), or install uv."
+        # Checked by pip, not python: a venv made without ensurepip has bin/python but no pip, and
+        # must be made again (and one that failed half way is removed, so a rerun starts clean).
+        if [ ! -x "$VENV/bin/pip" ]; then
+            if ! "$PY" -m venv "$VENV"; then
+                rm -rf "$VENV"
+                die "could not create a virtual environment with $PY (on Debian or Ubuntu install python3-venv), or install uv, or run ./install.sh --with-mule, which installs uv when it is needed."
+            fi
         fi
         "$VENV/bin/python" -m pip install --upgrade -e "$TARGET" || die "pip install failed (see the messages above)."
         mkdir -p "$LOCAL_BIN" || die "could not create $LOCAL_BIN."

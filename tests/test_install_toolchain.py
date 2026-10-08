@@ -161,7 +161,10 @@ def test_INSTALL_MULE_T01_installs_toolchain_writes_env_and_rerun_is_idempotent(
 
     toolchain = _toolchain(home)
     for piece, program, version in (
-        ("jdk", "bin/java", JDK_VERSION), ("maven", "bin/mvn", MAVEN_VERSION), ("mule", "bin/mule", MULE_VERSION)
+        # The JDK's marker names its platform too, so an x64 JDK from a Rosetta shell is replaced later.
+        ("jdk", "bin/java", f"{JDK_VERSION} {_jdk_platform()}"),
+        ("maven", "bin/mvn", MAVEN_VERSION),
+        ("mule", "bin/mule", MULE_VERSION),
     ):
         assert os.access(toolchain / piece / program, os.X_OK), f"{piece}/{program} missing:\n{_out(first)}"
         assert (toolchain / piece / ".a2m-installed").read_text().strip() == version
@@ -241,3 +244,32 @@ def test_INSTALL_MULE_T04_bootstraps_uv_and_uninstall_finds_it_off_path(tmp_path
     assert removed.returncode == 0, _out(removed)
     assert not (home / ".local" / "share" / "a2m").exists(), _out(removed)
     assert sorted(p.name for p in local_bin.iterdir()) == [], _out(removed)
+
+
+# A python3 like a fresh Ubuntu or Debian's: new enough, but without the python3-venv package.
+PYTHON_WITHOUT_VENV = """#!/bin/sh
+case "$*" in
+    *ensurepip*) exit 1 ;;
+esac
+exit 0
+"""
+
+
+def test_INSTALL_MULE_T05_python_without_venv_gets_uv(tmp_path: Path) -> None:
+    """[INSTALL-MULE-T05] Python 3.11+ without venv support, no uv, no pipx: --with-mule installs uv and
+    uses it, instead of a venv that cannot be made (and that every rerun would then trip over)."""
+    home, env, _ = _sandbox(tmp_path, with_uv=False)
+    python3 = tmp_path / "sandbox-bin" / "python3"
+    python3.write_text(PYTHON_WITHOUT_VENV)
+    python3.chmod(0o755)
+    env["PATH"] = str(tmp_path / "sandbox-bin")
+    installer = tmp_path / "uv-install.sh"
+    installer.write_text(FAKE_UV_INSTALLER)
+    env["A2M_UV_INSTALLER_URL"] = installer.as_uri()
+
+    result = _run(["--with-mule", "--skip-check"], env)
+    output = _out(result)
+    assert result.returncode == 0, output
+    record = (home / ".local" / "share" / "a2m" / "install-record").read_text()
+    assert "method=uv" in record and "uv_installed=1" in record, output
+    assert not (home / ".local" / "share" / "a2m" / "venv").exists(), output
