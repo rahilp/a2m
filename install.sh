@@ -2,6 +2,7 @@
 # Install a2m from this checkout with one command, so `a2m` and `a2m tui` work in any new shell.
 #
 #   ./install.sh               install, or upgrade the earlier install in place
+#   ./install.sh --with-mule   also install Java, Maven and the Mule runtime that verification needs
 #   ./install.sh --no-tui      install without the terminal UI (Textual)
 #   ./install.sh --uninstall   remove what this script installed, and nothing else
 #
@@ -10,13 +11,24 @@
 # `git pull` updates the code; rerun this script when the dependencies change. It never uses
 # sudo and never edits a shell file: when the command's folder is not on PATH it prints the
 # line to add. Works with the bash 3.2 that ships with macOS.
+#
+# --with-mule downloads Temurin JDK 17, Maven 3.9 and Mule Kernel CE 4.9.0 (the versions a2m is
+# verified against), checks each against its published SHA-256 or SHA-512 checksum before unpacking
+# it, and puts them in ~/.local/share/a2m/toolchain. a2m reads toolchain.env there at start-up, so
+# nothing has to be added to a shell file. When neither uv nor Python 3.11 or newer is found, it
+# first installs uv with uv's own installer into ~/.local/bin. It ends by migrating and verifying
+# the sample proxy catalog-api (--skip-check skips that). Windows runs it inside WSL2.
 set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: ./install.sh [--no-tui] [--uninstall] [--help]
+Usage: ./install.sh [--with-mule [--skip-check]] [--no-tui] [--uninstall] [--help]
 
   (no option)   Install a2m from this checkout, or upgrade the earlier install in place.
+  --with-mule   Also install Java (Temurin 17), Maven 3.9 and Mule Kernel CE 4.9.0 under
+                ~/.local/share/a2m/toolchain, so a2m can build and verify apps, then check the
+                install on the sample proxy catalog-api (about 2 to 3 minutes the first time).
+  --skip-check  With --with-mule: skip that final check.
   --no-tui      Install without the terminal UI extra (Textual); `a2m tui` then says what is missing.
   --uninstall   Remove the a2m command and what this script installed, and nothing else.
   -h, --help    Show this help.
@@ -34,13 +46,36 @@ STATE_DIR="$HOME/.local/share/a2m"
 RECORD="$STATE_DIR/install-record"
 VENV="$STATE_DIR/venv"
 LOCAL_BIN="$HOME/.local/bin"
+# The PATH new shells get; installing uv adds ~/.local/bin to this script's PATH only.
+SHELL_PATH="${PATH:-}"
+SELF_CHECK_DIR="$STATE_DIR/self-check"
+
+# --with-mule: the toolchain a2m is verified against. The base URLs can be overridden (tests point
+# them at a local file:// mirror); each archive is checked against the checksum file next to it.
+TOOLCHAIN="$STATE_DIR/toolchain"
+TOOLCHAIN_ENV="$TOOLCHAIN/toolchain.env"
+JDK_VERSION="17.0.20.1+1"
+MAVEN_VERSION="3.9.16"
+MULE_VERSION="4.9.0"
+JDK_BASE_URL="${A2M_JDK_BASE_URL:-https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.20.1%2B1}"
+# Maven's own distribution on Maven Central: the same file and SHA-512 as archive.apache.org, which
+# throttles downloads to a crawl, and a host the Maven builds need anyway.
+MAVEN_BASE_URL="${A2M_MAVEN_BASE_URL:-https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/$MAVEN_VERSION}"
+MULE_BASE_URL="${A2M_MULE_BASE_URL:-https://repository.mulesoft.org/nexus/content/repositories/releases/org/mule/distributions/mule-standalone/$MULE_VERSION}"
+UV_INSTALLER_URL="${A2M_UV_INSTALLER_URL:-https://astral.sh/uv/install.sh}"
+# Written into a piece's folder after it is fully in place; a folder without it is not installed.
+INSTALLED_MARK=".a2m-installed"
 
 ACTION=install
 WITH_TUI=1
+WITH_MULE=0
+SELF_CHECK=1
 for arg in "$@"; do
     case "$arg" in
         --uninstall) ACTION=uninstall ;;
         --no-tui) WITH_TUI=0 ;;
+        --with-mule) WITH_MULE=1 ;;
+        --skip-check) SELF_CHECK=0 ;;
         -h | --help)
             usage
             exit 0
@@ -99,6 +134,12 @@ write_record() {
         if [ "$1" = venv ]; then
             printf 'venv=%s\n' "$VENV"
             printf 'link=%s\n' "$LOCAL_BIN/a2m"
+        fi
+        if [ -n "$RECORD_TOOLCHAIN" ]; then
+            printf 'toolchain=%s\n' "$RECORD_TOOLCHAIN"
+        fi
+        if [ "$RECORD_UV" = 1 ]; then
+            printf 'uv_installed=1\n'
         fi
     } >"$RECORD" || return 1
 }
@@ -215,6 +256,58 @@ remove_install() {
     esac
 }
 
+# Prints why removing something --with-mule installed failed; the caller keeps the install record.
+toolchain_removal_failed() {
+    printf 'install.sh: could not remove %s (see the messages above); the install record at %s was kept so you can fix the problem and run ./install.sh --uninstall again.\n' "$1" "$RECORD" >&2
+}
+
+# Removes what --with-mule installed, as the record names it: the toolchain folder (only when it is
+# the one this script uses), the folder of the last self-check, and uv when this script installed
+# it. Runs under `||`, where errexit is off, so every removal checks its own status.
+remove_with_mule() {
+    local recorded tool receipt="${XDG_CONFIG_HOME:-$HOME/.config}/uv/uv-receipt.json"
+    recorded="$(record_get toolchain)"
+    if [ -n "$recorded" ]; then
+        if [ "$recorded" != "$TOOLCHAIN" ]; then
+            printf 'Left %s alone: it is not the toolchain folder this script uses (%s).\n' "$recorded" "$TOOLCHAIN"
+        elif [ -e "$TOOLCHAIN" ] || [ -L "$TOOLCHAIN" ]; then
+            if ! rm -rf "$TOOLCHAIN" || [ -e "$TOOLCHAIN" ]; then
+                toolchain_removal_failed "$TOOLCHAIN"
+                return 1
+            fi
+            printf 'Removed %s (Java, Maven and the Mule runtime)\n' "$TOOLCHAIN"
+            printf "Left Maven's download cache in ~/.m2, which other Maven builds share; delete it to free the space if nothing else uses it.\n"
+        fi
+    fi
+    if [ -e "$SELF_CHECK_DIR" ]; then
+        rm -rf "$SELF_CHECK_DIR" || {
+            toolchain_removal_failed "$SELF_CHECK_DIR"
+            return 1
+        }
+    fi
+    if [ "$(record_get uv_installed)" = 1 ]; then
+        for tool in uv uvx; do
+            if [ -e "$LOCAL_BIN/$tool" ] || [ -L "$LOCAL_BIN/$tool" ]; then
+                rm -f "$LOCAL_BIN/$tool" || {
+                    toolchain_removal_failed "$LOCAL_BIN/$tool"
+                    return 1
+                }
+                printf 'Removed %s\n' "$LOCAL_BIN/$tool"
+            fi
+        done
+        # The uv installer's own record of where it put uv.
+        if [ -f "$receipt" ]; then
+            rm -f "$receipt" || {
+                toolchain_removal_failed "$receipt"
+                return 1
+            }
+            rm -d "${receipt%/*}" 2>/dev/null || true
+        fi
+        printf 'Left the Python and the cache uv downloaded (in ~/.local/share/uv and ~/.cache/uv); delete those folders to free the space.\n'
+    fi
+    return 0
+}
+
 uninstall() {
     local method
     if [ ! -f "$RECORD" ]; then
@@ -223,15 +316,227 @@ uninstall() {
     fi
     method="$(record_get method)"
     remove_install "$method" || exit 1
+    remove_with_mule || exit 1
     rm -f "$RECORD" || die "a2m was removed, but the install record at $RECORD could not be deleted; delete it by hand."
     rm -d "$STATE_DIR" 2>/dev/null || true
     printf 'a2m is uninstalled (it was installed with %s). Shell files and this checkout were left alone.\n' "$method"
 }
 
+# The uv this script installed lives in ~/.local/bin, which may not be on PATH in this shell: use
+# it from there, so an upgrade or --uninstall finds it instead of installing it again or failing.
+if [ "$(record_get uv_installed)" = 1 ] && [ -x "$LOCAL_BIN/uv" ] && ! have uv; then
+    PATH="$LOCAL_BIN:$PATH"
+    export PATH
+fi
+
 if [ "$ACTION" = uninstall ]; then
     uninstall
     exit 0
 fi
+
+# ---------------------------------------------------------------- toolchain (--with-mule)
+
+# Sets JDK_PLATFORM (the Temurin download name, e.g. x64_linux) or stops, before anything changes,
+# on a platform the toolchain is not published for or when a tool the downloads need is missing.
+check_platform() {
+    local os arch missing=""
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    case "$os" in
+        Linux) os=linux ;;
+        Darwin) os=mac ;;
+        MINGW* | MSYS* | CYGWIN*) die "--with-mule runs inside WSL2 on Windows: open Ubuntu (wsl --install -d Ubuntu) and run ./install.sh --with-mule there." ;;
+        *) die "--with-mule supports Linux and macOS (and Windows through WSL2), not $os." ;;
+    esac
+    case "$arch" in
+        x86_64 | amd64) arch=x64 ;;
+        aarch64 | arm64) arch=aarch64 ;;
+        *) die "--with-mule supports x86-64 and ARM64 machines, not $arch." ;;
+    esac
+    JDK_PLATFORM="${arch}_$os"
+    have curl || have wget || missing="$missing curl"
+    have tar || missing="$missing tar"
+    have gzip || missing="$missing gzip"
+    { have sha256sum && have sha512sum; } || have shasum || missing="$missing sha256sum"
+    [ -z "$missing" ] || die "--with-mule needs these tools, which were not found:$missing. Install them (on Debian or Ubuntu: sudo apt install curl tar gzip coreutils) and run ./install.sh --with-mule again."
+}
+
+# Downloads a URL to a file with curl, or wget when there is no curl. Returns non-zero on failure.
+fetch() {
+    if have curl; then
+        if [ -t 2 ]; then
+            curl -fL --retry 3 --connect-timeout 30 --progress-bar -o "$2" "$1"
+        else
+            curl -fsSL --retry 3 --connect-timeout 30 -o "$2" "$1"
+        fi
+    else
+        wget -q -O "$2" "$1"
+    fi
+}
+
+# Prints the lowercase hex SHA-256 or SHA-512 (first argument 256 or 512) of a file. The file is
+# read on stdin so that no file name can change the output format.
+digest() {
+    local sum rest
+    if have "sha$1sum"; then
+        read -r sum rest < <("sha$1sum" <"$2") || return 1
+    elif have shasum; then
+        read -r sum rest < <(shasum -a "$1" <"$2") || return 1
+    else
+        return 1
+    fi
+    printf '%s\n' "$sum"
+}
+
+# The folder a piece's bin/ lives in: a macOS JDK keeps it in Contents/Home.
+piece_home() {
+    if [ -d "$1/Contents/Home" ]; then
+        printf '%s\n' "$1/Contents/Home"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+# True when the piece in $TOOLCHAIN/<name> is fully installed at the given version: its marker
+# names that version and the given program (relative to the piece's home) is there.
+piece_ok() {
+    local dest="$TOOLCHAIN/$1" mark=""
+    [ -f "$dest/$INSTALLED_MARK" ] || return 1
+    read -r mark <"$dest/$INSTALLED_MARK" || return 1
+    [ "$mark" = "$2" ] || return 1
+    [ -x "$(piece_home "$dest")/$3" ]
+}
+
+# Installs one piece into $TOOLCHAIN/<name> unless it is already there at this version:
+#   install_piece NAME LABEL VERSION ARCHIVE_URL CHECKSUM_URL BITS PROGRAM
+# The archive and its checksum file are downloaded into $WORK (inside the toolchain folder, so the
+# final move is a rename), the checksum is compared before anything is unpacked, and the marker is
+# written last. A download, check or unpack that fails part way leaves no piece that counts as
+# installed, and the next run starts that piece again.
+install_piece() {
+    local name="$1" label="$2" version="$3" url="$4" sums_url="$5" bits="$6" program="$7"
+    local dest="$TOOLCHAIN/$1" archive="$WORK/$1.tar.gz" unpack="$WORK/$1.unpack" expected="" rest actual top
+    if piece_ok "$name" "$version" "$program"; then
+        printf '%s %s is already installed in %s\n' "$label" "$version" "$dest"
+        return 0
+    fi
+    printf 'Downloading %s %s from %s\n' "$label" "$version" "$url"
+    fetch "$sums_url" "$WORK/$name.checksum" ||
+        die "could not download the $label checksum from $sums_url (see the messages above). If a proxy or firewall blocks it, see Troubleshooting in the README; then run ./install.sh --with-mule again."
+    fetch "$url" "$archive" ||
+        die "could not download $label from $url (see the messages above). If a proxy or firewall blocks it, see Troubleshooting in the README; then run ./install.sh --with-mule again."
+    read -r expected rest <"$WORK/$name.checksum" || [ -n "$expected" ] ||
+        die "the $label checksum file from $sums_url is empty; nothing was installed for $label."
+    expected="$(printf '%s' "$expected" | tr 'ABCDEF' 'abcdef')"
+    case "$bits:${#expected}:$expected" in
+        *:*:*[!0-9a-f]*) die "the $label checksum file from $sums_url does not hold a SHA-$bits checksum; nothing was installed for $label." ;;
+        256:64:* | 512:128:*) ;;
+        *) die "the $label checksum file from $sums_url does not hold a SHA-$bits checksum; nothing was installed for $label." ;;
+    esac
+    actual="$(digest "$bits" "$archive")" || die "could not compute a SHA-$bits checksum of the $label download."
+    [ "$actual" = "$expected" ] ||
+        die "the $label download does not match its published SHA-$bits checksum, so it was not unpacked and nothing was installed for $label (a proxy that rewrites downloads, or a broken download, causes this); run ./install.sh --with-mule again."
+    mkdir "$unpack" || die "could not create $unpack."
+    tar -xzf "$archive" -C "$unpack" || die "could not unpack the $label download (see the messages above); nothing was installed for $label. Is the disk full?"
+    rm -f "$archive"
+    # The archive holds one top-level folder; anything else is not the archive we expect.
+    set -- "$unpack"/*
+    if [ "$#" != 1 ] || [ ! -d "$1" ] || [ ! -x "$(piece_home "$1")/$program" ]; then
+        die "the $label download does not hold the folder with $program expected; nothing was installed for $label."
+    fi
+    top="$1"
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        rm -rf "$dest" || die "could not remove the incomplete or older $dest; remove it by hand and run ./install.sh --with-mule again."
+    fi
+    mv "$top" "$dest" || die "could not move $label into $dest."
+    printf '%s\n' "$version" >"$dest/$INSTALLED_MARK" || die "could not write $dest/$INSTALLED_MARK."
+    rm -rf "$unpack"
+    printf 'Installed %s %s in %s\n' "$label" "$version" "$dest"
+}
+
+# Writes toolchain.env, which a2m reads at start-up (a2m/toolchain.py), through a temporary file.
+write_toolchain_env() {
+    {
+        printf '# Written by install.sh --with-mule. a2m reads this at start-up; A2M_NO_TOOLCHAIN=1 turns that off.\n'
+        printf 'JAVA_HOME=%s\n' "$(piece_home "$TOOLCHAIN/jdk")"
+        printf 'MAVEN_HOME=%s\n' "$TOOLCHAIN/maven"
+        printf 'MULE_HOME=%s\n' "$TOOLCHAIN/mule"
+        printf 'JAVA_VERSION=%s\n' "$JDK_VERSION"
+        printf 'MAVEN_VERSION=%s\n' "$MAVEN_VERSION"
+        printf 'MULE_VERSION=%s\n' "$MULE_VERSION"
+    } >"$TOOLCHAIN_ENV.tmp" && mv -f "$TOOLCHAIN_ENV.tmp" "$TOOLCHAIN_ENV"
+}
+
+WORK=""
+# Removes the download folder on every exit, including a stop with Ctrl-C.
+cleanup_work() {
+    [ -z "$WORK" ] || rm -rf "$WORK"
+}
+
+install_toolchain() {
+    local jdk_file="OpenJDK17U-jdk_${JDK_PLATFORM}_hotspot_17.0.20.1_1.tar.gz"
+    local maven_file="apache-maven-$MAVEN_VERSION-bin.tar.gz"
+    local mule_file="mule-standalone-$MULE_VERSION.tar.gz"
+    mkdir -p "$TOOLCHAIN" || die "could not create $TOOLCHAIN."
+    rm -rf "$TOOLCHAIN"/.download.* 2>/dev/null || true
+    trap cleanup_work EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    WORK="$(mktemp -d "$TOOLCHAIN/.download.XXXXXX")" || die "could not create a download folder in $TOOLCHAIN."
+    install_piece jdk "Java (Temurin JDK)" "$JDK_VERSION" \
+        "$JDK_BASE_URL/$jdk_file" "$JDK_BASE_URL/$jdk_file.sha256.txt" 256 bin/java
+    install_piece maven "Maven" "$MAVEN_VERSION" \
+        "$MAVEN_BASE_URL/$maven_file" "$MAVEN_BASE_URL/$maven_file.sha512" 512 bin/mvn
+    install_piece mule "Mule Kernel CE" "$MULE_VERSION" \
+        "$MULE_BASE_URL/$mule_file" "$MULE_BASE_URL/$mule_file.sha256" 256 bin/mule
+    rm -rf "$WORK"
+    WORK=""
+    write_toolchain_env || die "could not write $TOOLCHAIN_ENV."
+    printf 'The toolchain is in %s; a2m finds it through %s.\n' "$TOOLCHAIN" "$TOOLCHAIN_ENV"
+}
+
+# Installs uv with its official installer into ~/.local/bin. UV_NO_MODIFY_PATH=1 keeps it from
+# editing any shell file; this script puts the folder on its own PATH so it can use uv right away.
+install_uv() {
+    local script
+    printf 'Neither uv nor Python 3.11 or newer was found; installing uv into %s (no shell file is changed).\n' "$LOCAL_BIN"
+    mkdir -p "$STATE_DIR" "$LOCAL_BIN" || die "could not create $STATE_DIR or $LOCAL_BIN."
+    script="$(mktemp "$STATE_DIR/uv-installer.XXXXXX")" || die "could not create a temporary file in $STATE_DIR."
+    if ! fetch "$UV_INSTALLER_URL" "$script"; then
+        rm -f "$script"
+        die "could not download the uv installer from $UV_INSTALLER_URL. $NEED_PYTHON"
+    fi
+    if ! UV_INSTALL_DIR="$LOCAL_BIN" UV_NO_MODIFY_PATH=1 sh "$script"; then
+        rm -f "$script"
+        die "the uv installer failed (see the messages above). $NEED_PYTHON"
+    fi
+    rm -f "$script"
+    PATH="$LOCAL_BIN:$PATH"
+    export PATH
+    have uv || die "the uv installer finished but $LOCAL_BIN/uv was not found. $NEED_PYTHON"
+}
+
+# Migrates and verifies the sample proxy catalog-api with the installed a2m and the toolchain.
+# Exits non-zero when it does not land in verified, leaving everything installed.
+self_check() {
+    local input="$REPO/tests/fixtures/e2e/input"
+    if [ ! -d "$input/catalog-api" ]; then
+        printf 'Skipped the self-check: the sample proxy %s is not in this checkout.\n' "$input/catalog-api"
+        return 0
+    fi
+    printf '\nChecking the install: migrating the sample proxy catalog-api and verifying it on the local Mule runtime.\n'
+    printf 'The first run takes about 2 to 3 minutes while Maven downloads its plugins...\n'
+    rm -rf "$SELF_CHECK_DIR" || die "could not clear the old self-check results in $SELF_CHECK_DIR."
+    if "$BIN/a2m" migrate "$input" --only catalog-api --llm none --mock-backends --out "$SELF_CHECK_DIR" &&
+        [ -d "$SELF_CHECK_DIR/verified/catalog-api" ]; then
+        rm -rf "$SELF_CHECK_DIR"
+        printf 'Self-check passed: catalog-api was built with Maven, deployed on Mule %s and passed its tests (verified).\n' "$MULE_VERSION"
+        return 0
+    fi
+    printf '\ninstall.sh: self-check failed: catalog-api did not land in verified. a2m and the toolchain stay installed. See %s and %s for what went wrong, then run ./install.sh --with-mule again.\n' \
+        "$SELF_CHECK_DIR/run.log" "$SELF_CHECK_DIR/needs-review/catalog-api/REPORT.md" >&2
+    exit 1
+}
 
 # ---------------------------------------------------------------- install
 
@@ -239,6 +544,19 @@ if [ "$WITH_TUI" = 1 ]; then
     TARGET="$REPO[tui,claude]"
 else
     TARGET="$REPO[claude]"
+fi
+
+# Read before anything changes: a rerun without --with-mule keeps what an earlier one installed.
+RECORD_TOOLCHAIN="$(record_get toolchain)"
+RECORD_UV="$(record_get uv_installed)"
+[ "$RECORD_UV" = 1 ] || RECORD_UV=0
+if [ "$WITH_MULE" = 1 ]; then
+    check_platform
+    RECORD_TOOLCHAIN="$TOOLCHAIN"
+    if ! have uv && [ -z "$(find_python)" ]; then
+        install_uv
+        RECORD_UV=1
+    fi
 fi
 
 # Rerunning upgrades the same install: keep the recorded method while its tool is still there.
@@ -320,15 +638,19 @@ write_record "$METHOD" "$BIN" || die "a2m was installed, but the install record 
 [ -x "$BIN/a2m" ] || die "the install finished but $BIN/a2m was not found."
 VERSION="$("$BIN/a2m" --version)" || die "a2m was installed at $BIN/a2m but \`a2m --version\` failed."
 
+if [ "$WITH_MULE" = 1 ]; then
+    install_toolchain
+fi
+
 printf 'a2m is installed at %s (editable: a git pull updates the code; rerun ./install.sh when dependencies change).\n' "$BIN/a2m"
 if [ "$WITH_TUI" = 0 ]; then
     printf 'Installed without the terminal UI; run ./install.sh again without --no-tui to add it.\n'
 fi
 printf 'Remove it with: %s/install.sh --uninstall\n' "$REPO"
 
-case ":${PATH:-}:" in
+case ":$SHELL_PATH:" in
     *":$BIN:"*)
-        FOUND="$(command -v a2m || true)"
+        FOUND="$(PATH="$SHELL_PATH" command -v a2m || true)"
         if [ -n "$FOUND" ] && [ "$FOUND" != "$BIN/a2m" ]; then
             printf 'Note: another a2m at %s comes first on PATH; it runs instead of this one.\n' "$FOUND"
         fi
@@ -362,3 +684,7 @@ case ":${PATH:-}:" in
 esac
 
 printf 'Installed version: %s\n' "$VERSION"
+
+if [ "$WITH_MULE" = 1 ] && [ "$SELF_CHECK" = 1 ]; then
+    self_check
+fi

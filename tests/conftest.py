@@ -31,8 +31,10 @@ FIXED_ZIP_TIME = (2026, 1, 1, 0, 0, 0)
 
 @pytest.fixture(autouse=True)
 def _no_api_key_and_isolated_cwd(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """No test ever sees a real API key, and stray relative writes land in tmp_path."""
+    """No test ever sees a real API key, and stray relative writes land in tmp_path. No test picks up
+    a toolchain installed under the real HOME by ./install.sh --with-mule either (cli.main applies it)."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("A2M_NO_TOOLCHAIN", "1")
     monkeypatch.chdir(tmp_path)
 
 

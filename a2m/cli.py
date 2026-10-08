@@ -31,7 +31,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from a2m import __version__
+from a2m import __version__, toolchain
 from a2m.engine import (
     DEFAULT_MAX_FIX_ATTEMPTS,
     LlmChoice,
@@ -335,6 +335,10 @@ def _open_tui(run_app: Callable[..., int]) -> int:
 
 def main(argv: list[str] | None = None, *, stages: Sequence[Stage] | None = None) -> int:
     """Run the a2m command line and return its exit code."""
+    # Before anything looks for Java, Maven or Mule: the toolchain ./install.sh --with-mule installed, if any.
+    warning = toolchain.apply()
+    if warning is not None:
+        _say(warning, err=True)
     parser = build_parser()
     if not (sys.argv[1:] if argv is None else argv) and _at_terminal():
         # A bare `a2m` typed in a terminal opens the TUI; piped or scripted, it stays a usage error.
