@@ -11,27 +11,143 @@ tests fail. Every AI result carries a confidence level and notes, and low confid
 
 ## Install
 
-From a checkout of this repository, on Linux or macOS:
+a2m runs on macOS, Linux and Windows (through WSL2). One command installs the `a2m` command (with the terminal
+UI) together with the Java, Maven and Mule runtime it uses to build and verify the generated apps:
 
 ```sh
-./install.sh
+./install.sh --with-mule
 ```
 
-It installs the `a2m` command with the terminal UI and the Anthropic SDK, then prints the installed
-`a2m --version`. It uses uv (`uv tool install`) when uv is on your PATH, otherwise pipx, otherwise a private
-virtual environment in `~/.local/share/a2m/venv` with a `~/.local/bin/a2m` link (this needs Python 3.11 or newer).
-It never uses sudo and never edits your shell files: if the folder holding `a2m` is not on your PATH, it prints
-the line to add and the file to add it to. The install is editable, so after a `git pull` `a2m` runs the new
-code; run `./install.sh` again when the dependencies change (it upgrades the same install in place).
+The steps below take a fresh machine from nothing to a working `a2m tui`. The code is in a private GitHub
+repository, https://github.com/rahilp/a2m, so you need a GitHub account that has been given access to it.
+
+### What you need
+
+- About 1.5 GB of free disk space in your home folder (see [Disk space](#disk-space)).
+- Internet access to the download hosts listed under [Troubleshooting](#troubleshooting). The first install
+  downloads about 630 MB.
+- No administrator rights for a2m itself: the installer never uses sudo and puts everything in your home
+  folder. Only the system packages in step 1 on Linux (and turning on WSL2 on Windows) need them.
+
+### macOS
+
+1. Open Terminal. If `git --version` asks you to install the command line developer tools, accept and wait
+   for it to finish (curl, tar and shasum ship with macOS).
+2. Get access to the repository and clone it. Either sign in with the GitHub CLI
+   (`brew install gh`, then `gh auth login` and `gh repo clone rahilp/a2m`), or add an SSH key to your GitHub
+   account (`ssh-keygen -t ed25519`, then paste `~/.ssh/id_ed25519.pub` under GitHub Settings, SSH and GPG keys)
+   and run:
+
+   ```sh
+   git clone git@github.com:rahilp/a2m.git
+   ```
+
+3. Install:
+
+   ```sh
+   cd a2m && ./install.sh --with-mule
+   ```
+
+4. Open a new Terminal window. If the installer printed a line to add to your shell file (it does when
+   `~/.local/bin` is not on your PATH), add that line first; the installer never edits the file itself.
+5. Check it:
+
+   ```sh
+   a2m --version
+   a2m tui
+   ```
+
+On macOS (Intel and Apple silicon) a2m starts the Mule runtime's Java process directly, without the 32-bit
+wrapper Mule's own launcher uses. The installer, its self-check and runtime verification have been tested end
+to end on Linux x86-64; if the self-check fails on a Mac, see [Troubleshooting](#troubleshooting). a2m still
+generates every project without the runtime.
+
+### Linux (Ubuntu or Debian)
+
+1. Install the few system tools the installer uses (other distributions: the same tools from their package
+   manager):
+
+   ```sh
+   sudo apt update && sudo apt install -y git curl tar gzip
+   ```
+
+2. Get access to the repository and clone it: `sudo apt install gh`, then `gh auth login` and
+   `gh repo clone rahilp/a2m`, or with an SSH key added to your GitHub account
+   (`ssh-keygen -t ed25519`, then paste `~/.ssh/id_ed25519.pub` under GitHub Settings, SSH and GPG keys):
+
+   ```sh
+   git clone git@github.com:rahilp/a2m.git
+   ```
+
+3. Install:
+
+   ```sh
+   cd a2m && ./install.sh --with-mule
+   ```
+
+4. Open a new shell. If the installer printed a line to add to `~/.bashrc` (it does when `~/.local/bin` is not
+   on your PATH), add it first, or run `a2m` by the full path it printed.
+5. Check it:
+
+   ```sh
+   a2m --version
+   a2m tui
+   ```
+
+### Windows (WSL2)
+
+a2m runs on Windows inside WSL2 (the Windows Subsystem for Linux), with the same installer as on Linux.
+
+1. Open PowerShell as Administrator and run:
+
+   ```powershell
+   wsl --install -d Ubuntu
+   ```
+
+   Restart Windows when it asks, then open Ubuntu from the Start menu and create your Linux user name and
+   password.
+2. In the Ubuntu window, follow every [Linux](#linux-ubuntu-or-debian) step above. Run them from your Linux home
+   folder (`cd ~` first), not from a Windows folder under `/mnt/c`: files under `/mnt/c` are much slower to
+   read and write from WSL2, and the Maven builds and Mule runs do a lot of both.
+3. Keep the exports and results folders under the Linux home too (copy exports in with
+   `cp -r /mnt/c/Users/<you>/Downloads/exports ~/exports`). Windows Explorer reaches them at
+   `\\wsl$\Ubuntu\home\<your Linux user>`.
+4. Run `a2m` and `a2m tui` in the Ubuntu window.
+
+### What the installer does
+
+`./install.sh` installs the `a2m` command with the terminal UI and the Anthropic SDK. It uses uv
+(`uv tool install`) when uv is on your PATH, otherwise pipx, otherwise a private virtual environment in
+`~/.local/share/a2m/venv` with a `~/.local/bin/a2m` link (this needs Python 3.11 or newer). With `--with-mule`
+and neither uv nor Python 3.11 or newer on the machine, it first installs uv with uv's official installer into
+`~/.local/bin` (uv then brings its own Python). The install is editable: after a `git pull`, `a2m` runs the new
+code.
+
+`--with-mule` also installs the toolchain a2m is verified against into `~/.local/share/a2m/toolchain`:
+Temurin JDK 17.0.20.1, Maven 3.9.16 and Mule Kernel CE 4.9.0. Each download is checked against the SHA-256 or
+SHA-512 checksum its publisher posts next to it before anything is unpacked, and a piece that is already
+installed at the right version is not downloaded again. The installer writes
+`~/.local/share/a2m/toolchain/toolchain.env`, which a2m reads every time it starts (also for `a2m tui`): it
+sets `JAVA_HOME`, puts that Java and Maven first on a2m's PATH and points a2m at that Mule runtime. Nothing is
+added to your shell files, and the Java and Maven you use outside a2m are not changed. `A2M_MULE_HOME`, when you
+set it, still wins over the installed runtime, and `A2M_NO_TOOLCHAIN=1` makes a2m ignore `toolchain.env`.
+
+At the end, `--with-mule` checks the install: it migrates the sample proxy `catalog-api` from
+`tests/fixtures/e2e/input` with `--llm none --mock-backends`, and the check passes only when it lands in
+verified (built with Maven, deployed on Mule and passing its tests). The first run takes about 2 to 3 minutes
+while Maven downloads its plugins into `~/.m2`. `--skip-check` skips it.
+
+The installer never uses sudo and never edits a shell file: if the folder holding `a2m` is not on your PATH, it
+prints the line to add and the file to add it to.
 
 ```sh
-./install.sh --no-tui      # without the terminal UI (Textual)
-./install.sh --uninstall   # remove what install.sh installed, and nothing else
+./install.sh                          # just the a2m command, without Java, Maven or Mule
+./install.sh --with-mule --skip-check # the toolchain, without the final check
+./install.sh --no-tui                 # without the terminal UI (Textual)
+./install.sh --uninstall              # remove what install.sh installed, and nothing else
 ```
 
-Java, Maven and the Mule runtime (pinned in `mise.toml`) are only needed to build and run the generated apps;
-see [Local Mule toolchain](#local-mule-toolchain-optional). Without them, or with `--no-runtime`, a2m still
-generates every project.
+### Other ways to install
 
 For development, or to install into an environment of your own, use pip (Python 3.11 or newer):
 
@@ -44,6 +160,8 @@ pip install ".[dev]"       # with pytest, ruff, mypy and the Textual dev tools, 
 
 `uv pip install ".[claude]"` works the same way.
 
+### The AI key
+
 `--llm claude` reads the API key from the `ANTHROPIC_API_KEY` environment variable and nothing else; a missing key
 stops the run before any proxy is processed, with one clear line. The model is `A2M_MODEL`, or a2m's default
 model when that is not set. `--llm none` turns AI off: nothing is sent anywhere and no key or SDK is needed;
@@ -55,17 +173,87 @@ opens a network connection (the folder named by `A2M_FAKE_LLM_DIR` can hold your
 export ANTHROPIC_API_KEY=...   # only for --llm claude
 ```
 
-## Local Mule toolchain (optional)
+### Update
+
+```sh
+cd a2m && git pull && ./install.sh --with-mule
+```
+
+It upgrades the same install in place, keeps the toolchain pieces that are already at the right version and
+runs the self-check again.
+
+### Uninstall
+
+```sh
+cd a2m && ./install.sh --uninstall
+```
+
+It removes the `a2m` command, the toolchain in `~/.local/share/a2m/toolchain` and, when the installer put it
+there, uv in `~/.local/bin`. If something cannot be removed it says what, keeps its install record and exits
+with an error, so you can fix the problem and run it again. It leaves your shell files and the checkout alone,
+and also the download caches other tools may share: Maven's `~/.m2` (about 200 MB after the self-check) and,
+when uv was installed for a2m, uv's cache and Python (in `~/.cache/uv` and `~/.local/share/uv`). Delete those
+folders by hand to free the space if nothing else uses them.
+
+### Disk space
+
+Measured on Linux x86-64 for a first `./install.sh --with-mule`:
+
+| What | Download | On disk |
+| --- | --- | --- |
+| Java (Temurin JDK 17.0.20.1) | 193 MB | 318 MB |
+| Maven 3.9.16 | 9 MB | 11 MB |
+| Mule Kernel CE 4.9.0 | 175 MB | 220 MB |
+| Maven plugins and connectors in `~/.m2` (first build, during the self-check) | about 190 MB | 198 MB |
+| uv, its Python and a2m's dependencies (only when the installer installs uv) | about 65 MB | about 200 MB |
+| Total | about 630 MB | about 950 MB |
+
+Leave about 1.5 GB free so the runs have room for their results and the Mule runtime's working files. On the
+test machine the whole first install took under 3 minutes: about 35 seconds for the downloads and 2 minutes for
+the self-check.
+
+### Troubleshooting
+
+- **The self-check failed.** a2m and the toolchain stay installed. The installer names the run log,
+  `~/.local/share/a2m/self-check/run.log`, and the proxy's report,
+  `~/.local/share/a2m/self-check/needs-review/catalog-api/REPORT.md`; the report's verification section says
+  whether the build, the deploy or a test failed. A Maven build that failed on a download is usually the
+  network (see below). Run `./install.sh --with-mule` again once it is fixed. Without the runtime, a2m still
+  generates every project (`a2m migrate ... --no-runtime`).
+- **`a2m: command not found`.** Open a new shell, or add the PATH line the installer printed to the file it
+  named. `ls ~/.local/bin/a2m` shows whether the command is there.
+- **A download is blocked (corporate proxy or firewall).** The installer and the first Maven builds need these
+  hosts over HTTPS:
+
+  | Host | Used for |
+  | --- | --- |
+  | `github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com` | Temurin JDK, uv and the Python uv installs |
+  | `repo.maven.apache.org` | Maven itself, and the Maven plugins the builds use |
+  | `repository.mulesoft.org` | the Mule runtime, and the Mule connectors and Maven plugin the builds use |
+  | `astral.sh` | the uv installer (only when neither uv nor Python 3.11 or newer is installed) |
+  | `pypi.org`, `files.pythonhosted.org` | a2m's Python dependencies |
+
+  curl and uv use the `https_proxy` (or `HTTPS_PROXY`) environment variable. Maven does not: give it the proxy in
+  `~/.m2/settings.xml` (a `<proxies>` entry, see https://maven.apache.org/guides/mini/guide-proxies.html). A proxy
+  that rewrites downloads makes the checksum check fail with "does not match its published checksum"; the
+  installer then stops without unpacking anything.
+
+## Local Mule toolchain
 
 Building and running the generated apps needs Java, Maven and a Mule runtime. a2m is verified against this
 toolchain:
 
-- Java: Temurin 17
-- Maven: 3.9
+- Java: Temurin 17 (17.0.20.1)
+- Maven: 3.9 (3.9.16)
 - Mule runtime: Mule Kernel CE 4.9.0 (the free Community Edition standalone runtime)
 
-The repository's `mise.toml` pins Temurin 17 and Maven 3.9 for [mise](https://mise.jdx.dev). Install mise, then from
-the repository root:
+The easy way is `./install.sh --with-mule` (see [Install](#install)), which installs exactly these into
+`~/.local/share/a2m/toolchain` and tells a2m where they are through `toolchain.env`.
+
+To use your own tools instead (the manual route), put `java` and `mvn` on your PATH and point `MULE_HOME` at an
+unpacked Mule runtime. When a `--with-mule` toolchain is installed too, a2m uses it first; set
+`A2M_NO_TOOLCHAIN=1` to make a2m use yours. The repository's `mise.toml` pins
+Temurin 17 and Maven 3.9 for [mise](https://mise.jdx.dev). Install mise, then from the repository root:
 
 ```sh
 mise install                                   # installs Temurin 17 and Maven 3.9 from mise.toml
@@ -77,8 +265,8 @@ Download the Mule Kernel CE 4.9.0 standalone distribution (`org.mule.distributio
 `.tar.gz` in the MuleSoft releases repository https://repository.mulesoft.org/nexus/content/repositories/releases/
 under `org/mule/distributions/mule-standalone/4.9.0/`), unpack it, and point `MULE_HOME` at the unpacked folder (the
 one holding `bin/mule`). `mise.toml` sets `MULE_HOME` to `~/.local/share/mule/mule-standalone-4.9.0`.
-`A2M_MULE_HOME` overrides `MULE_HOME` when both are set, so you can point a2m at another runtime without changing
-`MULE_HOME`.
+`A2M_MULE_HOME` overrides `MULE_HOME` (and the runtime `--with-mule` installed) when set, so you can point a2m at
+another runtime without changing `MULE_HOME`.
 
 The generated `pom.xml` pins the connector and plugin versions proven to deploy on Mule Kernel CE 4.9.0:
 
