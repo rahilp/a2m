@@ -653,16 +653,15 @@ def test_CP9_T25_the_readme_says_what_a_local_ce_runtime_check_proves_and_what_i
 def test_CP9_T21_a_failed_maven_build_sends_the_proxy_to_review_as_failed_with_the_build_log(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """[CP9-T21] With java and mule stubs and an mvn stub that prints BUILD FAILURE and a marker line then exits 1:
-    exit 0, both proxies processed; catalog-api in needs-review with mule-app/ kept, verification type failed, the
-    report says the Maven build failed and asks about it; diffs/ holds the build log (BUILD FAILURE and the marker);
-    mvn was called with package and the mule stub never deployed catalog-api; summary failed 1, battery 0, verified
-    0; catalog-api has its .done marker; no traceback."""
+    """[CP9-T21] With a java stub, a Mule home and an mvn stub that prints BUILD FAILURE and a marker line then
+    exits 1: exit 0, both proxies processed; catalog-api in needs-review with mule-app/ kept, verification type
+    failed, the report says the Maven build failed and asks about it; diffs/ holds the build log (BUILD FAILURE and
+    the marker); mvn was called with package and the java stub (Mule's JVM) never deployed catalog-api; summary
+    failed 1, battery 0, verified 0; catalog-api has its .done marker; no traceback."""
     calls = tmp_path / "tool-calls.log"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     write_stub(bin_dir / "java", calls)
-    write_stub(bin_dir / "mule", calls)
     write_stub(
         bin_dir / "mvn",
         calls,
@@ -670,9 +669,9 @@ def test_CP9_T21_a_failed_maven_build_sends_the_proxy_to_review_as_failed_with_t
         exit_code=1,
     )
     home = tmp_path / "mule-home"
-    for sub in ("bin", "services", "conf", "lib"):
+    for sub in ("services", "conf", "lib/boot"):
         (home / sub).mkdir(parents=True)
-    write_stub(home / "bin" / "mule", calls)
+    (home / "lib" / "boot" / "mule-module-reboot-4.9.0.jar").write_bytes(b"")
     clear_tool_env(monkeypatch)
     monkeypatch.setenv("PATH", str(bin_dir))
     monkeypatch.setenv("A2M_MULE_HOME", str(home))
@@ -696,7 +695,7 @@ def test_CP9_T21_a_failed_maven_build_sends_the_proxy_to_review_as_failed_with_t
 
     rows = tool_calls(calls)
     assert any(tool == "mvn" and "package" in args.split() for tool, _, args in rows), rows
-    assert not any(tool == "mule" and "catalog-api" in args for tool, _, args in rows), rows
+    assert not any(tool == "java" and "catalog-api" in args for tool, _, args in rows), rows
 
     data = read_summary(results)
     assert summary_proxies(data)["catalog-api"]["verification_type"] == "failed"

@@ -69,9 +69,10 @@ def test_CP3_T39_redeploying_under_the_same_name_proves_the_new_deployment(
 # ---------------------------------------------------------------------------
 # CP3 adversarial round 2: start and deploy only count evidence from their own action.
 #
-# CP3-T40 to CP3-T42 are unmarked and need no Java or Mule: a fake MULE_HOME whose
-# bin/mule is a small shell script stands in for the runtime and writes the log the
-# way the case needs. CP3-T43 is marked ``runtime`` and restarts the real runtime.
+# CP3-T40 to CP3-T42 are unmarked and need no Java or Mule: a fake JAVA_HOME whose
+# bin/java is a small shell script stands in for Mule's JVM (which a2m starts
+# directly, its output appended to logs/mule.log) and writes the log the way the
+# case needs. CP3-T43 is marked ``runtime`` and restarts the real runtime.
 
 import os  # noqa: E402
 import stat  # noqa: E402
@@ -83,14 +84,17 @@ from .test_cp3_deploy import processes_mentioning  # noqa: E402
 STALE_START = "INFO  2026-10-01 10:00:00 org.mule.runtime: Mule is up and kicking (every 5000ms)\n"
 
 
-def _fake_mule_home(root: Path, script: str) -> Path:
-    """A MULE_HOME with empty conf/ and services/ and ``bin/mule`` running ``script`` (sh, cwd = MULE_BASE)."""
+def _fake_mule_home(root: Path, script: str, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A MULE_HOME with empty conf/ and services/, and JAVA_HOME set to a folder whose ``bin/java`` runs
+    ``script`` (sh, cwd = MULE_BASE) as Mule's JVM."""
     home = root / "fake-mule-home"
-    for part in ("bin", "conf", "services"):
+    for part in ("conf", "services", "lib/boot"):
         (home / part).mkdir(parents=True, exist_ok=True)
-    launcher = home / "bin" / "mule"
-    launcher.write_text("#!/bin/sh\n" + textwrap.dedent(script), encoding="utf-8")
-    launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    java = root / "fake-java-home" / "bin" / "java"
+    java.parent.mkdir(parents=True, exist_ok=True)
+    java.write_text("#!/bin/sh\n" + textwrap.dedent(script), encoding="utf-8")
+    java.chmod(java.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("JAVA_HOME", str(root / "fake-java-home"))
     return home
 
 
@@ -120,13 +124,13 @@ def _all_gone(pids: list[int], seconds: float = 20.0) -> bool:
     ],
 )
 def test_CP3_T40_an_earlier_runs_startup_line_does_not_make_a_failed_launch_ready(
-    tmp_path: Path, script: str
+    tmp_path: Path, script: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """[CP3-T40] mule.log from an earlier run says "up and kicking", the new launch fails: start raises."""
     from a2m.verify.mule import MuleError, MuleRunner
 
     base = _base_with_log(tmp_path, "earlier run\n" + STALE_START + "earlier run stopped\n")
-    runner = MuleRunner(mule_home=_fake_mule_home(tmp_path, script), mule_base=base)
+    runner = MuleRunner(mule_home=_fake_mule_home(tmp_path, script, monkeypatch), mule_base=base)
     try:
         with pytest.raises(MuleError):
             runner.start(timeout=4)
@@ -155,12 +159,14 @@ def test_CP3_T40_an_earlier_runs_startup_line_does_not_make_a_failed_launch_read
         ),
     ],
 )
-def test_CP3_T41_a_launch_that_logs_its_own_startup_line_is_ready(tmp_path: Path, script: str) -> None:
+def test_CP3_T41_a_launch_that_logs_its_own_startup_line_is_ready(
+    tmp_path: Path, script: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """[CP3-T41] The new launch's own "up and kicking" makes start return, also after the log rolled over."""
     from a2m.verify.mule import MuleRunner
 
     base = _base_with_log(tmp_path, "earlier run\n" * 200 + STALE_START)
-    runner = MuleRunner(mule_home=_fake_mule_home(tmp_path, script), mule_base=base)
+    runner = MuleRunner(mule_home=_fake_mule_home(tmp_path, script, monkeypatch), mule_base=base)
     try:
         started = time.monotonic()
         runner.start(timeout=30)
@@ -187,12 +193,14 @@ exec sleep 300
 """
 
 
-def test_CP3_T42_a_deploy_failure_written_just_before_the_log_rolled_over_is_reported(tmp_path: Path) -> None:
+def test_CP3_T42_a_deploy_failure_written_just_before_the_log_rolled_over_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """[CP3-T42] A deploy failure logged just before mule.log rolled over is still reported as that failure."""
     from a2m.verify.mule import DeployError, MuleRunner
 
     base = _base_with_log(tmp_path, "ERROR Failed to deploy artifact [other-app] (earlier)\n" * 50)
-    runner = MuleRunner(mule_home=_fake_mule_home(tmp_path, FAILING_RUNTIME), mule_base=base)
+    runner = MuleRunner(mule_home=_fake_mule_home(tmp_path, FAILING_RUNTIME, monkeypatch), mule_base=base)
     jar = tmp_path / "rolled-app-mule-application.jar"
     jar.write_bytes(b"not really a jar")
     try:
@@ -239,7 +247,7 @@ def test_CP3_T43_restarting_the_runtime_under_the_same_base_proves_each_start(
         runner.start(timeout=START_TIMEOUT)
         second = [int(pid) for pid in runner.pids]
         recorded += second
-        assert len(second) > 1, "the restarted runtime's wrapper and JVM were not recorded"
+        assert len(second) == 1, "the restarted runtime's JVM was not recorded"
         assert all(pid_alive(pid) for pid in second)
         assert not set(second) & set(first)
         runner.stop(timeout=60)
@@ -492,14 +500,15 @@ def _app_jar(path: Path, port: int) -> Path:
 
 @pytest.mark.parametrize("container_answers", [0, 3])
 def test_CP3_T48_deploy_waits_through_container_503s_and_accepts_an_app_503(
-    tmp_path: Path, container_answers: int
+    tmp_path: Path, container_answers: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """[CP3-T48] deploy returns only after the listener port stops sending Mule's container 503; an app 503 is ready."""
     from a2m.verify.mule import MuleRunner
 
     port = free_port()
     listener = _ListenerStandIn(port, container_answers)
-    runner = MuleRunner(mule_home=_fake_mule_home(tmp_path, STARTING_RUNTIME), mule_base=tmp_path / "mule-base")
+    home = _fake_mule_home(tmp_path, STARTING_RUNTIME, monkeypatch)
+    runner = MuleRunner(mule_home=home, mule_base=tmp_path / "mule-base")
     try:
         runner.start(timeout=30)
         runner.deploy(_app_jar(tmp_path / "probe-app.jar", port), app_name="probe-app", timeout=30)
@@ -514,13 +523,16 @@ def test_CP3_T48_deploy_waits_through_container_503s_and_accepts_an_app_503(
         stop_and_reap(runner)
 
 
-def test_CP3_T48_deploy_fails_when_the_listener_never_leaves_the_container_503(tmp_path: Path) -> None:
+def test_CP3_T48_deploy_fails_when_the_listener_never_leaves_the_container_503(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """[CP3-T48] A listener port that only ever sends Mule's container 503 makes deploy raise DeployError in time."""
     from a2m.verify.mule import DeployError, MuleRunner
 
     port = free_port()
     listener = _ListenerStandIn(port, container_answers=10**6)
-    runner = MuleRunner(mule_home=_fake_mule_home(tmp_path, STARTING_RUNTIME), mule_base=tmp_path / "mule-base")
+    home = _fake_mule_home(tmp_path, STARTING_RUNTIME, monkeypatch)
+    runner = MuleRunner(mule_home=home, mule_base=tmp_path / "mule-base")
     try:
         runner.start(timeout=30)
         started = time.monotonic()

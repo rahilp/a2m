@@ -1,8 +1,10 @@
 """Find Java, Maven and the Mule runtime; what is missing makes verification a clean skip, never a failure.
 
 Java and Maven are found on PATH. The Mule runtime is the folder A2M_MULE_HOME
-names, else MULE_HOME (A2M_MULE_HOME wins when set); it counts only when it
-holds an executable ``bin/mule``.
+names, else MULE_HOME (A2M_MULE_HOME wins when set); it counts only when it is
+a Mule 4 standalone install a2m can start: its ``lib/boot`` holds the jar of the
+``org.mule.boot`` module (``mule-module-reboot-<version>.jar``), which a2m runs
+directly on Java (see :func:`a2m.verify.mule.jvm_command`; ``bin/mule`` is not used).
 """
 
 from __future__ import annotations
@@ -13,11 +15,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 MULE_HOME_VARIABLES = ("A2M_MULE_HOME", "MULE_HOME")
+# The org.mule.boot module's jar in a Mule 4 install's lib/boot: the one a2m starts Mule from.
+MULE_BOOT_JARS = "mule-module-reboot-*.jar"
 JAVA, MAVEN, MULE = "Java", "Maven", "Mule"
 HINTS = {
     JAVA: "no java on PATH",
     MAVEN: "no mvn on PATH",
-    MULE: "set A2M_MULE_HOME or MULE_HOME to a Mule standalone folder with bin/mule",
+    MULE: "set A2M_MULE_HOME or MULE_HOME to a Mule 4 standalone folder (one with lib/boot/mule-module-reboot-*.jar)",
 }
 
 
@@ -45,15 +49,16 @@ def mule_home_setting() -> str | None:
 
 
 def find_mule_home() -> Path | None:
-    """The configured Mule install folder (made absolute), only when it holds an executable bin/mule."""
+    """The configured Mule install folder (made absolute), only when its lib/boot holds the org.mule.boot jar."""
     value = mule_home_setting()
     if value is None:
         return None
     home = Path(value).absolute()
-    launcher = home / "bin" / "mule"
-    if launcher.is_file() and os.access(launcher, os.X_OK):
-        return home
-    return None
+    try:
+        found = any(jar.is_file() for jar in (home / "lib" / "boot").glob(MULE_BOOT_JARS))
+    except OSError:
+        return None
+    return home if found else None
 
 
 def detect_tools() -> ToolStatus:

@@ -765,10 +765,12 @@ def test_CP7_X17_sigterm_mid_batch_leaves_no_mule_process(runtime_tools: Any, tm
                 groups = [int(data["pgid"])] if data.get("pgid") else recorded[:1]
             except (OSError, ValueError, KeyError, TypeError):
                 recorded = []
-            if len(recorded) > 1:
+            # The JVM is recorded as it starts; wait until Mule is up too (it logs that to mule.log).
+            log = mule_base / "logs" / "mule.log"
+            if recorded and log.is_file() and "Mule is up and kicking" in log.read_text(errors="replace"):
                 break
             time.sleep(0.5)
-        assert len(recorded) > 1, f"the run never started its Mule runtime (exit code {process.poll()})"
+        assert recorded, f"the run never started its Mule runtime (exit code {process.poll()})"
         process.send_signal(signal.SIGTERM)
         _, err = process.communicate(timeout=180)
         assert process.returncode == 143, (process.returncode, err.decode(errors="replace")[-2000:])

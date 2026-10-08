@@ -2,7 +2,7 @@
 
 Every test here runs without Java, Maven or Mule. Tool detection and the clean
 skip run with PATH pointed at a tmp bin folder holding nothing or small shell
-stubs (mvn, java, mule) that log their calls; MULE_HOME, A2M_MULE_HOME and
+stubs (mvn, java) that log their calls; MULE_HOME, A2M_MULE_HOME and
 JAVA_HOME are removed from the environment (mise exports them). The decision,
 comparison and diff logic runs through a fake runner injected through the
 harness's runner interface; the fake simulates the fixture proxies' policies
@@ -42,7 +42,7 @@ Public contract these tests pin (CP7 plan, files_likely a2m/verify/*):
         explain_deploy_failure(app_name, log_text, *, mule_version) -> VerificationResult
     a2m.verify.tools.detect_tools() -> ToolStatus(missing: tuple[str, ...] of "Java" / "Maven" / "Mule",
                                     mule_home: Path | None)   (A2M_MULE_HOME wins over MULE_HOME; the
-                                    folder counts only with an executable bin/mule)
+                                    folder counts only with lib/boot/mule-module-reboot-*.jar)
     a2m.verify.runner.MuleAppRunner(mule_home: Path, mule_base: Path)
                                     the real Runner (wraps a2m.verify.mule): mvn package in the app folder,
                                     Mule started lazily under the private mule_base; context manager,
@@ -727,7 +727,8 @@ def tool_env(
     """PATH = one tmp bin folder holding ``stubs``; MULE_HOME, A2M_MULE_HOME, JAVA_HOME removed. Returns the call log.
 
     ``mule_home``: None leaves A2M_MULE_HOME unset, "empty" points it at an empty folder, "stub" at a folder
-    with an executable bin/mule stub (plus the empty services/ and conf/ a Mule install has).
+    with the lib/boot jar a Mule 4 install has (plus its empty services/ and conf/). a2m runs Mule's JVM
+    directly, so the JVM a run starts there is the ``java`` stub on PATH.
     """
     calls = tmp_path / "tool-calls.log"
     bin_dir = tmp_path / "bin"
@@ -741,11 +742,16 @@ def tool_env(
         home = tmp_path / f"mule-home-{mule_home}"
         home.mkdir(exist_ok=True)
         if mule_home == "stub":
-            for sub in ("bin", "services", "conf", "lib"):
-                (home / sub).mkdir(exist_ok=True)
-            write_stub(home / "bin" / "mule", calls, fail=True)
+            write_mule_boot(home)
         monkeypatch.setenv("A2M_MULE_HOME", str(home))
     return calls
+
+
+def write_mule_boot(home: Path) -> None:
+    """Make ``home`` look like a Mule 4 standalone install: services/, conf/ and lib/boot with its boot jar."""
+    for sub in ("services", "conf", "lib/boot"):
+        (home / sub).mkdir(parents=True, exist_ok=True)
+    (home / "lib" / "boot" / "mule-module-reboot-4.9.0.jar").write_bytes(b"")
 
 
 def write_stub(path: Path, calls: Path, *, fail: bool = False) -> None:
@@ -813,7 +819,7 @@ def test_CP7_T02_no_runtime_forces_static_and_never_calls_the_tools(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_cli: Any
 ) -> None:
     """[CP7-T02] --no-runtime forces static even when the tools are installed, and never calls them."""
-    calls = tool_env(monkeypatch, tmp_path, stubs=("mvn", "java", "mule"), mule_home="stub")
+    calls = tool_env(monkeypatch, tmp_path, stubs=("mvn", "java"), mule_home="stub")
     results = tmp_path / "results"
 
     res = run_cli(
@@ -861,7 +867,7 @@ def test_CP7_T03_some_tools_missing_gives_static_naming_the_missing_one(
     assert "Mule" in data["message"], data["message"]
     assert "Maven" not in data["message"] and "Java" not in data["message"], data["message"]
 
-    # case B: A2M_MULE_HOME holds an executable bin/mule
+    # case B: A2M_MULE_HOME holds lib/boot/mule-module-reboot-*.jar
     (tmp_path / "b").mkdir()
     tool_env(monkeypatch, tmp_path / "b", stubs=("java", "mvn"), mule_home="stub")
     status_b = detect_tools()
@@ -2075,7 +2081,7 @@ def test_CP7_X07_a_runtime_that_will_not_start_is_static_with_one_console_line(
         data = verification_json(results, proxy)
         assert data["type"] == "static", data
         assert "not run" in data["message"] and "Mule runtime did not start" in data["message"], data
-    assert [row[0] for row in tool_calls(calls)].count("mule") == 1, tool_calls(calls)
+    assert [row[0] for row in tool_calls(calls)].count("java") == 1, tool_calls(calls)
     notices = [line for line in res.err.splitlines() if "Mule runtime did not start" in line]
     assert len(notices) == 1 and "static" in notices[0], res.err
     assert "Traceback" not in res.err
@@ -2198,21 +2204,36 @@ def test_CP7_X09_a_failed_restart_or_a_death_during_deploy_is_said_plainly(
     assert died.ran == 0
 
 
+# A stand-in for Mule's JVM (a2m starts $JAVA_HOME/bin/java directly, its output going to logs/mule.log). It
+# loops instead of exec-ing a sleep, so its command line keeps the -Dmule.base=<base> that names its runtime.
 STUB_RUNTIME = """\
 #!/bin/sh
-echo 'INFO Mule is up and kicking (every 5000ms)' >> "$MULE_BASE/logs/mule.log"
-exec sleep 300
+echo 'INFO Mule is up and kicking (every 5000ms)'
+while :; do sleep 1; done
 """
+STUB_JAVA_HOME = "stub-java-home"
 
 
 def stub_mule_home(root: Path, script: str = STUB_RUNTIME) -> Path:
+    """A Mule 4 home under ``root``, and ``root/stub-java-home`` whose bin/java runs ``script``.
+
+    Point JAVA_HOME at :func:`stub_java_home` so the runner starts the stand-in JVM."""
     home = root / "stub-mule-home"
-    for part in ("bin", "conf", "services"):
-        (home / part).mkdir(parents=True, exist_ok=True)
-    launcher = home / "bin" / "mule"
-    launcher.write_text(script, encoding="utf-8")
-    launcher.chmod(0o755)
+    write_mule_boot(home)
+    java = stub_java_home(root) / "bin" / "java"
+    java.parent.mkdir(parents=True, exist_ok=True)
+    java.write_text(script, encoding="utf-8")
+    java.chmod(0o755)
     return home
+
+
+def stub_java_home(root: Path) -> Path:
+    return root / STUB_JAVA_HOME
+
+
+def stub_env(root: Path) -> dict[str, str]:
+    """child_env() with JAVA_HOME pointing at the stand-in JVM of :func:`stub_mule_home`."""
+    return dict(child_env(), JAVA_HOME=str(stub_java_home(root)))
 
 
 def live(pid: int) -> bool:
@@ -2242,11 +2263,14 @@ def kill_own(pids: Sequence[int]) -> None:
                 pass
 
 
-def test_CP7_X10_a_stopped_runtime_is_detected_and_a_deploy_does_not_hang(tmp_path: Path) -> None:
+def test_CP7_X10_a_stopped_runtime_is_detected_and_a_deploy_does_not_hang(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """[CP7-X10] The real MuleRunner sees its runtime die, and a deploy waiting on a dead runtime stops at once."""
     from a2m.verify.mule import MuleRunner, RuntimeStoppedError
 
     runner = MuleRunner(mule_home=stub_mule_home(tmp_path), mule_base=tmp_path / "base")
+    monkeypatch.setenv("JAVA_HOME", str(stub_java_home(tmp_path)))
     pids: list[int] = []
     try:
         runner.start(timeout=30)
@@ -2339,7 +2363,8 @@ def test_CP7_X11_a_signal_mid_batch_stops_the_runtime_a2m_started(tmp_path: Path
     script.write_text(SIGNAL_SCRIPT, encoding="utf-8")
     args = [str(stub_mule_home(tmp_path)), str(tmp_path / "base"), str(ready), str(exports), str(tmp_path / "out")]
     process = subprocess.Popen(
-        [sys.executable, str(script), *args], cwd=REPO, env=child_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        [sys.executable, str(script), *args], cwd=REPO, env=stub_env(tmp_path), stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     pids: list[int] = []
     try:
@@ -2366,7 +2391,7 @@ def test_CP7_X12_the_exit_hook_stops_a_runtime_nobody_stopped(tmp_path: Path) ->
     process = subprocess.Popen(
         [sys.executable, str(script), str(stub_mule_home(tmp_path)), str(tmp_path / "base"), str(ready)],
         cwd=REPO,
-        env=child_env(),
+        env=stub_env(tmp_path),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -2383,11 +2408,20 @@ def test_CP7_X12_the_exit_hook_stops_a_runtime_nobody_stopped(tmp_path: Path) ->
         kill_own(pids)
 
 
-def test_CP7_X13_a_new_start_ends_what_a_killed_a2m_left_under_the_same_base(tmp_path: Path) -> None:
-    """[CP7-X13] A runtime left running under a MULE_BASE (its a2m was killed) is ended by the next start there."""
+@pytest.mark.parametrize("processes", ["proc", "ps"])
+def test_CP7_X13_a_new_start_ends_what_a_killed_a2m_left_under_the_same_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, processes: str
+) -> None:
+    """[CP7-X13] A runtime left running under a MULE_BASE (its a2m was killed) is ended by the next start there:
+    its JVM is recognised by the -Dmule.base=<base> on its command line, read from /proc or from ps (macOS)."""
+    from a2m.verify import mule
     from a2m.verify.mule import MuleRunner
 
+    if processes == "ps":
+        monkeypatch.setattr(mule, "_processes", mule._PsTable())
+        monkeypatch.setattr(mule, "_pidfd_open", None)
     home = stub_mule_home(tmp_path)
+    monkeypatch.setenv("JAVA_HOME", str(stub_java_home(tmp_path)))
     base = tmp_path / "base"
     orphan = MuleRunner(mule_home=home, mule_base=base)
     fresh = MuleRunner(mule_home=home, mule_base=base)
@@ -2435,6 +2469,7 @@ RECORDING_MULE = """\
 #!/bin/sh
 printf '%s\\n%s\\n' "$MULE_BASE" "$MULE_HOME" > '{record}'
 if test -d "$MULE_BASE/conf"; then echo conf-found >> '{record}'; fi
+printf '%s\\n' "$@" >> '{record}'
 exit 1
 """
 
@@ -2443,14 +2478,14 @@ def test_CP7_X18_relative_paths_reach_the_mule_runtime_as_absolute_ones(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_cli: Any
 ) -> None:
     """[CP7-X18] `a2m migrate in --out results` with a relative MULE_HOME, run from a temp folder: the Mule
-    launcher gets an absolute MULE_BASE (the run's own .a2m-work/.mule-base) and MULE_HOME, and finds its conf."""
+    launcher gets an absolute MULE_BASE (the run's own .a2m-work/.mule-base) and MULE_HOME, and finds its conf.
+    The launcher is Mule's JVM itself (the java on PATH), and its -Dmule.base and -Dmule.home are absolute too."""
     calls = tool_env(monkeypatch, tmp_path, stubs=("java",))
     write_jar_mvn(tmp_path / "bin" / "mvn", calls)
     home = tmp_path / "rel-mule-home"
-    for part in ("bin", "conf", "services"):
-        (home / part).mkdir(parents=True)
+    write_mule_boot(home)
     record = tmp_path / "mule-env.txt"
-    launcher = home / "bin" / "mule"
+    launcher = tmp_path / "bin" / "java"
     launcher.write_text(RECORDING_MULE.format(record=record), encoding="utf-8")
     launcher.chmod(0o755)
     monkeypatch.setenv("A2M_MULE_HOME", "rel-mule-home")
@@ -2466,6 +2501,8 @@ def test_CP7_X18_relative_paths_reach_the_mule_runtime_as_absolute_ones(
     assert lines[0] == str(cwd / "results" / ".a2m-work" / ".mule-base"), lines
     assert lines[1] == str(cwd / "rel-mule-home"), lines
     assert "conf-found" in lines, lines
+    assert f"-Dmule.base={cwd / 'results' / '.a2m-work' / '.mule-base'}" in lines, lines
+    assert f"-Dmule.home={cwd / 'rel-mule-home'}" in lines, lines
 
 
 STRIP_KEYS = (
@@ -2754,14 +2791,13 @@ def test_CP7_X21_the_real_runner_sees_the_death_and_restarts_for_the_next_proxy(
 def test_CP7_X22_a_mule_home_without_services_is_static_with_one_console_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_cli: Any
 ) -> None:
-    """[CP7-X22] MULE_HOME with bin/mule but no services/ folder (e.g. a Mule 3 install): every proxy is static with
-    'not run', one console notice, exit 0, and no proxy crashes."""
+    """[CP7-X22] MULE_HOME with Mule's boot jar but no services/ folder (a broken install): every proxy is static
+    with 'not run', one console notice, exit 0, and no proxy crashes."""
     calls = tool_env(monkeypatch, tmp_path, stubs=("java",))
     write_jar_mvn(tmp_path / "bin" / "mvn", calls)
     home = tmp_path / "mule3-home"
-    (home / "bin").mkdir(parents=True)
-    (home / "conf").mkdir()
-    write_stub(home / "bin" / "mule", calls)
+    write_mule_boot(home)
+    (home / "services").rmdir()
     monkeypatch.setenv("A2M_MULE_HOME", str(home))
     exports = orders_input(tmp_path, write_orders, write_quota)
     results = tmp_path / "results"
@@ -2773,7 +2809,7 @@ def test_CP7_X22_a_mule_home_without_services_is_static_with_one_console_line(
         data = verification_json(results, proxy)
         assert data["type"] == "static", data
         assert "not run" in data["message"] and "cannot be prepared" in data["message"], data
-    assert [row[0] for row in tool_calls(calls)].count("mule") == 0, tool_calls(calls)
+    assert [row[0] for row in tool_calls(calls)].count("java") == 0, tool_calls(calls)
     notices = [line for line in res.err.splitlines() if "cannot be prepared" in line]
     assert len(notices) == 1 and "static" in notices[0], res.err
     assert "Traceback" not in res.err
@@ -3587,3 +3623,79 @@ def test_CP7_X36_a_golden_replay_fails_when_the_multipart_boundary_or_charset_ch
     assert "header Content-Type: expected 'multipart/mixed; boundary=original'" in outcomes["boundary"][1], outcomes
     assert outcomes["charset"][0] == "failed", outcomes
     assert outcomes["harmless"][0] == "golden", outcomes
+
+
+# ================================================================ Direct JVM launch (CP7-X37 .. X39)
+# a2m starts Mule's JVM itself, without Mule's Tanuki wrapper (no ARM Linux or 64-bit macOS build in Mule 4.9.0).
+
+
+def test_CP7_X37_mule_is_started_as_one_java_command_naming_its_home_and_base(tmp_path: Path) -> None:
+    """[CP7-X37] The JVM command: java first, the org.mule.boot module from MULE_HOME/lib/boot last, absolute
+    -Dmule.home and -Dmule.base (the base marks the JVM as this runtime's), and nothing from Tanuki."""
+    from a2m.verify.mule import jvm_command
+
+    java, home, base = tmp_path / "jdk" / "bin" / "java", tmp_path / "mule home", tmp_path / "results" / "base"
+    argv = jvm_command(java, home, base)
+
+    assert argv[0] == str(java)
+    assert argv[-1] == "--module=org.mule.boot/org.mule.runtime.module.reboot.MuleContainerBootstrap"
+    assert f"-Dmule.home={home}" in argv and f"-Dmule.base={base}" in argv, argv
+    assert f"--module-path={home / 'lib' / 'boot'}" in argv, argv
+    basic = "org.mule.runtime.module.boot.internal.MuleContainerBasicWrapper"
+    assert f"-Dmule.bootstrap.container.wrapper.class={basic}" in argv, argv
+    assert "-Xmx1024m" in argv and "-XX:+ExitOnOutOfMemoryError" in argv, argv
+    assert not [arg for arg in argv if "tanuki" in arg.lower()], argv
+    assert argv.index("--add-modules=java.se,org.mule.runtime.jpms.utils,com.fasterxml.jackson.core") < len(argv) - 1
+
+
+def test_CP7_X38_a_mule_home_counts_only_with_its_boot_module_jar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[CP7-X38] A Mule home is found by lib/boot/mule-module-reboot-*.jar (the module a2m starts), not bin/mule."""
+    from a2m.verify.tools import HINTS, MULE, find_mule_home
+
+    launcher_only = tmp_path / "launcher-only"
+    (launcher_only / "bin").mkdir(parents=True)
+    write_stub(launcher_only / "bin" / "mule", tmp_path / "calls")
+    monkeypatch.setenv("A2M_MULE_HOME", str(launcher_only))
+    assert find_mule_home() is None
+    write_mule_boot(tmp_path / "mule4")
+    monkeypatch.setenv("A2M_MULE_HOME", str(tmp_path / "mule4"))
+    assert find_mule_home() == (tmp_path / "mule4").absolute()
+    assert "lib/boot/mule-module-reboot-" in HINTS[MULE] and "bin/mule" not in HINTS[MULE]
+
+
+def test_CP7_X39_process_facts_from_ps_match_proc(tmp_path: Path) -> None:
+    """[CP7-X39] The ps backend (macOS) reads the same process group, liveness and command line as /proc,
+    arguments with spaces included, and a stable start time; a zombie counts as ended and a gone PID as None."""
+    from a2m.verify import mule
+
+    if not Path("/proc/self/stat").exists() or shutil.which("ps") is None:
+        pytest.skip("needs /proc and ps to compare them")
+    base = tmp_path / "a base"
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)", f"-Dmule.base={base}", "x"], start_new_session=True
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while (early := mule._ProcTable().facts(child.pid)) is None or "-Dmule.base" not in early.command:
+            assert time.monotonic() < deadline, "the child never ran its command"  # exec has not happened yet
+            time.sleep(0.02)
+        proc, ps = mule._ProcTable().facts(child.pid), mule._PsTable().facts(child.pid)
+        assert proc is not None and ps is not None
+        assert (ps.running, ps.group, ps.command) == (proc.running, proc.group, proc.command) == (
+            True, child.pid, f"{sys.executable} -c import time; time.sleep(60) -Dmule.base={base} x"
+        )
+        assert mule._PsTable().facts(child.pid) == ps  # the start time is the same on every read
+        assert mule._names_base(ps.command, base) and not mule._names_base(ps.command, tmp_path / "a bas")
+        child.kill()
+        deadline = time.monotonic() + 10
+        while (facts := mule._ProcTable().facts(child.pid)) is not None and facts.running:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        zombie = mule._PsTable().facts(child.pid)
+        assert zombie is not None and zombie.running is False
+    finally:
+        child.kill()
+        child.wait()
+    assert mule._PsTable().facts(child.pid) is None

@@ -4,8 +4,15 @@
 starts Mule headless under a private MULE_BASE (so the user's install under
 MULE_HOME is only read, never written), hot-deploys built apps into
 ``<mule_base>/apps``, waits for each to start or fail, undeploys them and
-stops Mule again. It records the PID of every process it starts, and
-:meth:`MuleRunner.stop` ends all of them.
+stops Mule again.
+
+Mule's JVM is started directly (:func:`jvm_command`), on every OS. Mule's own
+launcher, ``bin/mule``, runs the JVM under the Tanuki wrapper, which Mule 4.9.0
+ships only as a 32-bit macOS binary and not at all for ARM Linux; the JVM
+settings are the ones its ``conf/wrapper.conf`` gives, with Mule's basic
+container wrapper in place of Tanuki's. Without the Tanuki wrapper nothing
+writes ``logs/mule.log``: the JVM's own output (stdout and stderr) is appended
+to it instead, so the startup banner and every deploy line land there.
 
 Deploy signals (proven on Mule 4.9.0): ``apps/<name>-anchor.txt`` appears and
 ``Started app '<name>'`` is logged when an app started; ``Failed to deploy
@@ -16,21 +23,27 @@ handle this request, ..."). So :meth:`MuleRunner.deploy` also probes each
 listener port of the app (``http.listener.port`` in the jar's properties) until
 Mule answers with anything else.
 
-Java and Maven are found on PATH. When JAVA_HOME is not set, it is derived
-from the ``java`` on PATH, since Mule's wrapper starts ``$JAVA_HOME/bin/java``.
+Java and Maven are found on PATH. The JVM run is ``$JAVA_HOME/bin/java``; when
+JAVA_HOME is not set it is derived from the ``java`` on PATH (:func:`java_home`).
 
-A started runtime is always stopped: :meth:`MuleRunner.stop` ends its process
-group and every recorded PID, an ``atexit`` hook stops any runtime still
-running when Python exits, and the PIDs are written to ``a2m-mule.pids`` in the
-MULE_BASE so a later start under the same base first ends the processes an
-a2m that was killed outright left behind (only recorded PIDs and their
-children whose environment names this MULE_BASE; never anything found by
-name). Every process a2m signals is pinned by identity when it is chosen (a
-pidfd where the OS has them, else its start time, checked again before each
-signal), so a process that later took a recorded PID is never signalled.
-:meth:`MuleRunner.health_problem` says when a started runtime is no
-longer usable (the launcher or the JVM exited, or the wrapper reported the
-JVM gone), so a caller can restart it instead of blaming the next app.
+A started runtime is always stopped: the JVM is a2m's own child, leading its
+own process group, and :meth:`MuleRunner.stop` ends that group (SIGTERM, then
+SIGKILL after the timeout). The JVM is not reaped before that (its exit is seen
+through ``waitid`` without reaping, or as a zombie in the process table), so its
+PID and group ID cannot be taken by another process while a2m may still signal
+them. An ``atexit`` hook
+stops any runtime still running when Python exits, and the JVM's PID is written
+to ``a2m-mule.pids`` in the MULE_BASE so a later start under the same base
+first ends a JVM that an a2m killed outright left behind: only a recorded PID
+whose command line names this MULE_BASE (``-Dmule.base=<base>``) is
+signalled, never anything found by name. Each such process is pinned by
+identity when it is chosen (a pidfd where the OS has them, else its start
+time, checked again with its command line before each signal), so a process
+that later took a recorded PID is never signalled. Process facts come from
+``/proc`` on Linux and from ``ps`` elsewhere (macOS).
+:meth:`MuleRunner.health_problem` says when a started runtime is no longer
+usable (its JVM exited, which includes running out of memory: the JVM is told
+to exit then), so a caller can restart it instead of blaming the next app.
 """
 
 from __future__ import annotations
@@ -44,16 +57,17 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 import zipfile
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from a2m import safefs
 from a2m.generator.project import LISTENER_HOST_KEY, LISTENER_PORT_KEY
 
 MULE_LOG = ("logs", "mule.log")
-CONSOLE_LOG = ("logs", "console.log")
 STARTED_SIGNAL = "Mule is up and kicking"
 DEPLOY_FAILED_SIGNAL = "Failed to deploy artifact"
 APP_STARTED_SIGNAL = "Started app '{name}'"
@@ -71,22 +85,44 @@ JAR_SUFFIX = "-mule-application.jar"
 POLL_SECONDS = 0.5
 DEPLOY_POLL_SECONDS = 0.25
 EXCERPT_LINES = 60
-# Copied from MULE_HOME into each private MULE_BASE (conf is written to by the launcher).
-WRAPPER_ADDITIONAL = "wrapper-additional.conf"
-WRAPPER_ADDITIONAL_TEXT = (
-    "# Extra JVM settings for this private Mule base; Mule's launcher appends the JVM-specific ones here.\n"
-)
 # The PIDs (and process group) of the runtime started under a MULE_BASE, kept there while it runs.
 PID_FILE = "a2m-mule.pids"
 LEFTOVER_STOP_SECONDS = 30.0
 EXIT_STOP_SECONDS = 30.0
-# What Mule's (Tanuki) wrapper prints on the console when the JVM it runs is gone or unusable.
-JVM_TROUBLE = (
-    "JVM exited unexpectedly",
-    "JVM appears hung",
-    "JVM process is gone",
-    "JVM has run out of memory",
+# mule.log only grows (each start appends); one that grew past this is moved to mule.log.1 before a start.
+MULE_LOG_KEEP_BYTES = 16 * 1024 * 1024
+# The JVM settings of Mule 4.9.0's conf/wrapper.conf and conf/java11-plus/wrapper.jvmDependant.conf, minus the
+# Tanuki wrapper's own module and native library. -XX:+HeapDumpOnOutOfMemoryError and -XX:+AlwaysPreTouch are
+# left out (a 1 GB heap dump in the results folder; memory committed up front); -XX:+ExitOnOutOfMemoryError
+# stands in for the wrapper's restart of a JVM that ran out of memory, so health_problem sees it.
+JVM_HEAP = ("-Xms1024m", "-Xmx1024m")
+JVM_OPTIONS = (
+    "-Djava.net.preferIPv4Stack=TRUE",
+    "-Dorg.glassfish.grizzly.nio.transport.TCPNIOTransport.max-receive-buffer-size=1048576",
+    "-Dorg.glassfish.grizzly.nio.transport.TCPNIOTransport.max-send-buffer-size=1048576",
+    "-XX:MaxMetaspaceSize=256m",
+    "-XX:MetaspaceSize=128m",
+    "-XX:NewRatio=1",
+    "-XX:MaxTenuringThreshold=8",
+    "-XX:+ExitOnOutOfMemoryError",
+    "-Dorg.quartz.scheduler.skipUpdateCheck=true",
+    "-Dmule.metadata.cache.entryTtl.minutes=10",
+    "-Dmule.metadata.cache.expirationInterval.millis=5000",
+    "-Djava.locale.providers=COMPAT,CLDR,SPI",
+    "-Dlog4j2.disable.jmx=true",
+    "-Dlog4j2.Script.enableLanguages=nashorn,js,javascript,ecmascript,groovy",
+    "-Dmule.bootstrap.container.wrapper.class=org.mule.runtime.module.boot.internal.MuleContainerBasicWrapper",
+    "--add-modules=java.se,org.mule.runtime.jpms.utils,com.fasterxml.jackson.core",
+    "--add-opens=java.base/java.lang=org.mule.runtime.jpms.utils",
+    "--add-opens=java.base/java.lang.reflect=org.mule.runtime.jpms.utils",
+    "--add-opens=java.base/java.lang.invoke=org.mule.runtime.jpms.utils",
+    "--add-opens=java.sql/java.sql=org.mule.runtime.jpms.utils",
+    "-Dpolyglot.engine.WarnInterpreterOnly=false",
 )
+# The org.mule.boot module (in MULE_HOME/lib/boot) and the class it starts Mule with.
+JVM_MAIN = "--module=org.mule.boot/org.mule.runtime.module.reboot.MuleContainerBootstrap"
+# The argument that names a runtime's MULE_BASE on its JVM's command line: how a leftover is recognised.
+MULE_BASE_ARGUMENT = "-Dmule.base={base}"
 
 
 class MuleError(Exception):
@@ -126,6 +162,23 @@ def java_home() -> Path | None:
     return Path(java).resolve().parent.parent if java is not None else None
 
 
+def jvm_command(java: Path, mule_home: Path, mule_base: Path) -> list[str]:
+    """The command that starts Mule's JVM directly (no Tanuki wrapper), run with MULE_BASE as its folder.
+
+    ``mule_home`` and ``mule_base`` are used as given, so pass absolute paths: ``-Dmule.base`` on this
+    command line is also how a JVM left behind under ``mule_base`` is recognised.
+    """
+    return [
+        str(java),
+        *JVM_HEAP,
+        f"-Dmule.home={mule_home}",
+        MULE_BASE_ARGUMENT.format(base=mule_base),
+        *JVM_OPTIONS,
+        f"--module-path={mule_home / 'lib' / 'boot'}",
+        JVM_MAIN,
+    ]
+
+
 def package(project_dir: Path, *, timeout: float = 900.0) -> Path:
     """Build ``project_dir`` with ``mvn package`` and return the one ``target/*-mule-application.jar``."""
     mvn = shutil.which("mvn")
@@ -159,19 +212,16 @@ class MuleRunner:
     """One headless Mule runtime under its own MULE_BASE."""
 
     def __init__(self, mule_home: Path, mule_base: Path) -> None:
-        # Absolute: the launcher runs from MULE_HOME/bin and resolves a relative MULE_BASE from there.
+        # Absolute: they are passed to the JVM as -Dmule.home and -Dmule.base, which its folder would change.
         self.mule_home = Path(mule_home).absolute()
         self.mule_base = Path(mule_base).absolute()
+        # The JVM of the current start: a2m's child, the leader of its own process group, reaped only by stop().
         self._process: subprocess.Popen[bytes] | None = None
         self._pids: list[int] = []
-        self._jvm_pids: list[int] = []
-        # The wrapper and the JVM, pinned by identity when recorded (they are not a2m's children, so not reaped).
-        self._held: list[_Held] = []
-        self._console: LogWatch | None = None
 
     @property
     def pids(self) -> Sequence[int]:
-        """Every PID this runner started (the launcher script, the wrapper and the JVM)."""
+        """Every PID this runner started for its latest start (the JVM's)."""
         return tuple(self._pids)
 
     @property
@@ -194,54 +244,52 @@ class MuleRunner:
                 f"the Mule runtime under {self.mule_home} cannot be prepared (is it a Mule 4 standalone "
                 f"install?): {type(exc).__name__}: {exc}"
             ) from exc
+        home = java_home()
+        if home is None:
+            raise MuleError("Java was not found: set JAVA_HOME or put java on PATH")
+        self._keep_log_small()
         # mule.log is kept across runs; an earlier run's "up and kicking" must not count for this one.
         log = LogWatch(self.log_path)
-        env = dict(os.environ, MULE_HOME=str(self.mule_home), MULE_BASE=str(self.mule_base))
-        home = java_home()
-        if home is not None:
-            env["JAVA_HOME"] = str(home)
-        console_fd = safefs.open_plain_file(
-            self.mule_base, self.mule_base.joinpath(*CONSOLE_LOG), os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        )
-        self._console = LogWatch(self.mule_base.joinpath(*CONSOLE_LOG))
-        self._jvm_pids = []
-        self._held = []
+        env = dict(os.environ, MULE_HOME=str(self.mule_home), MULE_BASE=str(self.mule_base), JAVA_HOME=str(home))
+        # Appended to, never truncated: a LogWatch made before this start keeps its place in the file.
+        log_fd = safefs.open_plain_file(self.mule_base, self.log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        self._pids = []
         try:
             self._process = subprocess.Popen(
-                [str(self.mule_home / "bin" / "mule"), "console"],
+                jvm_command(home / "bin" / "java", self.mule_home, self.mule_base),
                 cwd=self.mule_base,
                 env=env,
                 stdin=subprocess.DEVNULL,
-                stdout=console_fd,
+                stdout=log_fd,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
         except OSError as exc:
-            self._console = None
-            raise MuleError(f"the Mule launcher under {self.mule_home} cannot be run: {exc}") from exc
+            raise MuleError(f"Java under {home} cannot be run to start Mule: {exc}") from exc
         finally:
-            os.close(console_fd)
+            os.close(log_fd)
         self._pids = [self._process.pid]
         _LIVE.add(self)
         self._write_pid_file()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            # Only this launch's log output counts, and only while the launcher still runs.
-            if self._process.poll() is not None:
+            # Only this launch's log output counts, and only while its JVM still runs.
+            if self._ended():
                 break
             if STARTED_SIGNAL in log.text():
-                self._record_started()
-                self._write_pid_file()
                 return
             time.sleep(POLL_SECONDS)
-        console = _tail(self.mule_base.joinpath(*CONSOLE_LOG).read_text(encoding="utf-8", errors="replace"))
-        code = self._process.poll()
+        output = _tail(log.text())
+        why = self._how_it_ended() if self._ended() else f"did not start within {timeout:.0f}s"
         self.stop()
-        why = f"exited with code {code}" if code is not None else f"did not start within {timeout:.0f}s"
-        raise MuleError(f"Mule {why} under {self.mule_base}:\n{console}")
+        raise MuleError(f"Mule {why} under {self.mule_base}:\n{output}")
 
     def stop(self, timeout: float = 60.0) -> None:
         """Stop Mule and every process it started; safe to call again.
+
+        The JVM's process group gets SIGTERM, then SIGKILL when the JVM has not ended within ``timeout``;
+        once the JVM ended (and before it is reaped, so the group is still this runtime's) the group gets a
+        last SIGKILL, so nothing the JVM started outlives it.
 
         When this runner never started its runtime, a leftover an earlier a2m recorded in the base's PID file
         is ended instead (see :meth:`_stop_leftovers`), so a caller that then removes the base never deletes
@@ -251,51 +299,79 @@ class MuleRunner:
             self._stop_leftovers()
             return
         self._signal_group(signal.SIGTERM)
-        for held in self._held:
-            held.send(signal.SIGTERM)
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and self._alive():
-            process.poll()
-            time.sleep(POLL_SECONDS)
-        if self._alive():
+        self._wait_ended(timeout)
+        if not self._ended():
             self._signal_group(signal.SIGKILL)
-            # Popen.kill signals the launcher only while it is not reaped, so its PID is still a2m's child.
-            process.kill()
-            for held in self._held:
-                held.send(signal.SIGKILL)
-            for held in self._pinned_descendants():
-                held.send(signal.SIGKILL)
-                held.close()
+            self._wait_ended(10)
+        self._signal_group(signal.SIGKILL)
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
-        for held in self._held:
-            held.close()
-        self._held = []
         self._process = None
-        self._console = None
         _LIVE.discard(self)
         safefs.remove(self.mule_base, self.mule_base / PID_FILE)
 
     def health_problem(self) -> str | None:
-        """Why the started runtime can no longer run apps (it or its JVM is gone), or None while it is usable."""
-        process = self._process
-        if process is None:
+        """Why the started runtime can no longer run apps (its JVM is gone), or None while it is usable."""
+        if self._process is None:
             return "the Mule runtime is not running"
-        code = process.poll()
-        if code is not None:
-            return f"the Mule runtime exited with code {code}"
-        # Through the pinned handles: a process that later took a dead JVM's PID is never mistaken for it.
-        jvms = [held for held in self._held if held.pid in self._jvm_pids]
-        if self._jvm_pids and not any(held.alive() for held in jvms):
-            return "the Mule runtime's JVM stopped"
-        console = self._console.text() if self._console is not None else ""
-        trouble = next((line for line in JVM_TROUBLE if line in console), None)
-        if trouble is not None:
-            return f"the Mule runtime's JVM stopped (the wrapper reported: {trouble})"
-        return None
+        if not self._ended():
+            return None
+        return f"the Mule runtime's JVM stopped (it {self._how_it_ended()})"
+
+    def _ended(self) -> bool:
+        """True once the JVM ended, seen without reaping it, so its PID and process group ID stay this
+        runtime's (a zombie holds them) until :meth:`stop` reaps it.
+
+        ``waitid`` with WNOWAIT tells where the OS has it (Linux; macOS from Python 3.13); elsewhere the JVM
+        counts as ended once the process table shows it a zombie. Only when neither can tell is it reaped
+        to find out, and its group is then no longer signalled."""
+        process = self._process
+        if process is None or process.returncode is not None:
+            return True
+        if _waitid is not None:
+            try:
+                return _waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+            except ChildProcessError:
+                pass
+        else:
+            facts = _facts(process.pid)
+            if facts is not None:
+                return not facts.running
+        return process.poll() is not None
+
+    def _how_it_ended(self) -> str:
+        """How the ended JVM ended, in words: its exit code or signal when the OS says so without reaping it."""
+        process = self._process
+        code = process.returncode if process is not None else None
+        if code is None and process is not None and _waitid is not None:
+            try:
+                info = _waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except ChildProcessError:
+                info = None
+            if info is not None:
+                code = info.si_status if info.si_code == os.CLD_EXITED else -info.si_status
+        if code is None:
+            return "exited"
+        return f"was killed by signal {-code}" if code < 0 else f"exited with code {code}"
+
+    def _wait_ended(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self._ended():
+            time.sleep(POLL_SECONDS)
+
+    def _signal_group(self, sig: signal.Signals) -> None:
+        process = self._process
+        # The group ID is this runtime's while its leader, the JVM, is not reaped (a zombie still holds it);
+        # once reaped it may name an unrelated process's group, so it is not signalled.
+        if process is None or process.returncode is not None:
+            return
+        try:
+            os.killpg(process.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
 
     def _write_pid_file(self) -> None:
         if self._process is None:
@@ -306,10 +382,11 @@ class MuleRunner:
     def _stop_leftovers(self) -> None:
         """End what an earlier runtime under this MULE_BASE left running (its a2m was killed outright).
 
-        Only PIDs recorded in the base's PID file, and their children, are considered, and only those
-        whose environment names this MULE_BASE are signalled; nothing is ever found by name. Each one is
-        pinned by identity when it is chosen, so one that ends while the others stop and whose PID is taken
-        by an unrelated process is treated as gone: that process is never waited on or signalled.
+        Only PIDs recorded in the base's PID file are considered, and only those whose command line names
+        this MULE_BASE (``-Dmule.base=<base>``) are signalled; nothing is ever found by name. The recorded
+        process group is signalled only while its leader is such a process. Each one is pinned by identity
+        when it is chosen, so one that ends while the others stop and whose PID is taken by an unrelated
+        process is treated as gone: that process is never waited on or signalled.
         """
         path = self.mule_base / PID_FILE
         try:
@@ -318,13 +395,12 @@ class MuleRunner:
             return
         recorded = [p for p in (data.get("pids", []) if isinstance(data, dict) else []) if isinstance(p, int)]
         group = data.get("pgid") if isinstance(data, dict) else None
-        candidates = [*recorded, *_tree(recorded)]
         base = self.mule_base
 
         def owned(pid: int) -> bool:
             return _runs_under(pid, base)
 
-        pinned = (_pin(pid, owned, recheck=owned) for pid in sorted({p for p in candidates if p > 1}))
+        pinned = (_pin(pid, owned, recheck=owned) for pid in sorted({p for p in recorded if p > 1}))
         mine = [held for held in pinned if held is not None]
         try:
             leader = [held for held in mine if held.pid == group]
@@ -359,74 +435,20 @@ class MuleRunner:
             if not os.path.lexists(link):
                 os.symlink(service, link, target_is_directory=service.is_dir())
         for source in sorted((self.mule_home / "conf").rglob("*")):
-            rel = source.relative_to(self.mule_home / "conf")
-            target = base / "conf" / rel
+            target = base / "conf" / source.relative_to(self.mule_home / "conf")
             if source.is_dir():
                 safefs.make_dirs(base, target)
-            elif rel.as_posix() == WRAPPER_ADDITIONAL:
-                safefs.write_text_atomic(base, target, WRAPPER_ADDITIONAL_TEXT)
             elif source.is_file():
                 safefs.write_text_atomic(base, target, source.read_text(encoding="utf-8"))
 
-    def _descendants(self) -> list[int]:
-        """PIDs of the running processes started from the launcher (its whole process tree)."""
-        # Once the launcher is reaped its PID may belong to an unrelated process (and its children are reparented).
-        if self._process is None or self._process.returncode is not None:
-            return []
-        children: dict[int, list[int]] = {}
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                fields = (entry / "stat").read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[1].split()
-            except OSError:
-                continue
-            # fields after the command: state, ppid, ...; a zombie has already ended.
-            if len(fields) > 1 and fields[0] != "Z":
-                children.setdefault(int(fields[1]), []).append(int(entry.name))
-        found: list[int] = []
-        todo = [self._process.pid]
-        while todo:
-            for child in children.get(todo.pop(), []):
-                found.append(child)
-                todo.append(child)
-        return found
-
-    def _record_started(self) -> None:
-        """Record the long-lived processes once Mule is up: the wrapper and the JVM."""
-        for pid in self._descendants():
-            if pid not in self._pids and _long_lived(pid):
-                held = _pin(pid, lambda p: _long_lived(p) and p in self._descendants())
-                if held is None:
-                    continue
-                self._pids.append(pid)
-                self._held.append(held)
-                if _executable_name(pid) == "java":
-                    self._jvm_pids.append(pid)
-
-    def _pinned_descendants(self) -> list[_Held]:
-        """The launcher's live descendants, each pinned and confirmed still in its tree after pinning."""
-        pinned = (_pin(pid, lambda p: p in self._descendants()) for pid in self._descendants())
-        return [held for held in pinned if held is not None]
-
-    def _alive(self) -> bool:
-        process = self._process
-        if process is None:
-            return False
-        return process.poll() is None or any(held.alive() for held in self._held) or bool(self._descendants())
-
-    def _signal_group(self, sig: signal.Signals) -> None:
-        if self._process is None:
-            return
-        group = self._process.pid
-        # The group ID stays this runtime's while the launcher (its leader) is not reaped, or while a pinned
-        # member is still in the group; otherwise it may name an unrelated process's group, so it is not signalled.
-        if self._process.returncode is not None and not _group_held_by(group, self._held):
-            return
+    def _keep_log_small(self) -> None:
+        """Move a mule.log that grew past MULE_LOG_KEEP_BYTES to mule.log.1 (replacing it), before a start."""
         try:
-            os.killpg(group, sig)
-        except (ProcessLookupError, PermissionError):
-            pass
+            size = self.log_path.lstat().st_size
+        except OSError:
+            return
+        if size > MULE_LOG_KEEP_BYTES:
+            safefs.move(self.mule_base, self.log_path, self.log_path.with_name(self.log_path.name + ".1"))
 
     # ------------------------------------------------------------ deploy and undeploy
 
@@ -723,66 +745,98 @@ def _needs_body(head: bytes, body: bytes) -> bool:
     return len(body) < len(CONTAINER_UNAVAILABLE)
 
 
-def _executable_name(pid: int) -> str | None:
-    try:
-        return Path(os.readlink(f"/proc/{pid}/exe")).name
-    except OSError:
-        return None
+@dataclass(frozen=True, slots=True)
+class _Facts:
+    """What a2m checks about a live process before it signals one it did not start in this run."""
+
+    running: bool  # False for a zombie: it has ended
+    group: int
+    start: str  # when it started, as the OS says it (only compared for equality)
+    command: str  # its command line, arguments joined with spaces
 
 
-def _long_lived(pid: int) -> bool:
-    """True for the wrapper and the JVM, not for short helpers the launcher script runs."""
-    return _executable_name(pid) in ("wrapper", "java")
+class _ProcTable:
+    """Process facts from /proc (Linux)."""
+
+    def facts(self, pid: int) -> _Facts | None:
+        before = self._stat(pid)
+        try:
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        except OSError:
+            return None
+        after = self._stat(pid)
+        # The start time read on both sides of the command line says all three belong to one process.
+        if before is None or after is None or before[19] != after[19]:
+            return None
+        command = " ".join(os.fsdecode(arg) for arg in argv if arg)
+        try:
+            return _Facts(running=after[0] != "Z", group=int(after[2]), start=after[19], command=command)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _stat(pid: int) -> list[str] | None:
+        """The fields of /proc/<pid>/stat after the command name (state first), or None when it is gone."""
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            return None
+        return fields if len(fields) > 19 else None
 
 
-def _running(pid: int) -> bool:
-    """True while ``pid`` is a live process (not ended, not a zombie)."""
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[1].split()
-    except (OSError, IndexError):
-        return False
-    return bool(fields) and fields[0] != "Z"
+class _PsTable:
+    """Process facts from ``ps`` (macOS, and any system without /proc).
+
+    One ``ps -p PID`` per question, with each column its own ``-o`` (POSIX gives a ``=`` header the rest of
+    its argument) and the C locale, so the start time (``lstart``, five words such as
+    ``Wed Oct  8 07:17:28 2026`` on Linux procps and macOS alike) splits the same way everywhere.
+    """
+
+    COLUMNS = ("pgid", "stat", "lstart", "command")
+    START_WORDS = 5
+
+    def facts(self, pid: int) -> _Facts | None:
+        argv = ["ps", "-ww", *(f"-o{column}=" for column in self.COLUMNS), "-p", str(pid)]
+        env = dict(os.environ, LC_ALL="C", LANG="C")
+        try:
+            done = subprocess.run(argv, capture_output=True, env=env, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        lines = os.fsdecode(done.stdout).splitlines()
+        if done.returncode != 0 or len(lines) != 1:
+            return None
+        words = lines[0].split(maxsplit=2 + self.START_WORDS)
+        if len(words) < 2 + self.START_WORDS or not words[0].isdigit():
+            return None
+        command = words[2 + self.START_WORDS] if len(words) > 2 + self.START_WORDS else ""
+        start = " ".join(words[2 : 2 + self.START_WORDS])
+        return _Facts(running=not words[1].startswith("Z"), group=int(words[0]), start=start, command=command)
+
+
+# /proc where the OS has it in Linux's form, else ps; a module attribute so tests can run the ps one on Linux.
+_processes: _ProcTable | _PsTable = _ProcTable() if sys.platform.startswith("linux") else _PsTable()
+
+
+def _facts(pid: int) -> _Facts | None:
+    return _processes.facts(pid)
+
+
+def _names_base(command: str, mule_base: Path) -> bool:
+    """True when ``command`` holds the argument ``-Dmule.base=<mule_base>`` (a JVM a2m started there)."""
+    marker = MULE_BASE_ARGUMENT.format(base=mule_base)
+    return f" {marker} " in f" {command} "
 
 
 def _runs_under(pid: int, mule_base: Path) -> bool:
-    """True when live process ``pid`` was started with MULE_BASE set to ``mule_base`` (a runtime a2m started)."""
-    if not _running(pid):
-        return False
-    try:
-        environ = Path(f"/proc/{pid}/environ").read_bytes()
-    except OSError:
-        return False
-    return f"MULE_BASE={mule_base}".encode() in environ.split(b"\0")
-
-
-def _stat_fields(pid: int) -> list[str] | None:
-    """The fields of /proc/<pid>/stat after the command name (state first), or None when it is gone."""
-    try:
-        return Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[1].split()
-    except (OSError, IndexError):
-        return None
-
-
-def _start_time(pid: int) -> int | None:
-    """When ``pid`` started (clock ticks after boot, stat field 22), or None when it is gone."""
-    fields = _stat_fields(pid)
-    try:
-        return int(fields[19]) if fields is not None else None
-    except (IndexError, ValueError):
-        return None
-
-
-def _process_group(pid: int) -> int | None:
-    """The process group of ``pid`` (stat field 5), or None when it is gone."""
-    fields = _stat_fields(pid)
-    try:
-        return int(fields[2]) if fields is not None else None
-    except (IndexError, ValueError):
-        return None
+    """True when live process ``pid`` is a JVM a2m started under ``mule_base`` (its command line names it)."""
+    facts = _facts(pid)
+    return facts is not None and facts.running and _names_base(facts.command, mule_base)
 
 
 # os.pidfd_open where the OS has it (Linux 5.3+); a module attribute so the start-time fallback can be tested.
 _pidfd_open: Callable[[int], int] | None = getattr(os, "pidfd_open", None)
+# os.waitid, to see that a child exited without reaping it (Linux; macOS from Python 3.13).
+_waitid: Callable[[int, int, int], os.waitid_result | None] | None = getattr(os, "waitid", None)
 
 
 class _Held:
@@ -793,7 +847,7 @@ class _Held:
     checked again right before every signal and on every liveness check.
     """
 
-    def __init__(self, pid: int, fd: int | None, start: int | None, recheck: Callable[[int], bool] | None) -> None:
+    def __init__(self, pid: int, fd: int | None, start: str | None, recheck: Callable[[int], bool] | None) -> None:
         self.pid = pid
         self._fd = fd
         self._start = start
@@ -804,7 +858,8 @@ class _Held:
         if self._fd is not None:
             # A pidfd becomes readable once its process has exited.
             return not select.select([self._fd], [], [], 0)[0]
-        if self._start is None or _start_time(self.pid) != self._start or not _running(self.pid):
+        facts = _facts(self.pid)
+        if self._start is None or facts is None or facts.start != self._start or not facts.running:
             return False
         return self._recheck is None or self._recheck(self.pid)
 
@@ -840,7 +895,8 @@ def _pin(pid: int, owned: Callable[[int], bool], *, recheck: Callable[[int], boo
             return None
         except OSError:
             fd = None  # no pidfd here (old kernel, sandbox): fall back to the start time
-    held = _Held(pid, fd, _start_time(pid), recheck)
+    facts = _facts(pid)
+    held = _Held(pid, fd, facts.start if facts is not None and facts.running else None, recheck)
     if held._start is None or not owned(pid) or not held.alive():
         held.close()
         return None
@@ -849,29 +905,11 @@ def _pin(pid: int, owned: Callable[[int], bool], *, recheck: Callable[[int], boo
 
 def _group_held_by(group: int, members: Sequence[_Held]) -> bool:
     """True when a live pinned member is in process group ``group``, so that group ID cannot be anyone else's."""
-    return any(held.alive() and _process_group(held.pid) == group and held.alive() for held in members)
-
-
-def _tree(roots: Sequence[int]) -> list[int]:
-    """Every live descendant of ``roots`` (from /proc parent PIDs)."""
-    children: dict[int, list[int]] = {}
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            fields = (entry / "stat").read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[1].split()
-        except (OSError, IndexError):
-            continue
-        if len(fields) > 1 and fields[0] != "Z":
-            children.setdefault(int(fields[1]), []).append(int(entry.name))
-    found: list[int] = []
-    todo = list(roots)
-    while todo:
-        for kid in children.get(todo.pop(), []):
-            if kid not in found:
-                found.append(kid)
-                todo.append(kid)
-    return found
+    for held in members:
+        facts = _facts(held.pid) if held.alive() else None
+        if facts is not None and facts.group == group and held.alive():
+            return True
+    return False
 
 
 # Every runtime started and not yet stopped, so the exit hook can stop it whatever ended the program.

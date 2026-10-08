@@ -50,18 +50,26 @@ import a2m.verify.mule as mule
 
 if os.environ.get("A2M_TEST_NO_PIDFD") == "1":
     mule._pidfd_open = None  # the start-time fallback, for systems without pidfds
+if os.environ.get("A2M_TEST_PS") == "1":
+    mule._processes = mule._PsTable()  # process facts from ps, as on macOS (no /proc, no pidfds)
+    mule._pidfd_open = None
+if os.environ.get("A2M_TEST_NO_WAITID") == "1":
+    mule._waitid = None  # seeing the JVM exit reaps it, as on macOS before Python 3.13
 
 plain_env = {k: v for k, v in os.environ.items() if k != "MULE_BASE"}
 
 
-def take_pid(pid, tries=50):
-    """Start an unrelated process (no MULE_BASE) on exactly ``pid`` (free by now), or None if it never lands there.
+def take_pid(pid, tries=50, session=False):
+    """Start an unrelated process (no -Dmule.base) on exactly ``pid`` (free by now), or None if it never lands there.
 
     Each try is checked: a process that landed on another PID is ended and the handoff is tried again (bounded),
-    so the scenario only goes on once the reuse it exists to prove has really happened."""
+    so the scenario only goes on once the reuse it exists to prove has really happened. With ``session`` it
+    leads its own process group, so the PID is a group ID too."""
     for _ in range(tries):
         Path("/proc/sys/kernel/ns_last_pid").write_text(str(pid - 1))
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], env=plain_env)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"], env=plain_env, start_new_session=session
+        )
         if proc.pid == pid:
             return proc
         proc.kill()
@@ -91,12 +99,13 @@ mule.LEFTOVER_STOP_SECONDS = 3.0
 tmp = Path(sys.argv[1])
 base = (tmp / "base").absolute()
 base.mkdir()
-env = dict(os.environ, MULE_BASE=str(base))
-# Leftover A ends at once on SIGTERM; leftover B takes 2 s to end after SIGTERM (like a JVM shutting down).
-a = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], env=env)
+marker = f"-Dmule.base={base}"
+# Leftover A ends at once on SIGTERM; leftover B takes 2 s to end after SIGTERM (like a JVM shutting down). Both
+# name the base on their command line, as the JVM a2m starts does.
+a = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", marker])
 b = subprocess.Popen([sys.executable, "-c",
     "import signal,time,sys\nsignal.signal(signal.SIGTERM, lambda *_: (time.sleep(2), sys.exit(0)))\n"
-    "print('ready', flush=True)\ntime.sleep(60)"], env=env, stdout=subprocess.PIPE)
+    "print('ready', flush=True)\ntime.sleep(60)", marker], stdout=subprocess.PIPE)
 b.stdout.readline()
 (base / mule.PID_FILE).write_text(json.dumps({"pgid": a.pid, "pids": [a.pid, b.pid]}))
 stranger = []
@@ -122,38 +131,33 @@ if u is not None:
 '''
 
 STARTED_SETUP = COMMON + r'''
-import shutil
-
 tmp = Path(sys.argv[1])
 home = tmp / "home"
-(home / "bin").mkdir(parents=True)
-(home / "services").mkdir()
+(home / "services").mkdir(parents=True)
 (home / "conf").mkdir()
-fake = tmp / "fake"
-fake.mkdir()
-# A "wrapper" that ends on SIGTERM and a "JVM" that ignores it, as the launcher's children. The JVM is one
-# process that never forks (it blocks in bash's builtin read on a FIFO nobody writes), so no child of it can
-# take a PID the scenario is about to hand to an unrelated process.
-shutil.copy(sys.argv[2], fake / "wrapper")
-shutil.copy(sys.argv[3], fake / "java")
-os.mkfifo(fake / "block")
-launcher = home / "bin" / "mule"
-launcher.write_text(
+java_home = tmp / "java-home"
+(java_home / "bin").mkdir(parents=True)
+fifo = tmp / "block"
+os.mkfifo(fifo)
+# The "JVM" a2m starts: it first starts a helper in its process group that ends on SIGTERM (its PID written to
+# helper.pid), then ignores SIGTERM itself and blocks in bash's builtin read on a FIFO nobody writes, so it never
+# forks again and no child of it can take a PID the scenario is about to hand to an unrelated process.
+java = java_home / "bin" / "java"
+java.write_text(
     "#!" + sys.argv[3] + "\n"
-    'cd "$MULE_BASE"\n'
-    f'"{fake}/wrapper" 60 &\n'
-    f'"{fake}/java" -c \'trap "" TERM; exec 3<>"{fake}/block"; while :; do read -r -u 3 _; done\' &\n'
-    "sleep 0.5\n"
-    "echo 'Mule is up and kicking' >> logs/mule.log\n"
-    "wait\n"
+    f'"{sys.argv[2]}" 60 &\n'
+    'echo $! > helper.pid\n'
+    'trap "" TERM\n'
+    "echo 'Mule is up and kicking'\n"
+    f'exec 3<>"{fifo}"; while :; do read -r -u 3 _; done\n'
 )
-launcher.chmod(0o755)
+java.chmod(0o755)
+os.environ["JAVA_HOME"] = str(java_home)
 base = (tmp / "base").absolute()
 runner = mule.MuleRunner(mule_home=home, mule_base=base)
 runner.start(timeout=20)
-names = {pid: mule._executable_name(pid) for pid in runner.pids}
-wrapper = next(pid for pid, name in names.items() if name == "wrapper")
-jvm = next(pid for pid, name in names.items() if name == "java")
+jvm = runner.pids[0]
+helper = int((base / "helper.pid").read_text())
 '''
 
 STARTED_SCENARIO = STARTED_SETUP + r'''
@@ -161,9 +165,9 @@ stranger = []
 
 
 def reuse():
-    # The wrapper ends on the SIGTERM (its launcher too, so it is reparented to us); its PID is then taken.
-    if reap(wrapper):
-        stranger.append(take_pid(wrapper))
+    # The helper ends on the SIGTERM to the JVM's group and is reaped; an unrelated process then takes its PID.
+    if reap(helper):
+        stranger.append(take_pid(helper))
 
 
 t = threading.Thread(target=reuse)
@@ -172,9 +176,8 @@ runner.stop(timeout=3)
 t.join(30)
 u = stranger[0] if stranger else None
 time.sleep(0.3)
-jvm_gone = reap(jvm, 10)
-print(json.dumps({"same_pid": u is not None and u.pid == wrapper, "stranger": u.poll() if u else "none",
-                  "jvm_gone": jvm_gone}))
+print(json.dumps({"same_pid": u is not None and u.pid == helper, "stranger": u.poll() if u else "none",
+                  "jvm_gone": not Path(f"/proc/{jvm}").exists()}))
 if u is not None:
     u.kill()
     u.wait()
@@ -183,28 +186,49 @@ if u is not None:
 
 JVM_REUSE_SCENARIO = STARTED_SETUP + r'''
 before = runner.health_problem()
-os.kill(jvm, signal.SIGKILL)  # the JVM this scenario started dies; the launcher (still waiting) reaps it
-u = take_pid(jvm) if reap(jvm, 10) else None
+os.kill(jvm, signal.SIGKILL)  # the JVM this scenario's runner started dies, and so does its helper
+os.kill(helper, signal.SIGKILL)
+reap(helper)  # orphaned by the JVM, the helper is the namespace init's (this script's) to reap
+deadline = time.monotonic() + 10
+while runner.health_problem() is None and time.monotonic() < deadline:
+    time.sleep(0.05)
 problem = runner.health_problem()
+# Nothing else is left in the JVM's group: only a2m not reaping its JVM keeps the PID (and group ID) taken.
+early = take_pid(jvm, tries=20, session=True)
+runner.stop(timeout=3)
+# Reaped by stop, the PID is free: an unrelated process leading its own group (its group ID is the old JVM's)
+# takes it, and nothing the runner does afterwards signals it.
+u = take_pid(jvm, session=True)
+after = runner.health_problem()
 runner.stop(timeout=3)
 time.sleep(0.3)
-print(json.dumps({"before": before, "same_pid": u is not None and u.pid == jvm, "problem": problem,
-                  "stranger": u.poll() if u else "none"}))
-if u is not None:
-    u.kill()
-    u.wait()
+print(json.dumps({"before": before, "problem": problem, "taken_before_stop": early is not None,
+                  "taken_after_stop": u is not None, "after": after, "stranger": u.poll() if u else "none"}))
+for proc in (early, u):
+    if proc is not None:
+        proc.kill()
+        proc.wait()
 '''
 
 
-def _run_scenario(tmp_path: Path, script: str, *, no_pidfd: bool, args: list[str] | None = None) -> dict[str, object]:
+MODES = {
+    "pidfd": {},
+    "start-time": {"A2M_TEST_NO_PIDFD": "1"},
+    "ps": {"A2M_TEST_PS": "1"},
+    "waitid": {},
+    "zombie-proc": {"A2M_TEST_NO_WAITID": "1"},
+    "zombie-ps": {"A2M_TEST_NO_WAITID": "1", "A2M_TEST_PS": "1"},
+}
+
+
+def _run_scenario(tmp_path: Path, script: str, *, mode: str, args: list[str] | None = None) -> dict[str, object]:
     path = tmp_path / "scenario.py"
     path.write_text(script, encoding="utf-8")
     work = tmp_path / "work"
     work.mkdir()
     env = {k: v for k, v in os.environ.items() if k not in ("MULE_BASE", "MULE_HOME", "FORCE_COLOR", "PY_COLORS")}
     env["PYTHONPATH"] = str(REPO)
-    if no_pidfd:
-        env["A2M_TEST_NO_PIDFD"] = "1"
+    env.update(MODES[mode])
     done = subprocess.run(
         ["unshare", "-Urpf", "--mount-proc", "--kill-child", sys.executable, str(path), str(work), *(args or [])],
         cwd=REPO, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=SCENARIO_SECONDS, check=False,
@@ -214,14 +238,13 @@ def _run_scenario(tmp_path: Path, script: str, *, no_pidfd: bool, args: list[str
 
 
 @needs_pid_namespace
-@pytest.mark.parametrize("no_pidfd", [False, True], ids=["pidfd", "start-time"])
-def test_TUI_CP6_X20_leftover_stop_never_signals_a_process_that_took_a_recorded_pid(
-    tmp_path: Path, no_pidfd: bool
-) -> None:
-    """[TUI-CP6-X20] A never-started runner ends the leftovers recorded for its base. When one of them ends on
-    SIGTERM and an unrelated process (no MULE_BASE) takes its PID while another leftover still stops, that
-    process is left alone: never SIGKILLed or signalled at all, with pidfds and with the start-time fallback."""
-    result = _run_scenario(tmp_path, LEFTOVER_SCENARIO, no_pidfd=no_pidfd)
+@pytest.mark.parametrize("mode", ["pidfd", "start-time", "ps"])
+def test_TUI_CP6_X20_leftover_stop_never_signals_a_process_that_took_a_recorded_pid(tmp_path: Path, mode: str) -> None:
+    """[TUI-CP6-X20] A never-started runner ends the leftovers recorded for its base (recognised by the
+    -Dmule.base=<base> on their command line). When one of them ends on SIGTERM and an unrelated process (no
+    -Dmule.base) takes its PID while another leftover still stops, that process is left alone: never SIGKILLed or
+    signalled at all, with pidfds, with the start-time fallback, and with process facts from ps (as on macOS)."""
+    result = _run_scenario(tmp_path, LEFTOVER_SCENARIO, mode=mode)
     assert result["same_pid"] is True, result
     assert result["stranger"] is None, result
     assert result["a"] == -15, result
@@ -229,41 +252,38 @@ def test_TUI_CP6_X20_leftover_stop_never_signals_a_process_that_took_a_recorded_
     assert result["pid_file_left"] is False, result
 
 
-@needs_pid_namespace
-@pytest.mark.parametrize("no_pidfd", [False, True], ids=["pidfd", "start-time"])
-def test_TUI_CP6_X21_started_runner_stop_never_kills_a_process_that_took_the_wrapper_pid(
-    tmp_path: Path, no_pidfd: bool
-) -> None:
-    """[TUI-CP6-X21] A started runner's stop: the recorded wrapper ends on SIGTERM and an unrelated process takes
-    its PID while the JVM ignores SIGTERM. When stop falls back to SIGKILL, the JVM is killed but the process
-    that took the wrapper's PID survives untouched."""
+def _sleep_and_bash() -> list[str]:
     sleep, bash = shutil.which("sleep"), shutil.which("bash")
     if sleep is None or bash is None:
         pytest.skip("needs sleep and bash")
-    result = _run_scenario(
-        tmp_path, STARTED_SCENARIO, no_pidfd=no_pidfd,
-        args=[str(Path(sleep).resolve()), str(Path(bash).resolve())],
-    )
+    return [str(Path(sleep).resolve()), str(Path(bash).resolve())]
+
+
+@needs_pid_namespace
+def test_TUI_CP6_X21_started_runner_stop_never_kills_a_process_that_took_a_helper_pid(tmp_path: Path) -> None:
+    """[TUI-CP6-X21] A started runner's stop: a helper in the JVM's process group ends on the SIGTERM and an
+    unrelated process takes its PID while the JVM ignores SIGTERM. When stop falls back to SIGKILL (to the JVM's
+    group only), the JVM is killed but the process that took the helper's PID survives untouched."""
+    result = _run_scenario(tmp_path, STARTED_SCENARIO, mode="pidfd", args=_sleep_and_bash())
     assert result["same_pid"] is True, result
     assert result["stranger"] is None, result
     assert result["jvm_gone"] is True, result
 
 
 @needs_pid_namespace
-@pytest.mark.parametrize("no_pidfd", [False, True], ids=["pidfd", "start-time"])
-def test_TUI_CP6_X22_health_check_sees_a_dead_jvm_whose_pid_an_unrelated_process_took(
-    tmp_path: Path, no_pidfd: bool
+@pytest.mark.parametrize("mode", ["waitid", "zombie-proc", "zombie-ps"])
+def test_TUI_CP6_X22_a_dead_jvm_is_seen_without_reaping_it_and_its_pid_is_never_signalled_after(
+    tmp_path: Path, mode: str
 ) -> None:
-    """[TUI-CP6-X22] A started runner's health check: when the JVM dies and an unrelated process takes its PID,
-    the runtime is reported as stopped (the new process is not mistaken for the JVM), and stop leaves it alone."""
-    sleep, bash = shutil.which("sleep"), shutil.which("bash")
-    if sleep is None or bash is None:
-        pytest.skip("needs sleep and bash")
-    result = _run_scenario(
-        tmp_path, JVM_REUSE_SCENARIO, no_pidfd=no_pidfd,
-        args=[str(Path(sleep).resolve()), str(Path(bash).resolve())],
-    )
+    """[TUI-CP6-X22] A started runner's health check: when the JVM dies the runtime is reported as stopped, and
+    the dead JVM is not reaped before stop (seen through waitid, or as a zombie in /proc or ps where waitid is
+    missing, as on macOS before Python 3.13), so no other process can take its PID or group ID meanwhile. Once
+    stop reaped it, a process that took the PID (leading its own group) is never signalled."""
+    result = _run_scenario(tmp_path, JVM_REUSE_SCENARIO, mode=mode, args=_sleep_and_bash())
     assert result["before"] is None, result
-    assert result["same_pid"] is True, result
-    assert result["problem"] == "the Mule runtime's JVM stopped", result
+    how = "was killed by signal 9" if mode == "waitid" else "exited"
+    assert result["problem"] == f"the Mule runtime's JVM stopped (it {how})", result
+    assert result["taken_before_stop"] is False, result
+    assert result["taken_after_stop"] is True, result
+    assert result["after"] == "the Mule runtime is not running", result
     assert result["stranger"] is None, result

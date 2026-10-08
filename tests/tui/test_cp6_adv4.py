@@ -274,8 +274,9 @@ def test_TUI_CP6_X19_close_ends_a_recorded_leftover_runtime_before_removing_the_
     tmp_path: Path, own_pids: list[int]
 ) -> None:
     """[TUI-CP6-X19] A run whose own runtime never started: VerifyStage.close ends the leftover runtime an
-    earlier a2m recorded in the base's PID file (a synthetic process started with that MULE_BASE) before it
-    removes the base, instead of deleting the only record of a runtime that is still running."""
+    earlier a2m recorded in the base's PID file (a synthetic process whose command line names that MULE_BASE, as
+    the JVM a2m starts does) before it removes the base, instead of deleting the only record of a runtime that is
+    still running."""
     from a2m import layout
     from a2m.verify.harness import VerifyStage
     from a2m.verify.mule import PID_FILE
@@ -284,18 +285,13 @@ def test_TUI_CP6_X19_close_ends_a_recorded_leftover_runtime_before_removing_the_
     results = tmp_path / "results"
     base = layout.mule_base_dir(results).absolute()
     base.mkdir(parents=True)
-    env = dict(clean_env(), MULE_BASE=str(base))
     leftover = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(120)"],
-        env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        [sys.executable, "-c", "import time; time.sleep(120)", f"-Dmule.base={base}"],
+        env=clean_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
     own_pids.append(leftover.pid)
     try:
-        deadline = time.monotonic() + 10.0
-        while f"MULE_BASE={base}".encode() not in Path(f"/proc/{leftover.pid}/environ").read_bytes().split(b"\0"):
-            assert time.monotonic() < deadline
-            time.sleep(0.02)
         (base / PID_FILE).write_text(json.dumps({"pgid": leftover.pid, "pids": [leftover.pid]}) + "\n", encoding="utf-8")
         stage = VerifyStage()
         stage._real = MuleAppRunner(tmp_path / "no-mule-home", base)
