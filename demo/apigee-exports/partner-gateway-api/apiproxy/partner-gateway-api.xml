@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="3" name="partner-gateway-api">
+    <DisplayName>partner-gateway-api</DisplayName>
+    <Description>Order status for approved logistics partners</Description>
+    <Policies>
+        <Policy>AC-PartnerNetwork</Policy>
+        <Policy>VK-PartnerKey</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>default</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>

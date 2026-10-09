@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="3" name="inventory-api">
+    <DisplayName>inventory-api</DisplayName>
+    <Description>Stock levels by SKU for store and web channels</Description>
+    <Policies>
+        <Policy>VK-StoreKey</Policy>
+        <Policy>EV-Sku</Policy>
+        <Policy>AM-SkuHeader</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>default</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>

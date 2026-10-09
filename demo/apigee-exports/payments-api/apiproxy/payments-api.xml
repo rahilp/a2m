@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="3" name="payments-api">
+    <DisplayName>payments-api</DisplayName>
+    <Description>Card payment capture and refunds</Description>
+    <Policies>
+        <Policy>VK-MerchantKey</Policy>
+        <Policy>AM-Idempotency</Policy>
+        <Policy>RF-MethodNotAllowed</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>default</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>

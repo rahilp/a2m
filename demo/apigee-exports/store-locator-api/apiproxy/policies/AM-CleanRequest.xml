@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<AssignMessage async="false" continueOnError="false" enabled="true" name="AM-CleanRequest">
+    <DisplayName>AM-CleanRequest</DisplayName>
+    <Remove>
+        <Headers>
+            <Header name="X-Internal-Debug"/>
+        </Headers>
+    </Remove>
+    <Set>
+        <Headers>
+            <Header name="X-Api-Version">1</Header>
+        </Headers>
+    </Set>
+    <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+    <AssignTo createNew="false" transport="http" type="request"/>
+</AssignMessage>

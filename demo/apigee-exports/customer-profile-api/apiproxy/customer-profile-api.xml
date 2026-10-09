@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="3" name="customer-profile-api">
+    <DisplayName>customer-profile-api</DisplayName>
+    <Description>Customer profile and preferences for the mobile app</Description>
+    <Policies>
+        <Policy>VK-ClientKey</Policy>
+        <Policy>AM-Channel</Policy>
+        <Policy>AM-ProfileView</Policy>
+        <Policy>AM-PrefsView</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>default</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>

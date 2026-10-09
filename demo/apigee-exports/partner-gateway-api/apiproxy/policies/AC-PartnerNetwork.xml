@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<AccessControl async="false" continueOnError="false" enabled="true" name="AC-PartnerNetwork">
+    <DisplayName>AC-PartnerNetwork</DisplayName>
+    <IPRules noRuleMatchAction="DENY">
+        <MatchRule action="ALLOW">
+            <SourceAddress mask="32">127.0.0.1</SourceAddress>
+        </MatchRule>
+    </IPRules>
+</AccessControl>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="3" name="hr-directory-api">
+    <DisplayName>hr-directory-api</DisplayName>
+    <Description>Employee directory lookups for internal HR tools</Description>
+    <Policies>
+        <Policy>BA-DecodeCaller</Policy>
+        <Policy>AM-Department</Policy>
+    </Policies>
+    <ProxyEndpoints>
+        <ProxyEndpoint>default</ProxyEndpoint>
+    </ProxyEndpoints>
+    <TargetEndpoints>
+        <TargetEndpoint>default</TargetEndpoint>
+    </TargetEndpoints>
+</APIProxy>
